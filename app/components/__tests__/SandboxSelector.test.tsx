@@ -291,6 +291,42 @@ describe("SandboxSelector", () => {
     await waitFor(() => expect(onChange).not.toHaveBeenCalled());
   });
 
+  it("selects a computer and hides Cloud when the cloud sandbox is disabled", async () => {
+    process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX = "true";
+    try {
+      const onChange = jest.fn();
+      mockGlobalState.subscription = "ultra";
+      mockGlobalState.desktopBridgeStatus = "connected";
+      mockGlobalState.localConnections = [
+        {
+          connectionId: "remote-kali",
+          environmentId: "kali",
+          isDesktop: false,
+          name: "Kali VM",
+        },
+      ];
+
+      render(<SandboxSelector value="e2b" onChange={onChange} />);
+
+      await waitFor(() =>
+        expect(onChange).toHaveBeenCalledWith("environment:kali", {
+          remember: false,
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Choose a computer" }),
+      );
+      expect(
+        await screen.findByRole("button", { name: "Kali VM" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Cloud" }),
+      ).not.toBeInTheDocument();
+    } finally {
+      delete process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX;
+    }
+  });
+
   it("continues to prefer a connected embedded bridge", async () => {
     const onChange = jest.fn();
     mockGlobalState.desktopBridgeStatus = "connected";

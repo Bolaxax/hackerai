@@ -378,6 +378,35 @@ describe("HybridSandboxManager prompt-time fallback", () => {
     expect(manager.consumeFallbackInfo()).toBeNull();
   });
 
+  it("never uses cloud for paid users when the cloud sandbox is disabled", async () => {
+    process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX = "true";
+    try {
+      mockConvexQuery.mockResolvedValue([]);
+
+      const manager = new HybridSandboxManager(
+        "user-1",
+        jest.fn(),
+        "desktop",
+        "service-key",
+        null,
+        "ultra",
+      );
+
+      await expect(manager.getSandboxContextForPrompt()).resolves.toBeNull();
+      expect(manager.consumeFallbackInfo()).toBeNull();
+      await expect(manager.getSandbox()).rejects.toThrow(
+        "Local sandbox disconnected. Reconnect your computer to continue.",
+      );
+
+      await manager.setSandboxPreference("e2b");
+      await expect(manager.getSandbox()).rejects.toThrow(
+        "Cloud sandbox is disabled",
+      );
+    } finally {
+      delete process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX;
+    }
+  });
+
   it("records a fallback when the selected local connection is unavailable", async () => {
     mockConvexQuery.mockResolvedValue([
       makeConnection({

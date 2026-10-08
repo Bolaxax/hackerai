@@ -260,6 +260,27 @@ describe("token-bucket", () => {
       const limits = getBudgetLimits("nonexistent" as any);
       expect(limits.monthly).toBe(0);
     });
+
+    it("applies a valid self-host Ultra override only to Ultra", () => {
+      const original = process.env.ULTRA_MONTHLY_LIMIT_USD;
+      try {
+        process.env.ULTRA_MONTHLY_LIMIT_USD = "500";
+        expect(getBudgetLimits("ultra").monthly).toBe(5_000_000);
+        expect(getSubscriptionPrice("ultra")).toBe(500);
+        expect(getBudgetLimits("pro").monthly).toBe(250_000);
+
+        for (const invalid of ["", "0", "-50", "$500", "Infinity"]) {
+          process.env.ULTRA_MONTHLY_LIMIT_USD = invalid;
+          expect(getBudgetLimits("ultra").monthly).toBe(2_000_000);
+        }
+      } finally {
+        if (original === undefined) {
+          delete process.env.ULTRA_MONTHLY_LIMIT_USD;
+        } else {
+          process.env.ULTRA_MONTHLY_LIMIT_USD = original;
+        }
+      }
+    });
   });
 
   // ==========================================================================

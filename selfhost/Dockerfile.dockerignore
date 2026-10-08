@@ -1,0 +1,17 @@
+# Build context filter for selfhost/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore next to the Dockerfile). The image installs its own
+# node_modules, and local env files must never reach a layer.
+.git
+**/node_modules
+**/.env
+**/.env.*
+.next
+.swc
+.trigger
+.convex
+.claude
+coverage
+test-results
+playwright-report
+packages/desktop/src-tauri/target
+*.tsbuildinfo

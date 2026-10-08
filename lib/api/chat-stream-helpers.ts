@@ -69,6 +69,7 @@ import {
   SYSTEM_PROMPT_RUNTIME_BOUNDARY,
 } from "@/lib/system-prompt";
 import { isAgentMode } from "@/lib/utils/mode-helpers";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 import {
   extractErrorDetails,
   getProviderStatusCode,
@@ -1455,7 +1456,8 @@ export async function applyPrepareStepReminders(
 }
 
 /**
- * Free-tier agent mode is restricted to the local sandbox.
+ * Free-tier agent mode is restricted to the local sandbox, as is every tier
+ * when the cloud sandbox is disabled.
  * Model overrides are normalized to auto before stream setup.
  * Throws ChatSDKError("forbidden:chat") if the sandbox gate fails.
  */
@@ -1465,13 +1467,17 @@ export function assertFreeAgentGates(args: {
   sandboxPreference: SandboxPreference | undefined;
 }): void {
   const { mode, subscription, sandboxPreference } = args;
-  if (!isAgentMode(mode) || subscription !== "free") return;
+  const cloudSandboxDisabled = isCloudSandboxDisabled();
+  if (!isAgentMode(mode) || (subscription !== "free" && !cloudSandboxDisabled))
+    return;
 
   const isLocalSandbox = sandboxPreference && sandboxPreference !== "e2b";
   if (!isLocalSandbox) {
     throw new ChatSDKError(
       "forbidden:chat",
-      "Agent mode on the free plan requires a local sandbox. Install the desktop app or upgrade to Pro for cloud access.",
+      cloudSandboxDisabled
+        ? "Agent mode requires a connected computer. Connect one in Remote Control, then try again."
+        : "Agent mode on the free plan requires a local sandbox. Install the desktop app or upgrade to Pro for cloud access.",
     );
   }
 }

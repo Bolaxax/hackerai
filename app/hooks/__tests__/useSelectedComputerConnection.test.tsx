@@ -123,6 +123,34 @@ describe("selected computer hydration", () => {
     );
   });
 
+  it("blocks Agent until a computer is selected when the cloud sandbox is disabled", () => {
+    process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX = "true";
+    try {
+      jest.useFakeTimers();
+      mockIsTauriEnvironment.mockReturnValue(false);
+      mockGlobalState.sandboxPreference = "e2b";
+      mockGlobalState.localConnections = undefined;
+
+      const { result, rerender } = renderHook(() =>
+        useSelectedComputerConnection(),
+      );
+      expect(result.current.sendDisabledReason).toBe(
+        "Checking your computer connection",
+      );
+
+      mockGlobalState.localConnections = [];
+      rerender();
+      act(() => jest.advanceTimersByTime(750));
+
+      expect(result.current.selectedComputerUnavailable).toBe(true);
+      expect(result.current.sendDisabledReason).toBe(
+        "Reconnect your computer or choose another environment",
+      );
+    } finally {
+      delete process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX;
+    }
+  });
+
   it("does not surface a disconnect when the remote appears during the startup grace", () => {
     jest.useFakeTimers();
     mockIsTauriEnvironment.mockReturnValue(false);

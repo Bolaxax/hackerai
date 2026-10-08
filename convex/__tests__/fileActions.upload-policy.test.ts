@@ -115,6 +115,21 @@ describe("file upload rate limit config", () => {
       window: "5 h",
     });
   });
+
+  it("uses the forced self-host tier when entitlements are empty", async () => {
+    const { getFileUploadRateLimitConfig } = await import("../fileActions");
+    process.env.NEXT_PUBLIC_FORCE_SUBSCRIPTION_TIER = "ultra";
+
+    try {
+      expect(getFileUploadRateLimitConfig([])).toEqual({
+        tier: "ultra",
+        limit: 1600,
+        window: "5 h",
+      });
+    } finally {
+      delete process.env.NEXT_PUBLIC_FORCE_SUBSCRIPTION_TIER;
+    }
+  });
 });
 
 describe("fileActions saveFile upload policy", () => {

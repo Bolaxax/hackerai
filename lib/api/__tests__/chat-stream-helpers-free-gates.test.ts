@@ -34,6 +34,49 @@ describe("assertFreeAgentGates", () => {
       }),
     ).toThrow(ChatSDKError);
   });
+
+  it("allows paid agent mode with the cloud sandbox", () => {
+    expect(() =>
+      assertFreeAgentGates({
+        mode: "agent",
+        subscription: "ultra",
+        sandboxPreference: "e2b",
+      }),
+    ).not.toThrow();
+  });
+
+  describe("with the cloud sandbox disabled", () => {
+    beforeEach(() => {
+      process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX = "true";
+    });
+
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX;
+    });
+
+    it.each(["e2b", undefined])(
+      "rejects paid agent mode with sandbox preference %p",
+      (sandboxPreference) => {
+        expect(() =>
+          assertFreeAgentGates({
+            mode: "agent",
+            subscription: "ultra",
+            sandboxPreference,
+          }),
+        ).toThrow(ChatSDKError);
+      },
+    );
+
+    it("allows paid agent mode on a connected computer", () => {
+      expect(() =>
+        assertFreeAgentGates({
+          mode: "agent",
+          subscription: "ultra",
+          sandboxPreference: "environment:kali",
+        }),
+      ).not.toThrow();
+    });
+  });
 });
 
 describe("assertChatModeAccess", () => {

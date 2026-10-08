@@ -1,0 +1,51 @@
+# HackerAI - Centrifugo relay for the local sandbox, as a Coolify
+# "Docker Compose Empty" resource.
+#
+# Domain to set in the Coolify UI: https://hackerai-relay.bolaxax.cloud:8000
+# Clients use wss://hackerai-relay.bolaxax.cloud/connection/websocket
+# (CENTRIFUGO_WS_URL on web, Convex and Trigger.dev).
+# Set CENTRIFUGO_TOKEN_SECRET in Coolify to the same value used on web, Convex
+# and Trigger.dev. Traefik terminates TLS, so no certificate files are needed.
+#
+# The config is docker/centrifugo/config.json with this deploy's origin and
+# the health endpoint (served on the internal port 9000, not exposed).
+services:
+  centrifugo:
+    image: centrifugo/centrifugo:v5
+    command: centrifugo -c /centrifugo/config.json
+    environment:
+      - SERVICE_URL_RELAY_8000
+      - CENTRIFUGO_TOKEN_HMAC_SECRET_KEY=${CENTRIFUGO_TOKEN_SECRET}
+      # The app never calls the server API; keep a generated key on it anyway.
+      - CENTRIFUGO_API_KEY=${SERVICE_PASSWORD_64_CENTRIFUGOAPI}
+    volumes:
+      - type: bind
+        source: ./config.json
+        target: /centrifugo/config.json
+        content: |
+          {
+            "allowed_origins": ["https://hackerai.bolaxax.cloud"],
+            "namespaces": [
+              {
+                "name": "sandbox",
+                "allow_user_limited_channels": true,
+                "allow_publish_for_subscriber": true,
+                "presence": true,
+                "allow_presence_for_subscriber": true,
+                "join_leave": true,
+                "history_size": 0,
+                "history_ttl": "0s"
+              }
+            ],
+            "uni_sse": true,
+            "uni_http_stream": true,
+            "http_stream": true,
+            "client_connection_limit": 5000,
+            "internal_port": 9000,
+            "health": true
+          }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

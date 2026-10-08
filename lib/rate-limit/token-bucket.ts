@@ -585,12 +585,32 @@ export const calculateRawModelUsageCostDollars = ({
 // Budget Limits
 // =============================================================================
 
+const ULTRA_MONTHLY_CREDITS = 2_000_000; // $200
+
+/**
+ * Self-host override: ULTRA_MONTHLY_LIMIT_USD replaces the Ultra allowance in
+ * dollars; unset, non-numeric or non-positive values keep the default. It is
+ * read on every access so the web server, Trigger worker and Convex each use
+ * their own env. Set the same value in all three: any of them clamps a stored
+ * bucket to its own limit.
+ */
+const getUltraMonthlyCredits = (): number => {
+  const points = Math.round(
+    Number(process.env.ULTRA_MONTHLY_LIMIT_USD) * POINTS_PER_DOLLAR,
+  );
+  return Number.isSafeInteger(points) && points > 0
+    ? points
+    : ULTRA_MONTHLY_CREDITS;
+};
+
 /** Monthly credit amounts per tier. */
 const MONTHLY_CREDITS: Record<string, number> = {
   free: 0,
   pro: 250_000,
   "pro-plus": 600_000, // $60
-  ultra: 2_000_000, // $200
+  get ultra() {
+    return getUltraMonthlyCredits();
+  },
   team: 400_000, // $40
 };
 

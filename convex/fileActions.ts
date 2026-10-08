@@ -53,6 +53,7 @@ import {
   S3_USER_FILES_PREFIX,
 } from "../lib/constants/s3";
 import {
+  getForcedSubscriptionTier,
   hasPaidEntitlement,
   parseEntitlements,
 } from "../lib/auth/entitlements";
@@ -105,6 +106,9 @@ const hasEntitlement = (
 export const getFileUploadRateLimitConfig = (
   entitlements: Array<string> = [],
 ): FileUploadRateLimitConfig => {
+  // Raw slugs never carry a forced self-host tier, so check it first.
+  const forcedTier = getForcedSubscriptionTier();
+  if (forcedTier) return FILE_UPLOAD_RATE_LIMITS[forcedTier];
   if (hasEntitlement(entitlements, "ultra")) {
     return FILE_UPLOAD_RATE_LIMITS.ultra;
   }

@@ -30,6 +30,7 @@ import {
   environmentPreference,
   isDesktopPreference,
 } from "@/lib/sandbox/environment";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 
 interface SandboxSelectorProps {
   value: string;
@@ -66,6 +67,7 @@ export function SandboxSelector({
     desktopEnvironmentId,
   } = useGlobalState();
   const isFreeUser = subscription === "free";
+  const cloudSandboxDisabled = isCloudSandboxDisabled();
 
   const selectedConnectionKnown = Boolean(
     connections?.some((connection) =>
@@ -91,12 +93,20 @@ export function SandboxSelector({
     return detectPlatform();
   }, []);
 
-  const cloudOption: ConnectionOption = {
-    id: "e2b",
-    label: "Cloud",
-    shortLabel: "Cloud",
-    icon: Cloud,
-  };
+  // Without Cloud, "e2b" only means that no computer is selected yet.
+  const cloudOption: ConnectionOption = cloudSandboxDisabled
+    ? {
+        id: "e2b",
+        label: "Choose a computer",
+        shortLabel: "Choose a computer",
+        icon: Monitor,
+      }
+    : {
+        id: "e2b",
+        label: "Cloud",
+        shortLabel: "Cloud",
+        icon: Cloud,
+      };
   const desktopLabel =
     isTauri && desktopBridgeStatus !== "connected"
       ? desktopBridgeStatus === "connecting"
@@ -243,10 +253,11 @@ export function SandboxSelector({
 
   // Availability must never replace the user's selected computer.
   const valueMatchesOption = options.some((opt) => opt.id === value);
-  // Choose an initial local default for free users, without replacing a
-  // previously selected computer when it disconnects.
+  // Choose an initial local default for free users (or every user without
+  // Cloud), without replacing a previously selected computer when it
+  // disconnects.
   useEffect(() => {
-    if (!isFreeUser || !connections?.length) return;
+    if ((!isFreeUser && !cloudSandboxDisabled) || !connections?.length) return;
 
     const firstRemote = shouldVerifyRemotePresence
       ? onlineRemoteConnectionIds
@@ -358,6 +369,7 @@ export function SandboxSelector({
         <div className="space-y-0.5">
           <button
             key={cloudOption.id}
+            hidden={cloudSandboxDisabled}
             onClick={() => {
               if (isFreeUser) {
                 toast.info("Cloud sandbox requires a Pro plan", {

@@ -1,4 +1,5 @@
 import { planLookupKeyToTier } from "@/lib/analytics/paid-funnel";
+import { getForcedSubscriptionTier } from "@/lib/auth/entitlements";
 import { HACKERAI_PRO_20_MONTHLY_PRICE_ID } from "@/lib/billing/included-usage";
 import type { SubscriptionTier } from "@/types";
 
@@ -68,6 +69,16 @@ export async function resolveCurrentAgentEntitlementContext(
   { userId, organizationId }: { userId: string; organizationId?: string },
   clients: AgentEntitlementClients,
 ): Promise<CurrentAgentEntitlementContext> {
+  // A forced self-host tier never comes from Stripe. Echo the run's
+  // organization so the worker's run-start comparison still matches.
+  const forcedTier = getForcedSubscriptionTier();
+  if (forcedTier) {
+    return {
+      subscription: forcedTier,
+      ...(organizationId ? { organizationId } : {}),
+    };
+  }
+
   if (!organizationId) return { subscription: "free" };
 
   const memberships =

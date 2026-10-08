@@ -38,7 +38,10 @@ import {
   type DesktopBridgeStatus,
 } from "@/app/hooks/useSandboxPreference";
 import { isTauriEnvironment } from "@/app/hooks/useTauri";
-import { resolveSubscriptionTier } from "@/lib/auth/entitlements";
+import {
+  getForcedSubscriptionTier,
+  resolveSubscriptionTier,
+} from "@/lib/auth/entitlements";
 import { clearSharedToken, setSharedToken } from "@/lib/auth/shared-token";
 import { chatSidebarStorage } from "@/lib/utils/sidebar-storage";
 import { useMutation, useQuery } from "convex/react";
@@ -308,7 +311,8 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
   const [entitlementRefreshRetryNonce, setEntitlementRefreshRetryNonce] =
     useState(0);
   const subscriptionFromEntitlements = useMemo<SubscriptionTier | null>(() => {
-    if (!Array.isArray(entitlements)) return null;
+    // A forced self-host tier does not need the /api/entitlements fallback.
+    if (!Array.isArray(entitlements)) return getForcedSubscriptionTier();
     return resolveSubscriptionTier(entitlements);
   }, [entitlements]);
   const refreshAuthTokenAfterEntitlementRefresh = useCallback(async () => {
@@ -1040,10 +1044,10 @@ const GlobalStateProviderInner: React.FC<GlobalStateProviderProps> = ({
               return;
             }
           }
-          setSubscriptionWithNormalize("free");
+          setSubscriptionWithNormalize(getForcedSubscriptionTier() ?? "free");
         }
       } catch {
-        setSubscriptionWithNormalize("free");
+        setSubscriptionWithNormalize(getForcedSubscriptionTier() ?? "free");
       } finally {
         setIsCheckingProPlan(false);
         // Remove the refresh param to avoid repeated refreshes

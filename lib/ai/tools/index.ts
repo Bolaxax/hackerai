@@ -36,6 +36,7 @@ import type {
   SandboxManager,
 } from "@/types";
 import { isAgentMode } from "@/lib/utils/mode-helpers";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 import type { Geo } from "@vercel/functions";
 import { FileAccumulator } from "./utils/file-accumulator";
 import { BackgroundProcessTracker } from "./utils/background-process-tracker";
@@ -201,11 +202,15 @@ export const createTools = (
     }
   };
 
-  // Cloud protection: free agent users must use a user-owned execution host.
-  if (subscription === "free" && isAgentMode(mode)) {
+  // Cloud protection: free agent users must use a user-owned execution host,
+  // as must every user when the cloud sandbox is disabled.
+  const cloudSandboxDisabled = isCloudSandboxDisabled();
+  if ((subscription === "free" || cloudSandboxDisabled) && isAgentMode(mode)) {
     if (!sandboxPreference || sandboxPreference === "e2b") {
       throw new Error(
-        "Free agent mode requires a local sandbox. Cloud sandboxes are not available on the free plan.",
+        cloudSandboxDisabled
+          ? "Agent mode requires a local sandbox. Cloud sandboxes are disabled."
+          : "Free agent mode requires a local sandbox. Cloud sandboxes are not available on the free plan.",
       );
     }
   }

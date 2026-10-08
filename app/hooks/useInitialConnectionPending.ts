@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 
 const INITIAL_EMPTY_CONNECTION_GRACE_MS = 750;
 
@@ -21,9 +22,11 @@ export function useInitialConnectionPending({
   const [settledPreference, setSettledPreference] = useState<string | null>(
     null,
   );
+  // Without Cloud, "e2b" waits for the first computer to be discovered.
+  const cloudSelected = preference === "e2b" && !isCloudSandboxDisabled();
 
   useEffect(() => {
-    if (preference === "e2b") return;
+    if (cloudSelected) return;
 
     if (connected) {
       if (settledPreference === preference) return;
@@ -46,6 +49,7 @@ export function useInitialConnectionPending({
     }, INITIAL_EMPTY_CONNECTION_GRACE_MS);
     return () => window.clearTimeout(timeout);
   }, [
+    cloudSelected,
     connected,
     connectionCount,
     hasObservedLoading,
@@ -54,7 +58,7 @@ export function useInitialConnectionPending({
   ]);
 
   return (
-    preference !== "e2b" &&
+    !cloudSelected &&
     !connected &&
     (connectionCount === undefined ||
       (connectionCount === 0 &&

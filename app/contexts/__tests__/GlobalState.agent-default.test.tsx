@@ -784,4 +784,32 @@ describe("GlobalStateProvider agent defaults", () => {
     expect(refreshAuth).not.toHaveBeenCalled();
     expect(refreshAccessToken).not.toHaveBeenCalled();
   });
+
+  it("keeps the forced self-host tier when checkout refresh fails", async () => {
+    process.env.NEXT_PUBLIC_FORCE_SUBSCRIPTION_TIER = "ultra";
+    try {
+      mockAuthUser([]);
+      window.history.pushState({}, "", "/?refresh=entitlements");
+      global.fetch = jest.fn(() =>
+        Promise.resolve({ ok: false, status: 500 }),
+      ) as unknown as typeof fetch;
+
+      render(
+        <GlobalStateProvider>
+          <GlobalStateProbe />
+        </GlobalStateProvider>,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId("checking-pro-plan")).toHaveTextContent(
+          "false",
+        );
+        expect(window.location.search).toBe("");
+      });
+
+      expect(screen.getByTestId("subscription")).toHaveTextContent("ultra");
+    } finally {
+      delete process.env.NEXT_PUBLIC_FORCE_SUBSCRIPTION_TIER;
+    }
+  });
 });

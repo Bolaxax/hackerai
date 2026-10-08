@@ -6,6 +6,7 @@ import { isTauriEnvironment } from "./useTauri";
 import { isAgentMode } from "@/lib/utils/mode-helpers";
 import { useInitialConnectionPending } from "./useInitialConnectionPending";
 import { connectionMatchesPreference } from "@/lib/sandbox/environment";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 
 // The native environment is fixed for the page lifetime. Use a server snapshot
 // so hydration starts with the same environment as the server render.
@@ -46,8 +47,11 @@ export function useSelectedComputerConnection() {
   const computerConnectionPending = selectedNativeDesktop
     ? desktopBridgeStatus === "idle" || desktopBridgeStatus === "connecting"
     : initialConnectionPending;
+  // Without Cloud, "e2b" means that no computer is selected yet.
   const selectedComputerUnavailable =
-    isAgentMode(chatMode) && sandboxPreference !== "e2b" && !connected;
+    isAgentMode(chatMode) &&
+    (sandboxPreference !== "e2b" || isCloudSandboxDisabled()) &&
+    !connected;
   const sendDisabledReason = selectedComputerUnavailable
     ? computerConnectionPending
       ? "Checking your computer connection"

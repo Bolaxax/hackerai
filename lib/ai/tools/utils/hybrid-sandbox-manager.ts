@@ -56,6 +56,7 @@ import {
   isDesktopPreference,
   resolveEnvironmentConnection,
 } from "@/lib/sandbox/environment";
+import { isCloudSandboxDisabled } from "@/lib/sandbox/cloud-availability";
 
 type SandboxInstance = AnySandbox;
 
@@ -328,6 +329,11 @@ export class HybridSandboxManager implements SandboxManager {
       getCloudSandboxProviderForInstance(this.sandbox) ??
       cloudSandboxContext?.provider ??
       getCloudSandboxProvider();
+  }
+
+  /** Free plans and deploys without a cloud sandbox stay on user computers. */
+  private canUseCloudSandbox(): boolean {
+    return this.subscription !== "free" && !isCloudSandboxDisabled();
   }
 
   recordHealthFailure(): boolean {
@@ -625,7 +631,7 @@ export class HybridSandboxManager implements SandboxManager {
 
     const connection = await this.getPreferredOrFallbackConnection();
     if (!connection) {
-      return this.subscription !== "free";
+      return this.canUseCloudSandbox();
     }
 
     return connection.capabilities?.pty !== false;
@@ -749,10 +755,14 @@ export class HybridSandboxManager implements SandboxManager {
       return this.getCloudSandbox();
     }
 
-    // If preference is E2B, always use E2B (but block for free users)
+    // If preference is E2B, always use E2B (but block when Cloud is unavailable)
     if (this.sandboxPreference === "e2b") {
-      if (this.subscription === "free") {
-        throw new Error("Cloud sandbox requires a paid plan.");
+      if (!this.canUseCloudSandbox()) {
+        throw new Error(
+          isCloudSandboxDisabled()
+            ? "Cloud sandbox is disabled. Select a connected computer."
+            : "Cloud sandbox requires a paid plan.",
+        );
       }
       return this.getCloudSandbox();
     }
@@ -801,10 +811,12 @@ export class HybridSandboxManager implements SandboxManager {
       return { sandbox: this.sandbox! };
     }
 
-    // Free users cannot fall back to E2B — must use local sandbox
-    if (this.subscription === "free") {
+    // Without Cloud (free plan or disabled), never fall back to E2B
+    if (!this.canUseCloudSandbox()) {
       throw new Error(
-        "Local sandbox disconnected. Reconnect your desktop app or upgrade to Pro for cloud sandbox.",
+        isCloudSandboxDisabled()
+          ? "Local sandbox disconnected. Reconnect your computer to continue."
+          : "Local sandbox disconnected. Reconnect your desktop app or upgrade to Pro for cloud sandbox.",
       );
     }
 
@@ -1010,7 +1022,7 @@ export class HybridSandboxManager implements SandboxManager {
       return this.buildSandboxContext(firstAvailable);
     }
 
-    if (this.subscription !== "free") {
+    if (this.canUseCloudSandbox()) {
       this.recordFallbackInfo({
         occurred: true,
         reason: "no_local_connections",
