@@ -1,10 +1,17 @@
+import { extractPreviewFileIdsFromParts } from "../lib/utils/file-preview-ids";
 import {
   getAbliterationHistoryEntry,
   stripClientAbliterationRouting,
 } from "../lib/experiments/abliteration-history";
-import { query, mutation, internalQuery } from "./_generated/server";
-import type { MutationCtx } from "./_generated/server";
-import { v, ConvexError, getDocumentSize, type Value } from "convex/values";
+import { query, mutation, internalQuery } from "./lib/serviceFunctions";
+import type { MutationCtx } from "./lib/serviceFunctions";
+import {
+  v,
+  ConvexError,
+  getConvexSize,
+  getDocumentSize,
+  type Value,
+} from "convex/values";
 import { internal } from "./_generated/api";
 import type { DataModel, Doc, Id } from "./_generated/dataModel";
 import {
@@ -23,6 +30,7 @@ import {
   sharedMessageValidator,
 } from "./lib/sharedChatSnapshot";
 import { stripOpenRouterReasoningMetadataFromParts } from "../lib/chat/provider-metadata-sanitizer";
+import { isUserDeletionFenced } from "./lib/userDeletionFence";
 import { invalidateModelHistory } from "./modelHistory";
 import {
   MAX_MESSAGE_SEARCH_QUERY_LENGTH,
@@ -135,6 +143,55 @@ const MIN_SEARCH_CONTENT_CHARS = 256;
 
 const getMessageDocumentSize = (document: Record<string, unknown>): number =>
   getDocumentSize(document as Record<string, Value>);
+
+const getClientPartSizeDiagnostics = (parts: Value[]) => {
+  const categories = {
+    text: { count: 0, sizeBytes: 0 },
+    reasoning: { count: 0, sizeBytes: 0 },
+    file: { count: 0, sizeBytes: 0 },
+    tool: { count: 0, sizeBytes: 0 },
+    data: { count: 0, sizeBytes: 0 },
+    "step-start": { count: 0, sizeBytes: 0 },
+    other: { count: 0, sizeBytes: 0 },
+  };
+  type Category = keyof typeof categories;
+  let largestPartCategory: Category | "none" = "none";
+  let largestPartSizeBytes = 0;
+  let partsSizeBytes = 2; // Convex array marker and terminator.
+  for (const part of parts) {
+    const type =
+      part && typeof part === "object" && "type" in part
+        ? part.type
+        : undefined;
+    // Never emit client-supplied type, tool or data names as telemetry keys.
+    const category: Category =
+      type === "text" ||
+      type === "reasoning" ||
+      type === "file" ||
+      type === "step-start"
+        ? type
+        : typeof type === "string" &&
+            (type.startsWith("tool-") || type === "dynamic-tool")
+          ? "tool"
+          : typeof type === "string" && type.startsWith("data-")
+            ? "data"
+            : "other";
+    const sizeBytes = getConvexSize(part);
+    categories[category].count++;
+    categories[category].sizeBytes += sizeBytes;
+    partsSizeBytes += sizeBytes;
+    if (sizeBytes > largestPartSizeBytes) {
+      largestPartSizeBytes = sizeBytes;
+      largestPartCategory = category;
+    }
+  }
+  return {
+    partsSizeBytes,
+    largestPartSizeBytes,
+    largestPartCategory,
+    categories,
+  };
+};
 
 const sliceValidUnicodePrefix = (value: string, end: number): string => {
   const sliced = value.slice(0, end);
@@ -535,19 +592,43 @@ export const saveMessage = mutation({
     ),
     parts: v.array(v.any()),
     fileIds: v.optional(v.array(v.id("files"))),
+    previewFileIds: v.optional(v.array(v.string())),
     model: v.optional(v.string()),
     mode: v.optional(v.union(v.literal("agent"), v.literal("ask"))),
     generationStartedAt: v.optional(v.number()),
     generationTimeMs: v.optional(v.number()),
     finishReason: v.optional(v.string()),
     triggerRunId: v.optional(v.string()),
+    expectedActiveTriggerRunId: v.optional(v.string()),
     usage: v.optional(v.any()),
     updateOnly: v.optional(v.boolean()),
     isHidden: v.optional(v.boolean()),
   },
-  returns: v.null(),
+  returns: v.union(v.null(), v.literal("stale_run")),
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
+    // Recovery may only write while this exact crashed run still owns the chat.
+    // This check shares the message transaction, so a concurrent new run wins.
+    if (args.expectedActiveTriggerRunId !== undefined) {
+      if (
+        args.triggerRunId !== args.expectedActiveTriggerRunId ||
+        args.role !== "assistant"
+      )
+        throw new Error("Invalid Agent recovery correlation");
+      const chat = await ctx.db
+        .query("chats")
+        .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
+        .first();
+      if (
+        !chat ||
+        chat.user_id !== args.userId ||
+        chat.active_trigger_run_id !== args.expectedActiveTriggerRunId ||
+        chat.canceled_at !== undefined ||
+        chat.deletion_started_at !== undefined ||
+        (await isUserDeletionFenced(ctx.db, args.userId))
+      )
+        return "stale_run" as const;
+    }
     let failureStage = "start";
     let chatForInsert: Doc<"chats"> | null = null;
 
@@ -593,7 +674,33 @@ export const saveMessage = mutation({
         failureStage = "verify_file_part_ownership";
         await ensureOwnedFiles(partOnlyFileIds);
       }
-      const fileIdsForSave = args.fileIds;
+      // Older tool outputs can point to previews already removed by unattached
+      // cleanup. Keep those messages saveable, but retain every surviving owned
+      // preview with the same attachment lifecycle as ordinary message files.
+      failureStage = "verify_preview_file_ownership";
+      const previewFiles: Doc<"files">[] = [];
+      for (const previewId of new Set([
+        ...(args.previewFileIds ?? []),
+        ...extractPreviewFileIdsFromParts(args.parts),
+      ])) {
+        const fileId = ctx.db.normalizeId("files", previewId);
+        if (!fileId) continue;
+        const file = await ctx.db.get(fileId);
+        if (!file) continue;
+        if (file.user_id !== args.userId) {
+          throw new Error("File does not belong to user");
+        }
+        previewFiles.push(file);
+      }
+      const fileIdsForSave =
+        previewFiles.length > 0
+          ? Array.from(
+              new Set([
+                ...(args.fileIds ?? []),
+                ...previewFiles.map((file) => file._id),
+              ]),
+            )
+          : args.fileIds;
       const partsForSave = args.parts;
 
       failureStage = "find_existing_message";
@@ -616,6 +723,18 @@ export const saveMessage = mutation({
 
         // Build patch for fields that need updating
         const patch: Record<string, unknown> = {};
+
+        // Repair an older preview that is already referenced but still marked
+        // unattached. The mutation commits this together with message changes.
+        for (const file of previewFiles) {
+          if (
+            existingMessage.file_ids?.includes(file._id) &&
+            !file.is_attached
+          ) {
+            failureStage = "patch_existing_message_file_attachment";
+            await ctx.db.patch(file._id, { is_attached: true });
+          }
+        }
 
         // Add new fileIds if provided
         if (fileIdsForSave && fileIdsForSave.length > 0) {
@@ -640,6 +759,29 @@ export const saveMessage = mutation({
               }
             }
           }
+        }
+
+        // The retained server stream is authoritative over an earlier browser
+        // snapshot of this same interrupted run. Never replace a final answer.
+        if (
+          args.expectedActiveTriggerRunId &&
+          existingMessage.role === "assistant" &&
+          existingMessage.trigger_run_id === args.expectedActiveTriggerRunId &&
+          existingMessage.finish_reason === "trigger_crashed_client_saved"
+        ) {
+          const base = {
+            ...existingMessage,
+            ...patch,
+            parts: partsForSave,
+            content: undefined,
+          };
+          if (getMessageDocumentSize(base) > MESSAGE_DOCUMENT_TARGET_BYTES)
+            throw new Error("Recovered Agent message is too large to save");
+          patch.parts = partsForSave;
+          patch.content = fitSearchContentToDocument(
+            base,
+            extractTextFromParts(partsForSave),
+          ).content;
         }
 
         // Update usage if provided and not already set (e.g., on abort)
@@ -946,6 +1088,29 @@ export const saveMessage = mutation({
   },
 });
 
+/** Check retry admission independently of the client's loaded history pages. */
+export const isUserMessagePersisted = query({
+  args: { chatId: v.string(), messageId: v.string() },
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    const user = await ctx.auth.getUserIdentity();
+    if (!user) throw new Error("Unauthorized: User not authenticated");
+    await assertUserCanAccessChatHistory(ctx, user.subject);
+
+    const message = await ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("id", args.messageId))
+      .first();
+    // A rejected first admission may not have created the chat yet.
+    if (!message) return false;
+    if (message.user_id !== user.subject || message.chat_id !== args.chatId) {
+      throw new Error("Unauthorized: Message does not belong to this chat");
+    }
+    await loadOwnedChat(ctx, args.chatId, user.subject);
+    return message.role === "user";
+  },
+});
+
 /**
  * Get messages for a chat with pagination
  */
@@ -1213,13 +1378,12 @@ export const saveAssistantMessage = mutation({
       // Save parts as-is - fixing happens at read time in chat-processor.ts
       const content = extractTextFromParts(args.parts);
 
-      await ctx.db.insert("messages", {
+      const messageDocumentBase = {
         id: args.id,
         chat_id: args.chatId,
         user_id: user.subject,
         role: args.role,
         parts: args.parts,
-        content: content || undefined,
         update_time: Date.now(),
         model: args.model,
         mode: args.mode,
@@ -1227,6 +1391,29 @@ export const saveAssistantMessage = mutation({
         generation_time_ms: args.generationTimeMs,
         finish_reason: args.finishReason,
         usage: stripClientAbliterationRouting(args.usage),
+      };
+      const baseDocumentSizeBytes = getMessageDocumentSize(messageDocumentBase);
+      if (baseDocumentSizeBytes > MESSAGE_DOCUMENT_TARGET_BYTES) {
+        throw new ConvexError({
+          code: "MESSAGE_TOO_LARGE",
+          message: "Message is too large to save",
+          failureStage: "prepare_insert_message",
+          operation: "messages.saveAssistantMessage",
+          baseDocumentSizeBytes,
+          maxDocumentSizeBytes: CONVEX_DOCUMENT_MAX_BYTES,
+          targetDocumentSizeBytes: MESSAGE_DOCUMENT_TARGET_BYTES,
+          partCount: args.parts.length,
+          partDiagnostics: getClientPartSizeDiagnostics(args.parts),
+        });
+      }
+      // Match backend saves: canonical parts remain intact while the duplicated
+      // search text uses only the space left in the complete document.
+      const indexedContent = content
+        ? fitSearchContentToDocument(messageDocumentBase, content)
+        : null;
+      await ctx.db.insert("messages", {
+        ...messageDocumentBase,
+        content: indexedContent?.content,
       });
 
       return null;
@@ -1500,24 +1687,9 @@ export const getMessagesPageForBackend = query({
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
 
-    // Verify chat ownership - if chat doesn't exist, return empty page
-    const chatExists: boolean = await ctx.runQuery(
-      internal.messages.verifyChatOwnership,
-      {
-        chatId: args.chatId,
-        userId: args.userId,
-      },
-    );
-
-    if (!chatExists) {
-      return {
-        page: [],
-        abliterationHistory: [],
-        fileTokens: [],
-        isDone: true,
-        continueCursor: "",
-      };
-    }
+    // Keep ownership and history in one query snapshot, without scheduling a
+    // nested query for every history page during periods of high concurrency.
+    await loadOwnedChat(ctx, args.chatId, args.userId);
 
     const result = await ctx.db
       .query("messages")
@@ -1907,8 +2079,11 @@ export const branchChat = mutation({
         return null;
       }
 
-      // Get all messages up to and including this message using index range
-      const messagesToCopy = await ctx.db
+      // Branching is one atomic transaction. Bound the entire history read,
+      // leaving room for ownership reads, pagination lookahead and the summary.
+      // Never continue pages here: that would restore the transaction-wide
+      // byte overflow, and copying only the first page would lose history.
+      const branchPage = await ctx.db
         .query("messages")
         .withIndex("by_chat_id", (q) =>
           q
@@ -1916,7 +2091,35 @@ export const branchChat = mutation({
             .lte("_creationTime", message._creationTime),
         )
         .order("asc")
-        .collect();
+        .paginate({
+          cursor: null,
+          numItems: 1000,
+          maximumRowsRead: 1001,
+          maximumBytesRead: MESSAGE_PAGE_MAX_BYTES,
+        });
+
+      const messagesToCopy = branchPage.page;
+      const historyBytes = messagesToCopy.reduce(
+        (bytes, msg) => bytes + getMessageDocumentSize(msg),
+        0,
+      );
+      if (
+        !branchPage.isDone ||
+        branchPage.pageStatus === "SplitRequired" ||
+        historyBytes > MESSAGE_PAGE_MAX_BYTES
+      ) {
+        convexLogger.warn("branch_chat_history_limit", {
+          reason: "atomic_history_budget",
+          message_count: messagesToCopy.length,
+          history_bytes: historyBytes,
+          max_history_bytes: MESSAGE_PAGE_MAX_BYTES,
+        });
+        throw new ConvexError({
+          code: "BRANCH_HISTORY_TOO_LARGE",
+          message:
+            "This task is too large to branch at this message. Try branching from an earlier message. Your original task is unchanged.",
+        });
+      }
 
       // Create new chat with same title as original
       const newChatId = crypto.randomUUID();

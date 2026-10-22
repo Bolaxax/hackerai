@@ -43,12 +43,19 @@ the server repeats those checks and retrieves a fresh hosted payment URL at clic
 time. Opening that URL does not charge an invoice or restore access.
 
 Former subscribers retain payment management in Account settings after dropping
-to Free. An unresolved canceled renewal uses the existing checkout safety guard
-and shows billing help instead of invoice payment: paying an old invoice does not
-restart a canceled subscription. Card management remains independent of that
-review. Status lookup failures stay unknown and offer retry instead of enabling a
-new checkout. Card-update returns request an entitlement refresh; payment status
-and access still require successful payment and the ordinary admission checks.
+to Free. An unresolved canceled renewal offers **Start fresh** instead of old
+invoice payment: paying an old invoice does not restart a canceled subscription.
+The authenticated billing admin/owner can retire eligible unpaid renewals from
+automatically failed individual subscriptions, including Stripe's default
+authentication attempts. The action discovers complete subscription history,
+rejects any current/incomplete subscription, retrieves each recovery target, and
+rechecks the checkout guard afterward. It creates no payment, refund, access, or
+new subscription. The UI refreshes billing status before enabling plan selection;
+ineligible or uncertain cases keep billing help available. Card management remains
+independent. Status lookup failures stay unknown and offer retry instead of
+enabling a new checkout. Card-update returns request an entitlement refresh;
+payment status and access still require successful payment and ordinary admission
+checks.
 
 ## Blocked-chat recovery
 
@@ -81,23 +88,33 @@ subscription, credit note, support resolution, partial payment, or unrelated
 refund requires manual reconciliation. Payments made before cancellation and
 voluntary cancellations are outside this policy.
 
-On `customer.subscription.deleted` with reason `payment_failed`, the handler
+On `customer.subscription.deleted` with reason `payment_failed` or
+`cancellation_requested`, the handler
 voids the latest wholly unpaid automatic renewal for a single recognized,
 licensed individual plan, with exactly one invoice line matching that subscription
-item and a quantity of one. Both `open` and `uncollectible` invoices can still be
-paid, so both are eligible. This deliberately retires that failed renewal debt
+item and a quantity of one. Requested cancellations cover Dashboard and portal
+cancellations as well as retries of the in-app cleanup. Only `open` invoices
+qualify for requested cancellations; written-off historical debt remains for
+review. For payment-failure cancellations, both `open` and `uncollectible` invoices
+qualify. This deliberately retires that failed renewal debt
 instead of collecting money for a subscription that cannot be restarted. It
 does not grant access or usage; the customer starts a new subscription normally.
 Team, metered, unfamiliar, partial-payment, prior-debt, proration, mixed-item, credit-note,
-and support-adjusted cases remain for review. Pending payment processing or
-authentication also prevents cleanup. Cleanup failures retry the deletion
+and support-adjusted cases remain for review. Pending payment processing still
+prevents cleanup. For automatic payment-failure cancellations only, an unfunded
+`requires_action` attempt can be retired when it is Stripe's default invoice
+payment and its invoice, customer and currency match. Billing-owned PaymentIntents
+cannot be canceled directly: void the invoice, then verify its terminal status,
+all invoice payments canceled, and each authentication PaymentIntent canceled.
+External authentication allocations and voluntary-cancellation authentication
+remain for review. Cleanup failures retry the deletion
 webhook before it is marked processed. Cleanup runs even if customer-user lookup
 fails or finds no users. A concurrent paid invoice stays under
 the existing late-payment reconciliation policy.
 
 This prevents future eligible canceled renewals from leaving a payable old
-invoice link or blocking a fresh checkout. It does not backfill already processed
-cancellations or change how an existing ambiguous paid invoice is resolved.
+invoice link or blocking a fresh checkout. Start fresh handles eligible existing
+cases on demand, without a bulk backfill or changes to ambiguous paid invoices.
 
 An in-app cancellation of a `past_due` or `unpaid` subscription ends service
 immediately. The cancellation path voids its latest open automatic renewal
@@ -120,6 +137,33 @@ event alongside `billing_late_payment_reconciled`. A refund records offsetting c
 revenue without restored access, recovered MRR, referral eligibility, or fresh
 usage credits. This change handles new webhook deliveries; it does not backfill
 previously processed payments.
+
+### Durable support review
+
+An unresolved positive payment made after a recognized subscription ended writes
+`hackeraiLatePaymentReview=required`, a reason,
+and `hackeraiLatePaymentReviewOwner=billing-support` to the invoice before the
+webhook is acknowledged. This includes historical invoices and missing user
+memberships. A delayed webhook for a payment made before cancellation does not
+create a case. Stripe failures retry delivery. Duplicate deliveries reuse the same
+invoice case and preserve unrelated metadata. This supplements the existing
+PostHog alerts; it does not send a customer message or automatically grant service.
+
+Billing support owns this queue. With a restricted Stripe credential securely
+provided through `STRIPE_SECRET_KEY` (account read and invoice read permissions),
+run `pnpm exec tsx scripts/list-late-payment-reviews.ts <acct_id> <test|live>`.
+The command verifies the account and credential mode, searches all pages, and
+re-reads each invoice before including it. Search is eventually consistent, so
+an empty result immediately after a webhook is not proof of no outstanding cases.
+The webhook credential needs invoice write permission to persist review markers.
+
+The existing `hackeraiLatePaymentResolution` metadata closes a case. Record it only
+after the financial/access decision is coordinated and verify the corresponding
+refund or replacement and allowance readback. The queue excludes resolved
+invoices even when a stale search result or webhook arrives later. No support
+resolution field is cleared by this handler. Unmarked historical events require
+a separate reconciliation pass; failed refund-update alerts remain under the
+existing refund monitoring workflow.
 
 For a manual replacement month, first coordinate with any in-flight webhook and
 confirm no refund has been issued. Mark the original invoice's metadata
@@ -193,8 +237,13 @@ detaches existing methods and has no sandbox guard).
    and a fresh checkout is allowed. Replay deletion: no additional write, access,
    usage, or charge. Make the void API fail once: delivery must retry and complete
    cleanup, rather than acknowledge and strand the invoice. Repeat with a partial
-   payment, credit note, mixed item, team plan, and processing/authentication
-   payment: none is voided automatically.
+   payment, credit note, mixed item, team plan, processing payment, and external
+   authentication allocation: none is voided automatically. For a default
+   authentication-required payment on an automatic cancellation, verify the
+   invoice is void and its PaymentIntent canceled. For a previously processed
+   cancellation, use Start fresh in pricing and Account settings; verify plan
+   selection becomes available after a fresh status check, and repeat the action
+   without an additional payment or write. Refresh/reload before choosing a plan.
 10. For the late-payment race, hold deletion delivery until its latest renewal is
     paid after cancellation. Confirm exactly one full refund, no paid access or
     usage reset, and offsetting revenue entries. Replay `invoice.paid` and refund

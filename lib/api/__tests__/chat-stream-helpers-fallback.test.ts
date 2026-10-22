@@ -8,7 +8,9 @@
 
 import {
   buildProviderOptions,
+  getFallbackSlugs,
   getContentFilterRetryModel,
+  getFallbackSlugs,
   getRetryFallbackModel,
   isAutoModelSelectionForRetry,
   isExplicitDeepSeekProSelectionForRetry,
@@ -16,6 +18,31 @@ import {
   resolveServedModelForCostAccounting,
   shouldRetryAbliterationError,
 } from "@/lib/api/chat-stream-helpers";
+
+import { getAgentContextBudget } from "@/lib/ai/agent-context-budget";
+import { getSummarizationThresholdTokens } from "@/lib/chat/summarization/constants";
+import {
+  DEEPSEEK_1017_MODEL_KEY,
+  DEEPSEEK_1017_SLUG,
+} from "@/lib/experiments/paid-deepseek-1017";
+
+it("bounds expanded Pro input for its real transparent fallback chain", () => {
+  const fallbackModelIds = getFallbackSlugs(DEEPSEEK_1017_MODEL_KEY, "agent", {
+    selectedModelOverride: "hackerai-pro",
+  });
+  const budget = getAgentContextBudget({
+    enabled: true,
+    mode: "agent",
+    subscription: "pro",
+    modelId: DEEPSEEK_1017_SLUG,
+    fallbackModelIds,
+  });
+  expect(budget).toBe(496_000);
+  expect(getSummarizationThresholdTokens(budget)).toBe(476_000);
+  expect(
+    getRetryFallbackModel(DEEPSEEK_1017_MODEL_KEY, "agent", "hackerai-pro"),
+  ).toBe("model-glm-5.3-flash");
+});
 
 jest.mock("@/lib/db/actions", () => ({
   getNotes: jest.fn(),
@@ -82,7 +109,7 @@ const KIMI_K3_SLUG = "moonshotai/kimi-k3";
 const GLM_5_2_SLUG = "z-ai/glm-5.2";
 const GLM_SLUG = "z-ai/glm-5.3";
 const GLM_FLASH_SLUG = "z-ai/glm-5.3-flash";
-const DEEPSEEK_VISION_SLUG = "deepseek/deepseek-v4.1-flash";
+const DEEPSEEK_VISION_SLUG = "deepseek/deepseek-v4.1-flash-1017";
 const DEEPSEEK_FLASH_SLUG = "deepseek/deepseek-v4-flash-0731";
 const DEEPSEEK_FLASH_CANONICAL_SLUG = "deepseek/deepseek-v4-flash-20260731";
 const DEEPSEEK_FLASH_PREVIOUS_SLUG = "deepseek/deepseek-v4-flash";
@@ -214,10 +241,10 @@ describe("buildProviderOptions fallback chain", () => {
       }),
     ).toEqual({});
     expect(getRetryFallbackModel("model-abliterated", "ask")).toBe(
-      "model-deepseek-v4-flash-0731",
+      "model-deepseek-v4-flash-vision",
     );
     expect(getRetryFallbackModel("model-abliterated", "agent")).toBe(
-      "model-deepseek-v4-flash-0731",
+      "model-deepseek-v4-flash-vision",
     );
     expect(
       resolveServedModelForCostAccounting({
@@ -404,6 +431,14 @@ describe("buildProviderOptions fallback chain", () => {
       models: [KIMI_K3_SLUG],
       user: "user-1",
     });
+  });
+
+  it("excludes the 1017 snapshot after its canonical ID returned content-filter", () => {
+    expect(
+      getFallbackSlugs("ask-model-free-glm", "ask", {
+        excludedModelSlugs: ["deepseek/deepseek-v4.1-flash-20261017"],
+      }),
+    ).toEqual([DEEPSEEK_V4_PRO_0813_SLUG, GLM_SLUG]);
   });
 
   it("falls back from the Grok-backed auto agent route through GLM 5.3 then Kimi K3", () => {
@@ -1304,7 +1339,7 @@ describe("resolveServedModelForCostAccounting", () => {
         responseModel: DEEPSEEK_FLASH_CANONICAL_SLUG,
         mode: "agent",
       }),
-    ).toBe("model-deepseek-v4-flash-0731");
+    ).toBe(DEEPSEEK_FLASH_SLUG);
   });
 
   it("maps a Grok slug served from free Agent fallback back to the local cost key", () => {
@@ -1473,5 +1508,52 @@ describe("resolveServedModelForCostAccounting", () => {
         mode: "agent",
       }),
     ).toBe("agent-model-free");
+  });
+});
+
+describe("Agent Max explicit provider recovery", () => {
+  const snapshot = "model-deepseek-v4.1-flash-1017-pro";
+  it("selects DeepSeek 1017 without admitting an unchecked Grok attempt or changing Ask and non-Max recovery", () => {
+    expect(
+      getRetryFallbackModel("model-glm-5.3", "agent", "hackerai-max"),
+    ).toBe(snapshot);
+    expect(getRetryFallbackModel(snapshot, "agent", "hackerai-max")).toBe(
+      snapshot,
+    );
+    expect(getRetryFallbackModel("model-glm-5.3", "ask", "hackerai-max")).toBe(
+      "model-kimi-k3",
+    );
+    expect(getRetryFallbackModel("model-glm-5.3", "agent")).toBe(
+      "model-kimi-k3",
+    );
+  });
+  it("sends maximum reasoning only on the explicit Max DeepSeek attempt", () => {
+    const options = buildProviderOptions(true, "user", snapshot, "agent", {
+      selectedModelOverride: "hackerai-max",
+    });
+    expect(options.openrouter.reasoning).toEqual({
+      enabled: true,
+      effort: "max",
+    });
+    expect(options.openrouter.models).toBeUndefined();
+    expect(
+      buildProviderOptions(true, "user", snapshot, "ask", {
+        selectedModelOverride: "hackerai-max",
+      }).openrouter.reasoning,
+    ).toEqual({ enabled: true, effort: "high" });
+  });
+  it("keeps a large GLM Max request from inheriting Grok's smaller budget", () => {
+    const options = buildProviderOptions(
+      true,
+      "user",
+      "model-glm-5.3",
+      "agent",
+      { selectedModelOverride: "hackerai-max" },
+    );
+    expect(options.openrouter.models).toBeUndefined();
+    expect(options.openrouter.reasoning).toEqual({
+      enabled: true,
+      effort: "high",
+    });
   });
 });

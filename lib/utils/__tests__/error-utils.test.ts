@@ -1,9 +1,11 @@
 import { describe, it, expect } from "@jest/globals";
 import {
+  isCancellationError,
   classifyProviderOverflowError,
   createProviderContentBlockedFinishReasonError,
   extractErrorDetails,
   extractRetryAttempts,
+  getErrorMessage,
   getUserFriendlyProviderError,
   getProviderErrorCategory,
   getProviderStatusCode,
@@ -27,6 +29,19 @@ const retryError = (errors: unknown[]) =>
     name: "AI_RetryError",
     errors,
   });
+
+describe("missing error messages", () => {
+  it.each([undefined, { message: undefined }, { toJSON: () => undefined }])(
+    "keeps structured error extraction safe without serialized text",
+    (value) => {
+      expect(getErrorMessage(value)).toBe("Unknown error occurred");
+      expect(extractErrorDetails(value)).toMatchObject({
+        errorName: "UnknownError",
+        errorMessage: "Unknown error occurred",
+      });
+    },
+  );
+});
 
 describe("extractRetryAttempts -> request_id", () => {
   it("extracts OpenRouter provider metadata from data.error.metadata", () => {
@@ -728,5 +743,23 @@ describe("SSE upstream abort recovery", () => {
     expect(
       extractErrorDetails(error("messages[1].private_payload")),
     ).not.toHaveProperty("providerErrorParam");
+  });
+});
+
+describe("isCancellationError", () => {
+  it("preserves unrelated failures after cancellation", () => {
+    const controller = new AbortController();
+    const reason = new Error("Stopped");
+    const abort = Object.assign(new Error("Aborted"), { name: "AbortError" });
+    expect(isCancellationError(abort, controller.signal)).toBe(false);
+    controller.abort(reason);
+    expect(isCancellationError(reason, controller.signal)).toBe(true);
+    expect(isCancellationError(abort, controller.signal)).toBe(true);
+    expect(
+      isCancellationError(new Error("Database failed"), controller.signal),
+    ).toBe(false);
+    expect(
+      isCancellationError(new TypeError("terminated"), controller.signal),
+    ).toBe(false);
   });
 });

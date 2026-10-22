@@ -1,3 +1,5 @@
+import { withTerminalCallTiming } from "./utils/terminal-call-timing";
+import { trackForegroundCommand } from "./utils/foreground-commands";
 import { tool, type Tool } from "ai";
 import { CommandExitError } from "@e2b/code-interpreter";
 import { randomUUID } from "crypto";
@@ -23,7 +25,6 @@ import {
 import {
   isCloudSandbox,
   isE2BSandbox,
-  isMiosaSandbox,
   isCentrifugoSandbox,
 } from "./utils/sandbox-types";
 import {
@@ -58,7 +59,9 @@ import {
 import {
   captureAgentBrowserUsage,
   getAgentBrowserRuntimeEnv,
+  detectAgentBrowserUsage,
 } from "./utils/agent-browser-usage";
+import { AGENT_BROWSER_IDLE_TIMEOUT_MS } from "./utils/agent-browser-runtime";
 import {
   RUN_TERMINAL_DEFAULT_STREAM_TIMEOUT_SECONDS,
   RUN_TERMINAL_MAX_TIMEOUT_SECONDS,
@@ -238,7 +241,22 @@ export const createRunTerminalCmd = (context: ToolContext) => {
     // normalize to the same execution input handled below.
   }) as unknown as Tool<RunTerminalCmdInput, unknown>;
 
-  return tool({
+  const prepareBrowserEnv = async (
+    sandbox: AnySandbox,
+    command: string,
+    interactiveShell = false,
+  ) => {
+    const env = getAgentBrowserRuntimeEnv(command);
+    if (!env && !(interactiveShell && context.browserSessions))
+      return undefined;
+    return {
+      AGENT_BROWSER_IDLE_TIMEOUT_MS: String(AGENT_BROWSER_IDLE_TIMEOUT_MS),
+      ...env,
+      ...(await context.browserSessions?.prepare(sandbox)),
+    };
+  };
+
+  const terminalTool = tool({
     ...runTerminalCmdTool,
     execute: async (
       {
@@ -404,13 +422,13 @@ export const createRunTerminalCmd = (context: ToolContext) => {
           const isCentrifugo = isCentrifugoSandbox(sandbox);
           const isE2B = isE2BSandbox(sandbox);
 
-          if (!isE2B && !isCentrifugo && !isMiosaSandbox(sandbox)) {
+          if (!isE2B && !isCentrifugo) {
             return {
               result: {
                 output: "",
                 exitCode: 1,
                 error:
-                  "Interactive PTY requires E2B, MIOSA, or local (Centrifugo) sandbox.",
+                  "Interactive PTY requires E2B or local (Centrifugo) sandbox.",
               },
             };
           }
@@ -438,10 +456,11 @@ export const createRunTerminalCmd = (context: ToolContext) => {
             interactive: true,
             isBackground: false,
           });
-          const agentBrowserEnv =
-            isE2B || isMiosaSandbox(sandbox)
-              ? getAgentBrowserRuntimeEnv(command)
-              : undefined;
+          // A persistent shell can launch the browser in a later send, including
+          // through a script. Establish its ownership before any input runs.
+          const agentBrowserEnv = isE2B
+            ? await prepareBrowserEnv(sandbox, command, true)
+            : undefined;
 
           // Factory is invoked BY `ptySessionManager.create` — this ensures
           // that if the concurrency cap is hit, the factory is never called
@@ -468,16 +487,6 @@ export const createRunTerminalCmd = (context: ToolContext) => {
                   cwd: sandbox.getWorkingDirectory(),
                 });
               }
-              if (isMiosaSandbox(sandbox)) {
-                const { createMiosaPtyHandle } =
-                  await import("./utils/miosa-pty-adapter");
-                return createMiosaPtyHandle(sandbox, {
-                  cols,
-                  rows,
-                  cwd: buildSandboxCommandOptions(sandbox).cwd,
-                  envs: agentBrowserEnv,
-                });
-              }
               return createE2BPtyHandle(sandbox, {
                 cols,
                 rows,
@@ -495,7 +504,11 @@ export const createRunTerminalCmd = (context: ToolContext) => {
           // passed in pty_create and the local runner spawns it directly.
           if (!isCentrifugo) {
             await session.handle.sendInput(
-              new TextEncoder().encode(command + "\n"),
+              new TextEncoder().encode(
+                (context.browserSessions && agentBrowserEnv
+                  ? `umask 077; unset AGENT_BROWSER_SESSION_NAME AGENT_BROWSER_PROFILE AGENT_BROWSER_STATE; ${command}`
+                  : command) + "\n",
+              ),
             );
           }
           session.lastActivityAt = Date.now();
@@ -770,6 +783,9 @@ export const createRunTerminalCmd = (context: ToolContext) => {
           : executeWithLocalRelayRecovery(sandbox));
 
         async function executeCommand(sandboxInstance: typeof sandbox) {
+          const agentBrowserEnv = isE2BSandbox(sandboxInstance)
+            ? await prepareBrowserEnv(sandboxInstance, command)
+            : undefined;
           captureAgentBrowserUsage({
             context,
             command,
@@ -825,16 +841,6 @@ export const createRunTerminalCmd = (context: ToolContext) => {
             };
 
             const terminateManagedCommand = async (): Promise<boolean> => {
-              if (isMiosaSandbox(sandboxInstance)) {
-                commandAbortController.abort();
-                if (!runPromise) return false;
-                try {
-                  await runPromise;
-                  return false;
-                } catch (error) {
-                  return error instanceof Error && error.name === "AbortError";
-                }
-              }
               if (isCentrifugoSandbox(sandboxInstance)) {
                 if (cancelCentrifugoCommand) {
                   return cancelCentrifugoCommand();
@@ -1121,13 +1127,6 @@ export const createRunTerminalCmd = (context: ToolContext) => {
                     onStderr: forwardCommandOutput,
                   },
             );
-            // agent-browser is installed in MIOSA sandboxes too, and needs the
-            // same runtime env there. Gating this on E2B alone left Chromium
-            // running without its configured flags on MIOSA.
-            const agentBrowserEnv =
-              isE2BSandbox(sandboxInstance) || isMiosaSandbox(sandboxInstance)
-                ? getAgentBrowserRuntimeEnv(command)
-                : undefined;
             const runOptions = isCentrifugoSandbox(sandboxInstance)
               ? {
                   ...commonOptions,
@@ -1144,15 +1143,7 @@ export const createRunTerminalCmd = (context: ToolContext) => {
                     ...(agentBrowserEnv && { envs: agentBrowserEnv }),
                     signal: abortSignal,
                   }
-                : isMiosaSandbox(sandboxInstance)
-                  ? {
-                      ...commonOptions,
-                      signal: is_background
-                        ? abortSignal
-                        : commandAbortController.signal,
-                      ...(agentBrowserEnv && { envVars: agentBrowserEnv }),
-                    }
-                  : commonOptions;
+                : commonOptions;
 
             // Determine if an error is a permanent command failure (don't retry)
             // vs a transient sandbox issue (do retry)
@@ -1191,7 +1182,11 @@ export const createRunTerminalCmd = (context: ToolContext) => {
             // Augment PATH for local sandboxes so user-installed tools
             // (e.g. ~/go/bin/waybackurls) are found without full paths.
             const effectiveCommand = augmentCommandPath(
-              command,
+              context.browserSessions &&
+                isE2BSandbox(sandboxInstance) &&
+                detectAgentBrowserUsage(command)
+                ? `umask 077; unset AGENT_BROWSER_SESSION_NAME AGENT_BROWSER_PROFILE AGENT_BROWSER_STATE; ${command}`
+                : command,
               sandboxInstance,
             );
 
@@ -1440,11 +1435,8 @@ export const createRunTerminalCmd = (context: ToolContext) => {
         };
       }
     },
-    // For interactive PTY results, strip rawSnapshot from what the model
-    // sees — the agent only needs the cleaned `output` plus structural
-    // fields. rawSnapshot stays in the persisted tool result so the
-    // sidebar's xterm renderer can replay it. No-op for non-interactive
-    // results, which never include rawSnapshot.
+    // The model only needs cleaned output and structural fields. Keep timing
+    // in diagnostics and rawSnapshot in the persisted result for xterm replay.
     //
     // Prepend a plain-language process state so partial stdout cannot be
     // mistaken for a successful command when the structural result explicitly
@@ -1457,10 +1449,11 @@ export const createRunTerminalCmd = (context: ToolContext) => {
       if (typeof result !== "object" || result === null) {
         return { type: "text", value: JSON.stringify(output) };
       }
-      const { rawSnapshot: _rawSnapshot, ...rest } = result as Record<
-        string,
-        unknown
-      >;
+      const {
+        rawSnapshot: _rawSnapshot,
+        callTiming: _callTiming,
+        ...rest
+      } = result as Record<string, unknown>;
       const processStatus = getTerminalProcessStatus(rest);
       const serializedResult = JSON.stringify({ result: rest });
 
@@ -1472,4 +1465,24 @@ export const createRunTerminalCmd = (context: ToolContext) => {
       };
     },
   });
+  return {
+    ...terminalTool,
+    execute: withTerminalCallTiming(
+      context,
+      "run_terminal_cmd",
+      (
+        input: Parameters<NonNullable<typeof terminalTool.execute>>[0],
+        options,
+      ) => {
+        // Terminal tools return one result, never an AsyncIterable.
+        const execute = async () =>
+          (await terminalTool.execute!(input, options)) as {
+            result: Record<string, unknown>;
+          };
+        return input.is_background || input.interactive
+          ? execute()
+          : trackForegroundCommand(context, execute);
+      },
+    ),
+  };
 };

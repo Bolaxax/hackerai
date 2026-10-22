@@ -1,4 +1,9 @@
 import {
+  DEEPSEEK_1017_MODEL_KEY,
+  DEEPSEEK_1017_SLUG,
+  DEEPSEEK_1017_CANONICAL_SLUG,
+} from "@/lib/experiments/paid-deepseek-1017";
+import {
   ABLITERATION_LARGE_V2_MODEL_KEY,
   ABLITERATION_MODEL_KEY,
   isAbliterationModel,
@@ -28,7 +33,6 @@ import type {
   UserCustomization,
 } from "@/types";
 import {
-  DEEPSEEK_V4_FLASH_VISION_SLUG,
   GLM_5_3_FLASH_SLUG,
   GLM_5_3_SLUG,
   GROK_4_5_SLUG,
@@ -147,6 +151,7 @@ export function sendRateLimitWarnings(
     subscription: SubscriptionTier;
     mode: ChatMode;
     rateLimitInfo: {
+      freeDailyCost?: boolean;
       remaining: number;
       limit: number;
       resetTime: Date;
@@ -180,6 +185,21 @@ export function sendRateLimitWarnings(
     return;
   }
 
+  if (subscription === "free" && rateLimitInfo.freeDailyCost) {
+    const usedPercent =
+      100 * (1 - rateLimitInfo.remaining / rateLimitInfo.limit);
+    if (!rateLimitInfo.rateLimitSkipped && usedPercent >= 75) {
+      emitTokenBucketThresholdWarning(writer, {
+        bucketType: "daily",
+        usedPercent,
+        projectedUsedPoints: rateLimitInfo.limit - rateLimitInfo.remaining,
+        monthlyLimitPoints: rateLimitInfo.limit,
+        resetTime: rateLimitInfo.resetTime,
+        subscription,
+      });
+    }
+    return;
+  }
   if (subscription === "free") {
     // Warn when roughly 30% of daily limit remains (minimum threshold of 1)
     const warningThreshold = Math.max(1, Math.ceil(rateLimitInfo.limit * 0.3));
@@ -245,6 +265,7 @@ export function sendRateLimitWarnings(
  * one of these and let the helper format the dollar/severity payload.
  */
 export interface TokenBucketEmitContext {
+  bucketType?: "daily" | "monthly";
   /** Used percentage (0–100+), pre-rounding. */
   usedPercent: number;
   /** Points consumed against the monthly bucket so far. */
@@ -271,7 +292,7 @@ export function emitTokenBucketThresholdWarning(
     ctx.usedPercent >= 90 ? "warning" : "info";
   writeRateLimitWarning(writer, {
     warningType: "token-bucket",
-    bucketType: "monthly",
+    bucketType: ctx.bucketType ?? "monthly",
     remainingPercent,
     resetTime: ctx.resetTime.toISOString(),
     subscription: ctx.subscription,
@@ -413,6 +434,7 @@ export interface SummarizationStepResult {
 }
 
 export async function runSummarizationStep(options: {
+  compactionPolicy?: import("@/lib/chat/summarization/compaction-policy").CompactionModelPolicy;
   messages: UIMessage[];
   subscription: SubscriptionTier;
   languageModel: LanguageModel;
@@ -427,6 +449,7 @@ export async function runSummarizationStep(options: {
   ctxSystemTokens: number;
   ctxMaxTokens: number;
   providerInputTokens?: number;
+  preparedInputTokens?: number;
   chatSystemPrompt: string;
   tools?: ToolSet;
   providerOptions?: Record<string, Record<string, unknown>>;
@@ -457,6 +480,7 @@ export async function runSummarizationStep(options: {
     ensureSandbox: options.ensureSandbox,
     systemPromptTokens: options.systemPromptTokens,
     providerInputTokens: options.providerInputTokens ?? 0,
+    preparedInputTokens: options.preparedInputTokens,
     chatSystemPrompt: options.chatSystemPrompt,
     tools: options.tools,
     providerOptions: options.providerOptions,
@@ -466,6 +490,7 @@ export async function runSummarizationStep(options: {
     providerPromptPressure: options.providerPromptPressure,
     onPhaseDuration: options.onPhaseDuration,
     startupCompaction: options.startupCompaction,
+    compactionPolicy: options.compactionPolicy,
     registerBackgroundWork: options.registerBackgroundWork,
   });
 
@@ -606,7 +631,7 @@ const PRO_TEXT_FALLBACK_CHAIN = [
 // three entries. Longer logical routes can still be used by app-side retries.
 const OPENROUTER_MAX_FALLBACK_MODELS = 3;
 
-const DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN = [
+const DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN = [
   "model-glm-5.3-flash",
   "model-deepseek-v4-pro-0813",
   "model-glm-5.3",
@@ -636,12 +661,12 @@ const HACKERAI_PRO_FALLBACK_CHAIN = [
 ] as const satisfies readonly ModelName[];
 
 const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
-  "ask-model-free": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+  "ask-model-free": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "ask-model-free-glm": GLM_FLASH_AGENT_FALLBACK_CHAIN,
-  "ask-model-free-deepseek-v41": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
-  "agent-model-free": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+  "ask-model-free-deepseek-v41": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
+  "agent-model-free": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-glm-5.3-flash-agent": GLM_FLASH_AGENT_FALLBACK_CHAIN,
-  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-deepseek-v4-pro": PRO_TEXT_FALLBACK_CHAIN,
   "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN,
   "ask-model": GROK_4_6_FALLBACK_CHAIN,
@@ -655,8 +680,9 @@ const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
   "model-glm-5.3": ["model-kimi-k3"],
   "model-glm-5.3-flash": GLM_FLASH_RECOVERY_FALLBACK_CHAIN,
   "model-glm-5.3-flash-pro": GLM_FLASH_RECOVERY_FALLBACK_CHAIN,
-  "model-deepseek-v4-flash-vision": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
-  "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+  "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
+  "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
+  [DEEPSEEK_1017_MODEL_KEY]: DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "fallback-agent-model": GROK_4_6_FALLBACK_CHAIN,
   "fallback-ask-model": GROK_4_6_FALLBACK_CHAIN,
   "model-kimi-k3": ["model-grok-4.6"],
@@ -706,13 +732,15 @@ export function isExplicitDeepSeekProSelectionForRetry({
 }): boolean {
   return (
     selectedModelOverride === "hackerai-pro" &&
-    (EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS.has(selectedModel) ||
+    (selectedModel === DEEPSEEK_1017_MODEL_KEY ||
+      EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS.has(selectedModel) ||
       (mode === "agent" &&
         selectedModel === "model-deepseek-v4-flash-vision-pro"))
   );
 }
 
 const HIGH_REASONING_MODELS = [
+  DEEPSEEK_1017_MODEL_KEY,
   "model-grok-4.5-pro",
   "model-grok-4.6",
   "model-grok-4.6-pro",
@@ -730,6 +758,8 @@ const isHighReasoningModel = (modelName?: string): boolean =>
   (HIGH_REASONING_MODELS as readonly string[]).includes(modelName);
 
 type FallbackOptions = {
+  /** Max uses explicit recovery so each model gets its own reasoning policy. */
+  selectedModelOverride?: SelectedModel;
   /** Preserve the authenticated free Ask policy across model retries. */
   isFreeAskRequest?: boolean;
   hasMultimodalToolResults?: boolean;
@@ -770,8 +800,13 @@ const getFallbackKeys = (
 /** Returns the first app-side retry model for a failed provider route. */
 export function getRetryFallbackModel(
   modelName: ModelName,
-  _mode: ChatMode,
+  mode: ChatMode,
+  selectedModelOverride?: SelectedModel,
 ): ModelName {
+  if (mode === "agent" && selectedModelOverride === "hackerai-max") {
+    // Grok is admitted only by the context-aware final recovery decision.
+    return DEEPSEEK_1017_MODEL_KEY;
+  }
   if (modelName === ABLITERATION_LARGE_V2_MODEL_KEY) {
     return "model-deepseek-v4-pro-0813";
   }
@@ -782,9 +817,10 @@ export function getRetryFallbackModel(
     return "model-deepseek-v4-flash-vision";
   }
   if (modelName === ABLITERATION_MODEL_KEY) {
-    return "model-deepseek-v4-flash-0731";
+    return "model-deepseek-v4-flash-vision";
   }
   if (
+    modelName === DEEPSEEK_1017_MODEL_KEY ||
     modelName === "ask-model-free" ||
     modelName === "ask-model-free-deepseek-v41" ||
     modelName === "agent-model-free" ||
@@ -914,9 +950,13 @@ const resolveSlug = (modelName: string): string | undefined => {
  */
 export function getFallbackSlugs(
   modelName?: string,
-  _mode?: ChatMode,
+  mode?: ChatMode,
   options: FallbackOptions = {},
 ): string[] {
+  // Transparent fallbacks share reasoning options and can lower context capacity.
+  // Max instead uses bounded, context-checked app-side recovery attempts.
+  if (mode === "agent" && options.selectedModelOverride === "hackerai-max")
+    return [];
   const fallbackKeys = getFallbackKeys(modelName);
   const excludedModelSlugs = options.excludedModelSlugs ?? [];
   return (
@@ -934,10 +974,14 @@ export function getFallbackSlugs(
 
 const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "anthropic/claude-opus-4.6": "model-opus-4.6",
+  [DEEPSEEK_1017_SLUG]: DEEPSEEK_1017_MODEL_KEY,
+  [DEEPSEEK_1017_CANONICAL_SLUG]: DEEPSEEK_1017_MODEL_KEY,
   "deepseek/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
   "deepseek/deepseek-v4-flash-20260423": "deepseek/deepseek-v4-flash",
-  "deepseek/deepseek-v4-flash-0731": "model-deepseek-v4-flash-0731",
-  "deepseek/deepseek-v4-flash-20260731": "model-deepseek-v4-flash-0731",
+  // Historical provider responses keep their original rates even though the
+  // persisted registry alias now routes to V4.1.
+  "deepseek/deepseek-v4-flash-0731": "deepseek/deepseek-v4-flash-0731",
+  "deepseek/deepseek-v4-flash-20260731": "deepseek/deepseek-v4-flash-0731",
   "deepseek/deepseek-v4-pro-0813": "model-deepseek-v4-pro-0813",
   "deepseek/deepseek-v4-pro-20260813": "model-deepseek-v4-pro-0813",
   "x-ai/grok-4.5": "model-grok-4.5",
@@ -948,7 +992,8 @@ const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "z-ai/glm-5.3": "model-glm-5.3",
   "z-ai/glm-5.3-20260816": "model-glm-5.3",
   [GLM_5_3_FLASH_SLUG]: "model-glm-5.3-flash",
-  [DEEPSEEK_V4_FLASH_VISION_SLUG]: "model-deepseek-v4-flash-vision",
+  // Keep historical responses separate from the active 1017 snapshot above.
+  "deepseek/deepseek-v4.1-flash": "model-deepseek-v4-flash-vision",
   "deepseek/deepseek-v4.1-flash-20260910": "model-deepseek-v4-flash-vision",
   "moonshotai/kimi-k3": "model-kimi-k3",
   "moonshotai/kimi-k3-20260715": "model-kimi-k3",
@@ -1071,37 +1116,46 @@ export function buildProviderOptions(
       }
     : baseProviderRouting;
   // GLM titles need mandatory reasoning, kept low for the small output budget.
-  const reasoning = isTitleGeneration
-    ? { enabled: true, effort: "low" }
-    : isStandardGlmFlashVision
+  const reasoning =
+    modelName === DEEPSEEK_1017_MODEL_KEY
       ? {
           enabled: true,
-          effort: "high",
+          effort:
+            mode === "agent" && options.selectedModelOverride === "hackerai-max"
+              ? "max"
+              : "high",
         }
-      : isMediumGrok45Vision
-        ? {
-            enabled: true,
-            effort: "medium",
-          }
-        : routesThroughHighReasoningModel
-          ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
-            ? options.reasoningOverride
-            : {
+      : isTitleGeneration
+        ? { enabled: true, effort: "low" }
+        : isStandardGlmFlashVision
+          ? {
+              enabled: true,
+              effort: "high",
+            }
+          : isMediumGrok45Vision
+            ? {
                 enabled: true,
-                effort: "high",
+                effort: "medium",
               }
-          : (options.reasoningOverride ??
-            (isHighReasoningModel(modelName) || isAgentDeepSeekV4
-              ? {
-                  enabled: true,
-                  effort: "high",
-                }
-              : isReasoningModel
-                ? {
+            : routesThroughHighReasoningModel
+              ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
+                ? options.reasoningOverride
+                : {
                     enabled: true,
-                    ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                    effort: "high",
                   }
-                : { enabled: false }));
+              : (options.reasoningOverride ??
+                (isHighReasoningModel(modelName) || isAgentDeepSeekV4
+                  ? {
+                      enabled: true,
+                      effort: "high",
+                    }
+                  : isReasoningModel
+                    ? {
+                        enabled: true,
+                        ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                      }
+                    : { enabled: false }));
 
   return {
     openrouter: {
@@ -1482,25 +1536,7 @@ export function assertFreeAgentGates(args: {
   }
 }
 
-/**
- * Paid plans are Agent-only. Enforce this at the API boundary so stale clients
- * and direct requests cannot restore the removed paid Ask path.
- */
-export function assertChatModeAccess(args: {
-  mode: unknown;
-  subscription: SubscriptionTier;
-}): void {
-  if (args.mode !== "ask" && args.mode !== "agent") {
-    throw new ChatSDKError("bad_request:api", "Invalid chat mode.");
-  }
-
-  if (args.mode !== "ask" || args.subscription === "free") return;
-
-  throw new ChatSDKError(
-    "forbidden:chat",
-    "Paid plans use Agent mode. Ask mode is only available on the free plan.",
-  );
-}
+export { assertChatModeAccess } from "@/lib/utils/mode-helpers";
 
 /**
  * Build the extra-usage config for paid users with `extra_usage_enabled`.
@@ -1605,6 +1641,7 @@ export async function estimatePreflightInputTokens(args: {
   subscription: SubscriptionTier;
   userId: string;
   selectedModel: ModelName;
+  selectedModelOverride?: SelectedModel;
   userCustomization: UserCustomization | null | undefined;
   truncatedMessages: UIMessage[];
 }): Promise<number> {
@@ -1613,6 +1650,7 @@ export async function estimatePreflightInputTokens(args: {
     subscription,
     userId,
     selectedModel,
+    selectedModelOverride,
     userCustomization,
     truncatedMessages,
   } = args;
@@ -1626,6 +1664,10 @@ export async function estimatePreflightInputTokens(args: {
     selectedModel,
     userCustomization,
     null,
+    "full_access",
+    false,
+    undefined,
+    selectedModelOverride,
   );
   const systemTokens = safeCountTokens(estimatedSystemPrompt);
   const toolSchemaOverhead = isAgentMode(mode) ? 1500 : 500;

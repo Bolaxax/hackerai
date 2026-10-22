@@ -1,6 +1,9 @@
 mod platform;
 mod environment_identity;
+mod file_save;
 mod pty;
+#[cfg(test)]
+mod updater_tests;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -16,6 +19,8 @@ use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const DESKTOP_AUTH_STATE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PENDING_DESKTOP_AUTH_STATES: usize = 16;
@@ -83,6 +88,41 @@ fn get_cmd_server_info() -> CmdServerInfo {
         port: CMD_SERVER_PORT.load(Ordering::Relaxed),
         token: CMD_SERVER_TOKEN.get().cloned().unwrap_or_default(),
     }
+}
+
+/// Write only after the user selects a destination in the native save dialog.
+/// No path supplied by the webview is accepted as a write destination.
+#[tauri::command]
+async fn save_file_with_dialog(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    filename: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    tokio::task::spawn_blocking(move || {
+        let suggested_name = Path::new(&filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Invalid filename".to_string())?;
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_file_name(suggested_name);
+        if let Ok(downloads) = app.path().download_dir() {
+            dialog = dialog.set_directory(downloads);
+        }
+        let Some(selected) = dialog.blocking_save_file() else {
+            return Ok(None);
+        };
+        let path = selected.into_path().map_err(|error| error.to_string())?;
+        file_save::save_text(&path, &content).map_err(|error| error.to_string())?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -285,10 +325,36 @@ fn remove_generated_text_attachment(
 
 #[tauri::command]
 fn read_local_file(path: String) -> Result<LocalFileData, String> {
+    read_local_file_data(path, None)
+}
+
+#[tauri::command(async)]
+fn read_local_preview_file(path: String) -> Result<LocalFileData, String> {
+    read_local_file_data(path, Some(10 * 1024 * 1024))
+}
+
+fn read_local_file_data(path: String, max_bytes: Option<u64>) -> Result<LocalFileData, String> {
     use base64::Engine;
+    use std::io::Read;
 
     let metadata = get_local_file_metadata(path.clone())?;
-    let bytes = fs::read(&path).map_err(|e| format!("Read error: {}", e))?;
+    let bytes = if let Some(limit) = max_bytes {
+        let limit = limit.min(10 * 1024 * 1024);
+        if metadata.size > limit {
+            return Err("File exceeds preview limit".into());
+        }
+        let file = fs::File::open(&path).map_err(|_| "File is no longer available")?;
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Could not read file")?;
+        if bytes.len() as u64 > limit {
+            return Err("File exceeds preview limit".into());
+        }
+        bytes
+    } else {
+        fs::read(&path).map_err(|e| format!("Read error: {}", e))?
+    };
 
     Ok(LocalFileData {
         path: metadata.path,
@@ -298,6 +364,38 @@ fn read_local_file(path: String) -> Result<LocalFileData, String> {
         last_modified: metadata.last_modified,
         base64: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
+}
+
+#[cfg(test)]
+mod local_preview_tests {
+    use super::*;
+
+    #[test]
+    fn preview_reads_bytes_and_rejects_oversized_or_missing_files() {
+        let path = std::env::temp_dir().join(format!(
+            "hackerai-preview-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"local preview").unwrap();
+        let name = path.to_string_lossy().into_owned();
+        let result = read_local_preview_file(name.clone()).unwrap();
+        assert_eq!(result.base64, "bG9jYWwgcHJldmlldw==");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(10 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            matches!(read_local_preview_file(name.clone()), Err(e) if e == "File exceeds preview limit")
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(read_local_preview_file(name).is_err());
+    }
 }
 
 // ── Command Execution Server ──────────────────────────────────────────
@@ -1714,28 +1812,31 @@ fn handle_auth_deep_link(app: &tauri::AppHandle, url: &url::Url) {
     }
 }
 
+async fn check_update(
+    builder: tauri_plugin_updater::UpdaterBuilder,
+    check_timeout: Duration,
+    download_timeout: Duration,
+) -> tauri_plugin_updater::Result<Option<tauri_plugin_updater::Update>> {
+    let updater = builder.timeout(check_timeout).build()?;
+    let mut update = updater.check().await?;
+    if let Some(update) = update.as_mut() {
+        // The updater does not propagate the check timeout to the returned download.
+        // Bound HTTP activity without timing out user approval or native installation.
+        update.timeout = Some(download_timeout);
+    }
+    Ok(update)
+}
+
 async fn check_for_updates(app: tauri::AppHandle, silent: bool) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-    let updater = match app.updater() {
-        Ok(updater) => updater,
-        Err(e) => {
-            if silent {
-                log::warn!("Auto-update check failed to get updater: {}", e);
-            } else {
-                log::error!("Failed to get updater: {}", e);
-                let _ = app
-                    .dialog()
-                    .message(format!("Failed to check for updates: {}", e))
-                    .kind(MessageDialogKind::Error)
-                    .title("Update Error")
-                    .blocking_show();
-            }
-            return;
-        }
-    };
-
-    match updater.check().await {
+    match check_update(
+        app.updater_builder(),
+        UPDATE_CHECK_TIMEOUT,
+        UPDATE_DOWNLOAD_TIMEOUT,
+    )
+    .await
+    {
         Ok(Some(update)) => {
             let version = update.version.clone();
             log::info!("Update available: {}", version);
@@ -2092,12 +2193,14 @@ pub fn run() {
             get_dev_auth_port,
             prepare_desktop_auth_state,
             get_cmd_server_info,
+            save_file_with_dialog,
             desktop_file_request,
             get_local_file_metadata,
             write_generated_text_attachment,
             read_generated_text_attachment,
             remove_generated_text_attachment,
             read_local_file,
+            read_local_preview_file,
             execute_command,
             execute_stream_command,
             cancel_stream_command,

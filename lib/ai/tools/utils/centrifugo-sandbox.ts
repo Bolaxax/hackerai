@@ -11,6 +11,7 @@ import { Centrifuge, type Subscription } from "centrifuge";
 import { generateCentrifugoToken } from "@/lib/centrifugo/jwt";
 import {
   sandboxConnectionChannel,
+  DESKTOP_COMMAND_DELIVERY_GRACE_MS,
   type CommandResponseMessage,
   type CommandMessage,
   type FileRequestMessage,
@@ -26,6 +27,7 @@ import {
   recordRelayReceivedBytes,
 } from "@/lib/centrifugo/traffic";
 import {
+  isCentrifugoPublishTimeout,
   CentrifugoMessageReassembler,
   fragmentCentrifugoMessage,
   fragmentMatchesCorrelation,
@@ -72,6 +74,7 @@ const SETUP_COMMAND_TIMEOUT_MS = 30000;
 const SETUP_COMMAND_MAX_ATTEMPTS = 2;
 const SETUP_COMMAND_RETRY_DELAY_MS = 500;
 const COMMAND_CANCEL_ACK_TIMEOUT_MS = 5000;
+const COMMAND_CANCEL_RETRY_MS = 1500;
 const TRANSIENT_COMMAND_TIMEOUT_ERROR_PATTERN =
   /\b(?:deadline_exceeded|operation timed out:.*\btimeoutMs\b|exceeding ['"]?timeoutMs['"]?|Command timeout after \d+ms)\b/i;
 
@@ -677,8 +680,14 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
             this.connectionInfo.connectionId,
           );
 
-      // Generate short-lived JWT for this subscription (30s + command timeout)
-      const tokenExpSeconds = Math.ceil(timeout / 1000) + 30;
+      // Desktop retains output across relay outages after native execution ends.
+      // Keep the receiver and its token alive for that bounded delivery window;
+      // this does not extend native execution or change CLI command deadlines.
+      const maxWaitTime =
+        timeout +
+        5000 +
+        (this.connectionInfo.isDesktop ? DESKTOP_COMMAND_DELIVERY_GRACE_MS : 0);
+      const tokenExpSeconds = Math.ceil(maxWaitTime / 1000) + 30;
       const token = await generateCentrifugoToken(this.userId, tokenExpSeconds);
 
       // Create a centrifuge client for this command
@@ -693,6 +702,7 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
         let settled = false;
         let timeoutId: NodeJS.Timeout | undefined;
         let cancelAckTimeoutId: NodeJS.Timeout | undefined;
+        let cancelRetryTimeoutId: NodeJS.Timeout | undefined;
         let subscription: Subscription | undefined;
         let publishedCommand = false;
         let commandPublishInFlight = false;
@@ -707,8 +717,6 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
         let cancelAttemptPromise: Promise<boolean> | null = null;
         let resolveCancelAttempt: ((confirmed: boolean) => void) | null = null;
         const reassembler = new CentrifugoMessageReassembler();
-
-        const maxWaitTime = timeout + 5000; // Add 5s buffer for network
 
         // Timing diagnostics — track which phase we reached before timeout
         const t0 = Date.now();
@@ -736,6 +744,8 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
             clearTimeout(cancelAckTimeoutId);
             cancelAckTimeoutId = undefined;
           }
+          clearTimeout(cancelRetryTimeoutId);
+          cancelRetryTimeoutId = undefined;
           if (subscription) {
             try {
               subscription.unsubscribe();
@@ -771,6 +781,8 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
         };
 
         const failCancellation = (message: string) => {
+          clearTimeout(cancelRetryTimeoutId);
+          cancelRetryTimeoutId = undefined;
           if (cancelAckTimeoutId) {
             clearTimeout(cancelAckTimeoutId);
             cancelAckTimeoutId = undefined;
@@ -807,19 +819,35 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
             }
           }, COMMAND_CANCEL_ACK_TIMEOUT_MS);
 
-          subscription
-            .publish({
-              type: "command_cancel",
-              commandId,
-              targetConnectionId: this.connectionInfo.connectionId,
-            })
-            .catch(() => {
-              if (cancelAttemptPromise === attempt) {
-                failCancellation(
-                  "Failed to publish local command cancellation.",
-                );
-              }
-            });
+          let retried = false;
+          const sendCancel = (retry: boolean) => {
+            subscription!
+              .publish({
+                type: "command_cancel",
+                commandId,
+                targetConnectionId: this.connectionInfo.connectionId,
+              })
+              .catch((error: unknown) => {
+                if (cancelAttemptPromise === attempt && (retry || !retried)) {
+                  // A missing RPC ACK does not prove the control was rejected.
+                  // Leave the bounded resend/acknowledgement deadline in charge.
+                  if (isCentrifugoPublishTimeout(error)) return;
+                  failCancellation(
+                    "Failed to publish local command cancellation.",
+                  );
+                }
+              });
+          };
+          // Stop is idempotent for this exact command/connection. Resend once
+          // if no terminal response arrives, even if the first RPC is stalled.
+          // Never replay the command or extend the acknowledgement deadline.
+          cancelRetryTimeoutId = setTimeout(() => {
+            cancelRetryTimeoutId = undefined;
+            if (settled || cancelAttemptPromise !== attempt) return;
+            retried = true;
+            sendCancel(true);
+          }, COMMAND_CANCEL_RETRY_MS);
+          sendCancel(false);
         };
 
         const requestCancellation = (
@@ -1403,6 +1431,66 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
   // Cache for the detected HTTP client.
   private httpClient: HttpClient | null = null;
   private powerShellExecutable: string | undefined;
+  private uploadReadDiagnosticStarted = false;
+
+  private async diagnoseUploadReadFailure(path: string): Promise<void> {
+    // Reserve before awaiting: concurrent and repeated failed files share one
+    // metadata-only probe per adapter. Never read file contents or list folders.
+    if (this.uploadReadDiagnosticStarted) return;
+    this.uploadReadDiagnosticStarted = true;
+    const escaped = CentrifugoSandbox.escapePath(path);
+    const marker = "__HACKERAI_UPLOAD_READ_FLAGS__:";
+    const command =
+      `printf '${marker}'; ` +
+      ["-e", "-f", "-r"]
+        .map(
+          (flag) =>
+            `if test ${flag} ${escaped}; then printf 1; else printf 0; fi; `,
+        )
+        .join("") +
+      "printf '\\n'";
+    let probeStatus: "complete" | "invalid_response" | "unavailable" =
+      "unavailable";
+    let flags: boolean[] | null = null;
+    try {
+      const result = await this.commands.run(command, {
+        timeoutMs: 2_000,
+        displayName: "",
+      });
+      const match = result.stdout.match(
+        /(?:^|\n)__HACKERAI_UPLOAD_READ_FLAGS__:([01])([01])([01])\r?(?:\n|$)/,
+      );
+      if (result.exitCode === 0 && match) {
+        probeStatus = "complete";
+        flags = match.slice(1).map((flag) => flag === "1");
+      } else if (result.exitCode === 0) {
+        probeStatus = "invalid_response";
+      }
+    } catch {
+      // Diagnostics must not replace the upload failure or retry publication.
+    }
+    try {
+      console.warn(
+        "[centrifugo-http]",
+        JSON.stringify({
+          level: "warn",
+          event: "sandbox_file_upload_input_diagnostic",
+          sandbox_type: "desktop",
+          platform: "posix",
+          http_client: "curl",
+          exit_code: 26,
+          probe_status: probeStatus,
+          input_exists: flags?.[0] ?? null,
+          input_regular_file: flags?.[1] ?? null,
+          // A confined curl process can still differ from this shell's view.
+          input_readable_by_shell: flags?.[2] ?? null,
+          native_file_relay: this.supportsNativeFileRelay(),
+        }),
+      );
+    } catch {
+      // Logging is optional; preserve the original redacted upload error.
+    }
+  }
 
   private async resolvePowerShellExecutable(
     signal?: AbortSignal,
@@ -2339,6 +2427,29 @@ Browser automation is host-dependent on this connection. Chromium and agent-brow
           displayName: `Uploading: ${fileName}`,
         });
         if (result.exitCode !== 0) {
+          // The thrown error retains the existing redacted message. Record the
+          // command outcome separately without paths, signed URLs or output.
+          console.warn(
+            "[centrifugo-http]",
+            JSON.stringify({
+              level: "warn",
+              event: "sandbox_file_upload_command_failed",
+              sandbox_type: this.connectionInfo.isDesktop ? "desktop" : "local",
+              platform: this.isWindows() ? "windows" : "posix",
+              http_client: httpClient,
+              exit_code: Number.isSafeInteger(result.exitCode)
+                ? result.exitCode
+                : null,
+            }),
+          );
+          if (
+            result.exitCode === 26 &&
+            httpClient === "curl" &&
+            this.connectionInfo.isDesktop &&
+            !this.isWindows()
+          ) {
+            await this.diagnoseUploadReadFailure(path);
+          }
           const safeStderr = redactTransferDetails(result.stderr, uploadUrl, [
             rawPath,
             path,

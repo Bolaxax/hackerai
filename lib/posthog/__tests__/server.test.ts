@@ -112,13 +112,19 @@ describe("phLogger", () => {
       getPostHogFeatureFlagVariantForUser(
         "hac46-pro-monthly-29-pricing",
         "user_123",
-        { sendFeatureFlagEvents: false },
+        {
+          sendFeatureFlagEvents: false,
+          personProperties: { subscription_tier: "pro" },
+        },
       ),
     ).resolves.toBe("test");
     expect(mockGetFeatureFlagResult).toHaveBeenLastCalledWith(
       "hac46-pro-monthly-29-pricing",
       "user_123",
-      { sendFeatureFlagEvents: false },
+      {
+        sendFeatureFlagEvents: false,
+        personProperties: { subscription_tier: "pro" },
+      },
     );
 
     mockGetFlag.mockReturnValueOnce(true);
@@ -138,6 +144,32 @@ describe("phLogger", () => {
       ),
     ).resolves.toBeUndefined();
   });
+  it.each([true, false, undefined])(
+    "evaluates deferred boolean assignment %s without emitting flag access",
+    async (enabled) => {
+      mockGetFeatureFlagResult.mockResolvedValueOnce(
+        enabled === undefined ? undefined : { enabled },
+      );
+      await expect(
+        getPostHogBooleanFlagDecisionForUser(
+          "deferred-boolean-test",
+          "user",
+          { subscription_tier: "free" },
+          { sendFeatureFlagEvents: false },
+        ),
+      ).resolves.toBe(enabled ?? null);
+      expect(mockGetFeatureFlagResult).toHaveBeenCalledWith(
+        "deferred-boolean-test",
+        "user",
+        {
+          personProperties: { subscription_tier: "free" },
+          sendFeatureFlagEvents: false,
+        },
+      );
+      expect(mockEvaluateFlags).not.toHaveBeenCalled();
+      expect(mockCapture).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["test", true, false, undefined, 42])(
     "preserves raw flag value %s and unavailable results",
@@ -159,8 +191,14 @@ describe("phLogger", () => {
     mockGetFlag.mockReturnValueOnce("control");
     mockEvaluateFlags.mockResolvedValueOnce({ getFlag: mockGetFlag });
     await expect(
-      getPostHogFeatureFlagVariantForUser("experiment", "user"),
+      getPostHogFeatureFlagVariantForUser("experiment", "user", {
+        personProperties: { subscription_tier: "pro" },
+      }),
     ).resolves.toBe("control");
+    expect(mockEvaluateFlags).toHaveBeenLastCalledWith("user", {
+      flagKeys: ["experiment"],
+      personProperties: { subscription_tier: "pro" },
+    });
     expect(mockGetFeatureFlagResult).not.toHaveBeenCalled();
 
     mockGetFeatureFlagResult.mockRejectedValueOnce(new Error("unavailable"));

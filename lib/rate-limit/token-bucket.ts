@@ -1,4 +1,9 @@
 import {
+  DEEPSEEK_1017_MODEL_KEY,
+  DEEPSEEK_1017_SLUG,
+  DEEPSEEK_1017_CANONICAL_SLUG,
+} from "@/lib/experiments/paid-deepseek-1017";
+import {
   ABLITERATION_MODEL_ID,
   ABLITERATION_MODEL_KEY,
   ABLITERATION_BASE_PRICING,
@@ -141,6 +146,10 @@ const KIMI_K3_PRICING: ModelPricing = {
 /** Model pricing: $/1M tokens per model, including provider cache rates. */
 const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   default: DEFAULT_PRICING,
+  // Snapshot peak ceiling; provider-reported actual costs remain authoritative.
+  [DEEPSEEK_1017_MODEL_KEY]: DEEPSEEK_V4_1_FLASH_PRICING,
+  [DEEPSEEK_1017_SLUG]: DEEPSEEK_V4_1_FLASH_PRICING,
+  [DEEPSEEK_1017_CANONICAL_SLUG]: DEEPSEEK_V4_1_FLASH_PRICING,
   [ABLITERATION_MODEL_KEY]: ABLITERATION_BASE_PRICING,
   [ABLITERATION_MODEL_ID]: ABLITERATION_BASE_PRICING,
   [ABLITERATION_LARGE_V2_MODEL_KEY]: ABLITERATION_LARGE_V2_PRICING,
@@ -155,15 +164,14 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   "agent-model": GROK_4_6_BASE_PRICING,
   "fallback-agent-model": GROK_4_6_BASE_PRICING,
   "fallback-ask-model": GROK_4_6_BASE_PRICING,
-  // The paid daily free Ask rescue retains DeepSeek 0731, while free Agent
-  // uses DeepSeek V4.1 Flash. Provider fallbacks reconcile against their
-  // served model.
-  "ask-model-free": DEEPSEEK_V4_FLASH_0731_PRICING,
+  // Ask allowance rescue and free Agent use V4.1. Historical provider
+  // response slugs below retain their original prices.
+  "ask-model-free": DEEPSEEK_V4_1_FLASH_PRICING,
   "ask-model-free-glm": GLM_5_3_FLASH_PRICING,
   "ask-model-free-deepseek-v41": DEEPSEEK_V4_1_FLASH_PRICING,
   "agent-model-free": DEEPSEEK_V4_1_FLASH_PRICING,
-  // DeepSeek V4 Flash 0731 rates from OpenRouter: $0.14 in / $0.28 out per 1M tokens.
-  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_FLASH_0731_PRICING,
+  // Persisted registry alias now executes V4.1, including without response metadata.
+  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_1_FLASH_PRICING,
   "model-deepseek-v4-pro": DEEPSEEK_V4_PRO_PRICING,
   "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_PRICING,
   "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_PRICING,

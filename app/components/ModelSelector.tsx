@@ -52,9 +52,7 @@ import { openSettingsDialog } from "@/lib/utils/settings-dialog";
 
 import { CostIndicator } from "./ModelSelector/CostIndicator";
 import {
-  ASK_MODEL_OPTIONS,
   AGENT_MODEL_OPTIONS,
-  getDefaultModelForMode,
   type ModelOption,
 } from "./ModelSelector/constants";
 
@@ -162,14 +160,12 @@ const AutoOptionButton = ({
     aria-pressed={isSelected}
     className={`group w-full flex items-center gap-2.5 px-2.5 rounded-lg text-left transition-colors select-none cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
       mobile ? "py-2.5" : "py-2"
-    } ${isSelected ? "bg-accent" : "hover:bg-muted/50 active:bg-muted/50"}`}
+    } ${isSelected ? "bg-accent text-accent-foreground" : "hover:bg-muted active:bg-muted"}`}
   >
     <div className="flex-1 min-w-0">
       <span
         className={`text-sm font-medium transition-colors ${
-          isSelected
-            ? "text-accent-foreground"
-            : "text-muted-foreground group-hover:text-foreground"
+          isSelected ? "text-accent-foreground" : "text-popover-foreground"
         }`}
       >
         Auto
@@ -222,17 +218,15 @@ const ModelOptionButton = ({
         isPending
           ? `cursor-wait opacity-80 ${isSelected ? "bg-accent" : ""}`
           : isSelected
-            ? "cursor-pointer bg-accent"
-            : "cursor-pointer hover:bg-muted/50 active:bg-muted/50"
+            ? "cursor-pointer bg-accent text-accent-foreground"
+            : "cursor-pointer hover:bg-muted active:bg-muted"
       }`}
     >
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
           <span
             className={`text-sm transition-colors ${
-              isSelected
-                ? "text-accent-foreground"
-                : "text-muted-foreground group-hover:text-foreground"
+              isSelected ? "text-accent-foreground" : "text-popover-foreground"
             }`}
           >
             {option.label}
@@ -269,11 +263,6 @@ const ModelOptionButton = ({
         <p className="text-sm font-semibold text-foreground leading-snug">
           {option.description}
         </p>
-        {option.poweredBy && (
-          <p className="text-xs text-muted-foreground">
-            Powered by {option.poweredBy}
-          </p>
-        )}
       </TooltipContent>
     </Tooltip>
   );
@@ -400,11 +389,6 @@ const ModelOptionList = ({
                 {option.label}
               </p>
             )}
-            {option.poweredBy && (
-              <p className="text-xs text-muted-foreground">
-                Powered by {option.poweredBy}
-              </p>
-            )}
             <p className="text-xs text-muted-foreground leading-relaxed pt-1">
               <a
                 href={
@@ -468,9 +452,10 @@ export function ModelSelector({ value, onChange, mode }: ModelSelectorProps) {
         }) ?? "auto");
   const isAuto = displayValue === "auto";
 
-  const options = isAgentMode(mode) ? AGENT_MODEL_OPTIONS : ASK_MODEL_OPTIONS;
+  // Free users see the paid Agent tiers as locked upgrade options.
+  const options = AGENT_MODEL_OPTIONS;
 
-  const effectiveValue = isAuto ? getDefaultModelForMode(mode) : displayValue;
+  const effectiveValue = isAuto ? options[0].id : displayValue;
   const selected =
     options.find((opt) => opt.id === effectiveValue) ?? options[0];
 

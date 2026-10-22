@@ -1,5 +1,5 @@
 import type { PostHog } from "posthog-node";
-import type { ModelName } from "@/lib/ai/providers";
+import { myProvider, type ModelName } from "@/lib/ai/providers";
 import { getExperimentAnalyticsProperties } from "@/lib/analytics/experiment-context";
 import type { ChatMode, SubscriptionTier } from "@/types";
 
@@ -21,6 +21,8 @@ export async function evaluateFlashRouting({
   subscription,
   selectedModel,
   hasImages,
+  limitRescue = false,
+  modelPolicyActive = false,
 }: {
   posthog: Pick<PostHog, "evaluateFlags"> | null;
   userId: string;
@@ -28,8 +30,11 @@ export async function evaluateFlashRouting({
   subscription: SubscriptionTier;
   selectedModel: ModelName;
   hasImages: boolean;
+  limitRescue?: boolean;
+  modelPolicyActive?: boolean;
 }): Promise<FlashRoutingAssignment | undefined> {
-  if (!posthog || !userId || hasImages) return undefined;
+  if (!posthog || !userId || limitRescue || modelPolicyActive) return undefined;
+  if (hasImages) return undefined;
   const key =
     mode === "agent" &&
     subscription !== "free" &&
@@ -37,6 +42,14 @@ export async function evaluateFlashRouting({
       ? PAID_AGENT_FLASH_RETURN_KEY
       : undefined;
   if (!key) return undefined;
+  // This legacy experiment compares 0731 with GLM. Redirected saved selections
+  // must not enroll a different baseline under its historical experiment key.
+  if (
+    myProvider.languageModel(selectedModel).modelId !==
+    "deepseek/deepseek-v4-flash-0731"
+  ) {
+    return undefined;
+  }
 
   try {
     const flags = await posthog.evaluateFlags(userId, { flagKeys: [key] });
@@ -107,6 +120,7 @@ export function createFlashRoutingExposureRecorder({
           selected_model: assignment.modelKey,
           configured_model: configuredModel,
           request_id: requestId,
+          message_id: requestId,
           exposure_surface: "provider_request",
           $process_person_profile: false,
         },

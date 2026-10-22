@@ -1,4 +1,5 @@
 "use client";
+import { CloudWorkspaceRecovery } from "./CloudWorkspaceRecovery";
 
 import { useChat, type UseChatHelpers } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
@@ -18,6 +19,7 @@ import {
   usePaginatedQuery,
   useMutation,
   useConvexAuth,
+  useConvex,
 } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { FileDetails } from "@/types/file";
@@ -49,6 +51,7 @@ import {
   type MessageRecord,
 } from "@/lib/utils";
 import { getSafeErrorEventMessage } from "@/lib/utils/error-event";
+import { getBranchErrorMessage } from "@/lib/chat/branch-error";
 import {
   cancelAgentLongRealtimeStreams,
   fetchAgentLongStream,
@@ -115,6 +118,9 @@ import {
 import { parseRateLimitWarning } from "@/lib/utils/parse-rate-limit-warning";
 import { formatTaskUiCopy } from "@/app/utils/task-ui-copy";
 import { finalizeNewChatRoute } from "./chat-route";
+import { ChatPerformanceTracker } from "@/lib/analytics/chat-performance";
+import { useChatPerformance } from "@/app/hooks/useChatPerformance";
+import { useBrowserResponsiveness } from "@/app/hooks/useBrowserResponsiveness";
 
 import { HackingSuggestions } from "./HackingSuggestions";
 
@@ -550,6 +556,7 @@ export const Chat = ({ autoResume }: { autoResume: boolean }) => {
 };
 
 const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
+  const convex = useConvex();
   const { sendDisabledReason: connectionSendDisabledReason } =
     useSelectedComputerConnection();
   const params = useParams();
@@ -906,11 +913,22 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
   const queuedAdmissionRef = useRef<(chatId: string, id: string) => void>(
     () => {},
   );
+  const [performanceTracker] = useState(() => new ChatPerformanceTracker());
+  useBrowserResponsiveness();
   const transportRef = useRef(
     new DefaultChatTransport({
       api: "/api/chat",
       fetch: async (input, init) => {
         const mode = chatModeRef.current;
+        if (init?.method === "POST") {
+          performanceTracker.start(
+            activeChatIdRef.current,
+            mode,
+            messagesRef.current
+              .filter((message) => message.role === "assistant")
+              .map((message) => message.id),
+          );
+        }
         const isTauri = isTauriEnvironment();
         if (isLegacyDesktopAgentClient({ mode, isTauri })) {
           throw new ChatSDKError(
@@ -966,6 +984,18 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
                 typeof queuedMessageId === "string"
               ) {
                 queuedAdmissionRef.current(request.chatId, queuedMessageId);
+              }
+              // Only expose the saved-task route after attachment staging and
+              // user-message persistence have succeeded.
+              if (
+                finalizeNewChatRoute({
+                  chatId: activeChatIdRef.current,
+                  isAbort: false,
+                  isExistingChat: isExistingChatRef.current,
+                })
+              ) {
+                removeDraft("new");
+                setIsExistingChat(true);
               }
               setAgentLongRunId(run.runId);
               if (run.runCorrelationToken) {
@@ -1067,6 +1097,11 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     }),
   );
 
+  const [cloudConnectionFailure, setCloudConnectionFailure] = useState<{
+    chatId: string;
+    sequence: number;
+  } | null>(null);
+
   const {
     messages,
     sendMessage: sendMessageUnchecked,
@@ -1111,6 +1146,20 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
       agentLongHasVisibleProgressRef.current = true;
       appendDataPart({ ...dataPart, __chatId: chatId });
       switch (dataPart.type) {
+        case "data-cloud-connection-error": {
+          setCloudConnectionFailure((prior) => ({
+            chatId,
+            sequence: (prior?.sequence ?? 0) + 1,
+          }));
+          const data = dataPart.data as { code?: unknown };
+          if (data?.code === "timeout") {
+            toast.error(
+              "Cloud connection timed out. Your workspace is preserved. Try sending your message again shortly.",
+              { duration: 10_000 },
+            );
+          }
+          break;
+        }
         case "data-agent-approval-session": {
           const approvalData = dataPart.data as {
             chatId?: unknown;
@@ -1225,7 +1274,10 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         }
       }
     },
-    onFinish: ({ isAbort }) => {
+    onFinish: ({ isAbort, isError }) => {
+      performanceTracker.setOutcome(
+        isError ? "error" : isAbort ? "aborted" : "completed",
+      );
       if (!isChatMountedRef.current || activeChatIdRef.current !== chatId) {
         return;
       }
@@ -1240,6 +1292,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         finalizeNewChatRoute({
           chatId,
           isAbort,
+          isError,
           isExistingChat: isExistingChatRef.current,
         })
       ) {
@@ -1248,6 +1301,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
       }
     },
     onError: (error) => {
+      performanceTracker.setOutcome("error");
       if (!isChatMountedRef.current || activeChatIdRef.current !== chatId) {
         return;
       }
@@ -1273,6 +1327,14 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         );
       }
     },
+  });
+
+  useChatPerformance({
+    tracker: performanceTracker,
+    chatId,
+    messages,
+    status,
+    runId: agentLongRunId,
   });
 
   // Guard the shared dispatch boundary as well as the UI. Forks, retries,
@@ -2195,6 +2257,8 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
     regenerate,
     setMessages,
     isExistingChat,
+    isUserMessagePersisted: (messageId) =>
+      convex.query(api.messages.isUserMessagePersisted, { chatId, messageId }),
     status,
     isSendingNowRef,
     hasManuallyStoppedRef,
@@ -2235,7 +2299,7 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
         router.push(`/c/${newChatId}`);
       } catch (error) {
         console.error("Failed to branch chat:", error);
-        toast.error("Failed to branch task. Please try again.");
+        toast.error(getBranchErrorMessage(error));
       }
     },
     [branchChatMutation, initializeChat, router],
@@ -2381,6 +2445,19 @@ const ChatContent = ({ autoResume }: { autoResume: boolean }) => {
               isChatNotFound={isChatNotFound}
               branchedFromChatTitle={branchedFromChatTitle}
             />
+
+            {sandboxPreference === "e2b" && subscription !== "free" && (
+              <div className="mx-auto w-full max-w-[768px] px-4">
+                <CloudWorkspaceRecovery
+                  key={`${chatId}:${cloudConnectionFailure?.sequence ?? 0}`}
+                  surface={
+                    cloudConnectionFailure?.chatId === chatId
+                      ? "cloud_connection_error"
+                      : "workspace_status"
+                  }
+                />
+              </div>
+            )}
 
             {/* Chat interface */}
             <div className="bg-background flex flex-col flex-1 relative min-h-0">

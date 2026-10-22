@@ -1,4 +1,5 @@
 import {
+  getTerminalProviderStreamError,
   getProviderDisconnectIgnoredSlugs,
   wrapProviderTerminalError,
 } from "../provider-terminal-error";
@@ -58,6 +59,21 @@ describe("getProviderDisconnectIgnoredSlugs", () => {
 });
 
 describe("wrapProviderTerminalError", () => {
+  it("can prepare recovery diagnostics when an empty stream has no provider error", () => {
+    const state = { providerError: undefined };
+    const error = wrapProviderTerminalError(state.providerError, {
+      model: "test/model",
+    });
+    expect(error).toMatchObject({
+      name: "ProviderTerminalError",
+      message: "Provider terminal error category=unknown",
+      category: "unknown",
+      model: "test/model",
+    });
+    expect(error.cause).toBeUndefined();
+    expect(wrapProviderTerminalError(error, {})).toBe(error);
+  });
+
   it("uses a low-cardinality fingerprint while retaining provider diagnostics", () => {
     const cause = Object.assign(new Error("Network connection lost."), {
       statusCode: 502,
@@ -160,5 +176,52 @@ describe("wrapProviderTerminalError", () => {
       "Provider terminal error category=provider_4xx status=413",
     );
     expect(upstreamRejection.origin).toBeUndefined();
+  });
+});
+
+describe("getTerminalProviderStreamError", () => {
+  it.each(["error", "content-filter"])(
+    "preserves %s observed before cancellation",
+    (streamFinishReason) => {
+      expect(
+        getTerminalProviderStreamError(
+          {
+            providerError: undefined,
+            streamFinishReason: undefined,
+            providerTerminalFinishReasonBeforeAbort: streamFinishReason,
+          },
+          true,
+        ),
+      ).toBeInstanceOf(Error);
+      expect(
+        getTerminalProviderStreamError(
+          {
+            providerError: undefined,
+            streamFinishReason,
+            providerTerminalFinishReasonBeforeAbort: undefined,
+          },
+          true,
+        ),
+      ).toBeUndefined();
+      expect(
+        getTerminalProviderStreamError(
+          { providerError: undefined, streamFinishReason },
+          false,
+        ),
+      ).toBeInstanceOf(Error);
+    },
+  );
+  it("preserves a captured error even if finish occurs after cancellation", () => {
+    const error = new Error("Upstream unavailable");
+    expect(
+      getTerminalProviderStreamError(
+        {
+          providerError: error,
+          streamFinishReason: "error",
+          providerTerminalFinishReasonBeforeAbort: undefined,
+        },
+        true,
+      ),
+    ).toBe(error);
   });
 });

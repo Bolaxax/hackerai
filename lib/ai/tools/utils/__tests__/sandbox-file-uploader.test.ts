@@ -35,7 +35,7 @@ function makeSandbox(size: number, e2b = false, windows = false) {
     isWindows: jest.fn(() => windows),
     commands: {
       run: jest.fn(async (command: string) => {
-        if (command.includes("stat -c%s")) {
+        if (command.includes("stat -Lc%s")) {
           return { stdout: String(size), stderr: "", exitCode: 0 };
         }
         if (command.startsWith("for %I")) {
@@ -87,6 +87,79 @@ describe("uploadSandboxFileToConvex", () => {
     consoleWarnSpy.mockRestore();
     consoleErrorSpy.mockRestore();
   });
+
+  test.each([
+    "file_metadata",
+    "upload_url",
+    "transfer",
+    "file_registration",
+  ] as const)(
+    "retains the failing %s phase without exporting the failure contents",
+    async (phase) => {
+      const error = Object.freeze(new Error("private-upload-error"));
+      const sandbox = makeSandbox(10);
+      if (phase === "file_metadata") {
+        sandbox.commands.run.mockRejectedValueOnce(error);
+      } else if (phase === "upload_url") {
+        mockGenerateS3UploadUrl.mockRejectedValueOnce(error);
+      } else if (phase === "transfer") {
+        sandbox.files.uploadToUrl.mockRejectedValueOnce(error);
+        const originalRun = sandbox.commands.run.getMockImplementation()!;
+        sandbox.commands.run.mockImplementation(async (command) => {
+          if (command.includes("curl -fsSL -X PUT")) throw error;
+          return originalRun(command);
+        });
+      } else {
+        mockConvexAction.mockRejectedValueOnce(error);
+      }
+      const onPhase = jest.fn();
+
+      await expect(
+        uploadSandboxFileToConvex({
+          sandbox: sandbox as any,
+          userId: "u1",
+          fullPath: "/private/report.txt",
+          onPhase,
+        }),
+      ).rejects.toThrow("private-upload-error");
+      expect(onPhase).toHaveBeenLastCalledWith(phase);
+      expect(JSON.stringify(onPhase.mock.calls)).not.toMatch(/private|report/);
+    },
+  );
+
+  test("a failing diagnostics observer cannot prevent a file upload", async () => {
+    const sandbox = makeSandbox(10);
+    await expect(
+      uploadSandboxFileToConvex({
+        sandbox: sandbox as any,
+        userId: "u1",
+        fullPath: "/report.txt",
+        onPhase: () => {
+          throw new Error("observer unavailable");
+        },
+      }),
+    ).resolves.toMatchObject({ fileId: "file_123", sizeBytes: 10 });
+  });
+
+  test.each([false, true])(
+    "an async diagnostics rejection cannot change the upload outcome (upload fails: %s)",
+    async (uploadFails) => {
+      const sandbox = makeSandbox(10);
+      const uploadError = Object.freeze(new Error("private-metadata-error"));
+      if (uploadFails) sandbox.commands.run.mockRejectedValueOnce(uploadError);
+      const result = uploadSandboxFileToConvex({
+        sandbox: sandbox as any,
+        userId: "u1",
+        fullPath: "/report.txt",
+        onPhase: async () => {
+          throw new Error("observer unavailable");
+        },
+      });
+
+      if (uploadFails) await expect(result).rejects.toBe(uploadError);
+      else await expect(result).resolves.toMatchObject({ fileId: "file_123" });
+    },
+  );
 
   test("mints a fresh user-scoped URL for an uploaded sandbox file", async () => {
     mockConvexAction.mockResolvedValueOnce([
@@ -204,6 +277,243 @@ describe("uploadSandboxFileToConvex", () => {
     });
   });
 
+  test.each([0, 4321])(
+    "uses native Desktop metadata for a %s-byte file when shell size checks cannot run",
+    async (size) => {
+      const sandbox = {
+        ...makeSandbox(size, false, true),
+        supportsNativeFileRelay: () => true,
+      };
+      const stat = jest.fn().mockResolvedValue({
+        kind: "file",
+        path: "C:\\repo\\report & review!.zip",
+        sizeBytes: size,
+      });
+      Object.assign(sandbox.files, { stat });
+      sandbox.commands.run.mockResolvedValue({
+        stdout: "ECHO is on.\r\n",
+        stderr: "The syntax of the command is incorrect.",
+        exitCode: 1,
+      });
+
+      const saved = await uploadSandboxFileToConvex({
+        sandbox: sandbox as any,
+        userId: "u1",
+        fullPath: "C:\\repo\\report & review!.zip",
+      });
+
+      expect(saved.sizeBytes).toBe(size);
+      expect(stat).toHaveBeenCalledWith("C:\\repo\\report & review!.zip");
+      expect(sandbox.commands.run).not.toHaveBeenCalled();
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).toHaveBeenCalledWith(
+        "report & review!.zip",
+        "application/octet-stream",
+        "u1",
+        size,
+      );
+    },
+  );
+
+  test.each([
+    [
+      { kind: "missing", path: "C:\\repo\\report.zip" },
+      /File not found/,
+      "file_missing",
+    ],
+    [
+      { kind: "not_file", path: "C:\\repo\\report.zip" },
+      /not a regular file/,
+      "not_regular_file",
+    ],
+    [{ kind: "file", sizeBytes: -1 }, /invalid file size/, "invalid_file_size"],
+    [
+      { kind: "file", sizeBytes: NaN },
+      /invalid file size/,
+      "invalid_file_size",
+    ],
+    [
+      { kind: "file", sizeBytes: 1.5 },
+      /invalid file size/,
+      "invalid_file_size",
+    ],
+    [
+      { kind: "file", sizeBytes: undefined },
+      /invalid file size/,
+      "invalid_file_size",
+    ],
+    [
+      { kind: "file", sizeBytes: MAX_GENERATED_FILE_SIZE_BYTES + 1 },
+      /exceeds the maximum generated file size/,
+      undefined,
+    ],
+  ])(
+    "rejects native preflight %j before upload",
+    async (metadata, message, reason) => {
+      const observed = jest.fn();
+      const sandbox = {
+        ...makeSandbox(42, false, true),
+        supportsNativeFileRelay: () => true,
+      };
+      Object.assign(sandbox.files, {
+        stat: jest.fn().mockResolvedValue(metadata),
+      });
+
+      await expect(
+        uploadSandboxFileToConvex({
+          sandbox: sandbox as any,
+          userId: "u1",
+          fullPath: "C:\\repo\\report.zip",
+          onNativeStatFailure: observed,
+        }),
+      ).rejects.toThrow(message);
+      if (reason) {
+        expect(observed).toHaveBeenCalledTimes(1);
+        expect(observed).toHaveBeenCalledWith(reason);
+      } else {
+        expect(observed).not.toHaveBeenCalled();
+      }
+
+      expect(sandbox.commands.run).not.toHaveBeenCalled();
+      expect(sandbox.files.uploadToUrl).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+      expect(mockConvexAction).not.toHaveBeenCalled();
+      const diagnostics = consoleWarnSpy.mock.calls
+        .map(([entry]) => JSON.parse(entry))
+        .filter(
+          (entry) =>
+            entry.event === "sandbox_generated_file_native_stat_failed",
+        );
+      expect(diagnostics).toEqual(
+        reason
+          ? [
+              {
+                level: "warn",
+                message: "sandbox_generated_file_native_stat_failed",
+                timestamp: expect.any(String),
+                event: "sandbox_generated_file_native_stat_failed",
+                service: "chat-handler",
+                sandbox_type: "desktop",
+                failure_reason: reason,
+              },
+            ]
+          : [],
+      );
+    },
+  );
+
+  test.each([false, true])(
+    "preserves a native denial without shell fallback when logging fails: %s",
+    async (loggingFails) => {
+      const sandbox = {
+        ...makeSandbox(42),
+        supportsNativeFileRelay: () => true,
+      };
+      const error = Object.freeze(
+        new Error("Metadata error: private permission denial"),
+      );
+      const stat = jest.fn().mockRejectedValue(error);
+      Object.assign(sandbox.files, { stat });
+      if (loggingFails) {
+        consoleWarnSpy.mockImplementation(() => {
+          throw new Error("logger unavailable");
+        });
+      }
+
+      await expect(
+        uploadSandboxFileToConvex({
+          sandbox: sandbox as any,
+          userId: "u1",
+          fullPath: "/protected/report.zip",
+        }),
+      ).rejects.toBe(error);
+      expect(stat).toHaveBeenCalledTimes(1);
+      expect(sandbox.commands.run).not.toHaveBeenCalled();
+      expect(sandbox.files.uploadToUrl).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+      expect(mockConvexAction).not.toHaveBeenCalled();
+      if (!loggingFails) {
+        expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(consoleWarnSpy.mock.calls[0][0])).toEqual({
+          level: "warn",
+          message: "sandbox_generated_file_native_stat_failed",
+          timestamp: expect.any(String),
+          event: "sandbox_generated_file_native_stat_failed",
+          service: "chat-handler",
+          sandbox_type: "desktop",
+          failure_reason: "stat_failed",
+        });
+      }
+    },
+  );
+
+  test.each(["throw", "reject"])(
+    "preserves a frozen native stat error when its observer fails (%s)",
+    async (mode) => {
+      const sandbox = {
+        ...makeSandbox(42),
+        supportsNativeFileRelay: () => true,
+      };
+      const original = Object.freeze(new Error("PRIVATE stat error"));
+      Object.assign(sandbox.files, {
+        stat: jest.fn().mockRejectedValue(original),
+      });
+      const observed = jest.fn(() => {
+        if (mode === "throw") throw new Error("observer unavailable");
+        return Promise.reject(new Error("observer unavailable"));
+      });
+      await expect(
+        uploadSandboxFileToConvex({
+          sandbox: sandbox as any,
+          userId: "u1",
+          fullPath: "/private/report.zip",
+          onNativeStatFailure: observed,
+        }),
+      ).rejects.toBe(original);
+      await Promise.resolve();
+      expect(observed).toHaveBeenCalledTimes(1);
+      expect(observed).toHaveBeenCalledWith("stat_failed");
+      expect(sandbox.commands.run).not.toHaveBeenCalled();
+      expect(sandbox.files.uploadToUrl).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([true, false])(
+    "preserves a Windows native upload failure without a POSIX fallback (fallback would succeed: %s)",
+    async (fallbackWouldSucceed) => {
+      const nativeError = new Error("Native upload connection closed");
+      const sandbox = {
+        ...makeSandbox(1234, false, true),
+        supportsNativeFileRelay: () => true,
+      };
+      sandbox.files = {
+        ...sandbox.files,
+        stat: jest.fn(async () => ({ kind: "file", sizeBytes: 1234 })),
+      } as typeof sandbox.files;
+      sandbox.files.uploadToUrl.mockRejectedValueOnce(nativeError);
+      sandbox.commands.run.mockResolvedValue({
+        stdout: "",
+        stderr: fallbackWouldSucceed ? "" : "curl is not recognized",
+        exitCode: fallbackWouldSucceed ? 0 : 1,
+      });
+      const onPhase = jest.fn();
+
+      await expect(
+        uploadSandboxFileToConvex({
+          sandbox: sandbox as any,
+          userId: "u1",
+          fullPath: "C:\\project\\report.txt",
+          onPhase,
+        }),
+      ).rejects.toBe(nativeError);
+      expect(onPhase).toHaveBeenLastCalledWith("transfer");
+      expect(sandbox.files.uploadToUrl).toHaveBeenCalledTimes(1);
+      expect(sandbox.commands.run).not.toHaveBeenCalled();
+      expect(mockConvexAction).not.toHaveBeenCalled();
+    },
+  );
+
   test("falls back to command upload when native Centrifugo upload fails", async () => {
     const sandbox = makeSandbox(1234);
     sandbox.files.uploadToUrl.mockRejectedValueOnce(new Error("exit status 1"));
@@ -240,7 +550,7 @@ describe("uploadSandboxFileToConvex", () => {
     const sandbox = makeSandbox(1234, true);
     (sandbox.commands.run as jest.Mock).mockImplementation(
       async (command: string) => {
-        if (command.includes("stat -c%s")) {
+        if (command.includes("stat -Lc%s")) {
           return { stdout: "1234", stderr: "", exitCode: 0 };
         }
         if (command.includes("curl -fsSL -X PUT")) {
@@ -292,7 +602,7 @@ describe("uploadSandboxFileToConvex", () => {
     const sandbox = makeSandbox(0, false, true);
     (sandbox.commands.run as jest.Mock).mockImplementation(
       async (command: string) => {
-        if (command.includes("stat -c%s")) {
+        if (command.includes("stat -Lc%s")) {
           return {
             stdout: "",
             stderr: "'[' is not recognized as an internal or external command",
@@ -335,7 +645,7 @@ describe("uploadSandboxFileToConvex", () => {
     const sandbox = makeSandbox(0, false, true);
     (sandbox.commands.run as jest.Mock).mockImplementation(
       async (command: string) => {
-        if (command.includes("stat -c%s")) {
+        if (command.includes("stat -Lc%s")) {
           return {
             stdout: "",
             stderr: "'[' is not recognized as an internal or external command",

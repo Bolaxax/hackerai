@@ -1,3 +1,17 @@
+import { restoreProviderRecoveryContext } from "@/lib/chat/provider-recovery-context";
+import { estimateSummaryInputTokens } from "@/lib/chat/summarization/helpers";
+import { createPromptSerializationTools } from "@/lib/ai/tools/prompt-serialization";
+import { resolvePaidProAutoModel } from "@/lib/ai/paid-model-routing";
+import {
+  getAgentModelContextVariant,
+  getAgentModelContextFlag,
+} from "@/lib/experiments/agent-model-context";
+import { createAgentRunReporting } from "@/lib/analytics/agent-run-reporting";
+import { FreeDailyCostSettlement } from "@/lib/rate-limit/free-cost-budget";
+import {
+  evaluateFreeAgentBudget,
+  freeAgentBudgetPolicy,
+} from "@/lib/experiments/free-agent-budget";
 import { isAbliterationModel } from "@/lib/ai/abliteration";
 import { enforceRegionalSubscriptionFirst } from "@/lib/experiments/regional-subscription-first.server";
 import { formatToolStreamError } from "@/lib/chat/tool-stream-error";
@@ -27,6 +41,7 @@ import {
   generateId,
   type UIMessageStreamWriter,
   UIMessage,
+  convertToModelMessages,
 } from "ai";
 import type { Geo } from "@vercel/functions";
 import {
@@ -42,11 +57,13 @@ import { recordGroupedSpikeAlert } from "@/lib/observability/grouped-spike-alert
 import { systemPrompt } from "@/lib/system-prompt";
 import { getResumeSection } from "@/lib/system-prompt/resume";
 import { createTools } from "@/lib/ai/tools";
-import { selectCloudSandboxProvider } from "@/lib/ai/tools/utils/cloud-sandbox-provider";
 import { ptySessionManager } from "@/lib/ai/tools/utils/pty-session-manager";
 import { generateTitleFromUserMessageWithWriter } from "@/lib/actions";
 import { createTrackedProvider } from "@/lib/ai/providers";
-import { AGENT_PROVIDER_IDLE_TIMEOUT_MS } from "@/lib/ai/provider-stream-timeout";
+import {
+  AGENT_PROVIDER_IDLE_TIMEOUT_MS,
+  AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
+} from "@/lib/ai/provider-stream-timeout";
 import { processChatMessages, selectModel } from "@/lib/chat/chat-processor";
 import { cacheAuxiliaryVisionDescription } from "@/lib/utils/file-transform-utils";
 import {
@@ -55,6 +72,7 @@ import {
   describeImageWithAuxiliaryVision,
 } from "@/lib/chat/auxiliary-vision";
 import { summarizeIncompleteToolParts } from "@/lib/chat/tool-abort-utils";
+import { createAgentStopSignal } from "@/lib/chat/agent-stop-signal";
 import {
   hasVisibleAssistantContent,
   shouldSkipAbortedMessageSave,
@@ -87,7 +105,7 @@ import { UsageTracker } from "@/lib/usage-tracker";
 import { resolveTriggerRunCost } from "@/lib/billing/trigger-run-cost";
 import {
   acquireFreeRunConcurrencyLock,
-  checkFreeMonthlyCostLimit,
+  checkFreeCostBudget,
   checkRateLimit,
   checkRateLimitCapacity,
   isHandledUserRateLimitError,
@@ -109,6 +127,10 @@ import {
   UsageRefundTracker,
 } from "@/lib/rate-limit";
 import { assertUserCanMakeCostIncurringRequest } from "@/lib/suspensions";
+import {
+  parseCloudAcquisitionStage,
+  type CloudAcquisitionStage,
+} from "@/lib/ai/tools/utils/cloud-acquisition-budget";
 import {
   saveMessage,
   updateChat,
@@ -197,6 +219,7 @@ import {
   isInvalidImageInputError,
   isProviderContentFilterFinishReason,
   isRetriableProviderStreamDisconnectError,
+  isCancellationError,
 } from "@/lib/utils/error-utils";
 import { ChatSDKError, serializeChatSDKErrorForStream } from "@/lib/errors";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -261,10 +284,13 @@ import {
   PREEMPTIVE_TIMEOUT_FINISH_REASON,
 } from "@/lib/chat/stop-conditions";
 import {
+  appendProviderEmptyResponseFailure,
   decideProviderRecovery,
   detectAssistantContentLoopFromParts,
   getProviderOutputDiagnostics,
-  getNextDeepSeekProDisconnectRetryModel,
+  hasUncertainProviderToolOutcome,
+  isTerminalEmptyAssistantResponse,
+  getNextProviderDisconnectRetryModel,
   prepareProviderDisconnectContinuation,
   PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
   shouldRetryProviderStreamAfterNonDurableOutputLimit,
@@ -276,6 +302,7 @@ import {
   ProviderTerminalError,
   getProviderDisconnectIgnoredSlugs,
   wrapProviderTerminalError,
+  getTerminalProviderStreamError,
 } from "@/lib/api/provider-terminal-error";
 import {
   omitImageViewToolResultsForProviderRetry,
@@ -335,8 +362,8 @@ import {
   buildAgentToolApprovalRequester,
 } from "@/lib/chat/agent-tool-approval-requester";
 
-const AGENT_LONG_FREE_MAX_DURATION_SECONDS = 4 * 60 * 60;
-const AGENT_LONG_PAID_MAX_DURATION_SECONDS = 4 * 60 * 60;
+const AGENT_LONG_FREE_MAX_DURATION_SECONDS = 6 * 60 * 60;
+const AGENT_LONG_PAID_MAX_DURATION_SECONDS = 6 * 60 * 60;
 const AGENT_LONG_CLEANUP_GRACE_MS = 2 * 60 * 1000;
 const AGENT_LONG_RUNTIME_SETTLEMENT_WATCHDOG_MS = 30 * 1000;
 const AGENT_LONG_TRIGGER_MAX_DURATION_SECONDS =
@@ -580,6 +607,7 @@ type AgentLongErrorSummary = {
   actualSandbox?: string;
   uploadFailureKind?: string;
   uploadFailurePhase?: "acquisition" | "readiness" | "transfer";
+  uploadFailureAcquisitionStage?: CloudAcquisitionStage;
   uploadFailureReason?: string;
   uploadFailureCause?: string;
   uploadFailureTransientSandboxCommand?: boolean;
@@ -615,6 +643,7 @@ const USER_CORRECTABLE_AGENT_LONG_ERROR_CATEGORIES = new Set([
   "input_too_large",
   "empty_after_processing",
   "local_sandbox_fallback_blocked",
+  "sandbox_offline",
   "invalid_image_input",
   "content_blocked",
 ]);
@@ -624,6 +653,7 @@ const isUserCorrectableAgentLongErrorCategory = (category: string): boolean =>
 
 const getAgentLongErrorRunStatus = (category: string): string => {
   if (category === "chat_not_found") return "chat_not_found";
+  if (category === "sandbox_offline") return "reconnect_required";
   if (isUserCorrectableAgentLongErrorCategory(category)) {
     return "user_correctable";
   }
@@ -712,9 +742,11 @@ const classifyAgentLongError = (error: unknown): AgentLongErrorSummary => {
                     ? "empty_after_processing"
                     : errorMetadata?.localSandboxFallbackBlocked === true
                       ? "local_sandbox_fallback_blocked"
-                      : errorMetadata?.upload_failure_kind
-                        ? "sandbox_upload_failure"
-                        : "chat_error",
+                      : error.type === "offline" && error.surface === "sandbox"
+                        ? "sandbox_offline"
+                        : errorMetadata?.upload_failure_kind
+                          ? "sandbox_upload_failure"
+                          : "chat_error",
       code,
       name: "ChatSDKError",
       message: errorMessage,
@@ -779,6 +811,12 @@ const classifyAgentLongError = (error: unknown): AgentLongErrorSummary => {
         errorMetadata,
         "upload_failure_reason",
       ),
+      uploadFailureAcquisitionStage:
+        uploadFailurePhase === "acquisition"
+          ? parseCloudAcquisitionStage(
+              errorMetadata?.upload_failure_acquisition_stage,
+            )
+          : undefined,
       uploadFailureCause: getStringMetadata(
         errorMetadata,
         "upload_failure_cause",
@@ -883,31 +921,6 @@ const recordAgentLongChatMetadataUpdateFailure = (
   });
 };
 
-const getTerminalProviderStreamError = (
-  state:
-    Pick<AgentStreamState, "streamFinishReason" | "providerError"> | undefined,
-): unknown | undefined => {
-  if (!state) return undefined;
-  if (state.providerError) return state.providerError;
-  if (
-    state.streamFinishReason !== "error" &&
-    !isProviderContentFilterFinishReason(state.streamFinishReason)
-  ) {
-    return undefined;
-  }
-  if (isProviderContentFilterFinishReason(state.streamFinishReason)) {
-    return createProviderContentBlockedFinishReasonError();
-  }
-
-  return Object.assign(
-    new Error("Provider stream finished with error finish reason"),
-    {
-      name: "ProviderStreamError",
-      finishReason: state.streamFinishReason,
-    },
-  );
-};
-
 const isTerminalProviderStreamError = (
   state:
     Pick<AgentStreamState, "streamFinishReason" | "providerError"> | undefined,
@@ -921,6 +934,7 @@ const resetAgentStreamStateForRetry = (state: AgentStreamState): void => {
   state.lastStepInputTokens = 0;
   state.stoppedDueToStepLimit = false;
   state.streamFinishReason = undefined;
+  state.providerTerminalFinishReasonBeforeAbort = undefined;
   state.providerError = undefined;
   state.providerErrorMetadata = undefined;
   state.providerRejectedMultimodalToolResults = false;
@@ -1049,6 +1063,11 @@ const recordAgentLongFailureForDashboard = async (
     metadata.set("uploadFailureKind", summary.uploadFailureKind);
   if (summary.uploadFailurePhase)
     metadata.set("uploadFailurePhase", summary.uploadFailurePhase);
+  if (summary.uploadFailureAcquisitionStage)
+    metadata.set(
+      "uploadFailureAcquisitionStage",
+      summary.uploadFailureAcquisitionStage,
+    );
   if (summary.uploadFailureReason)
     metadata.set("uploadFailureReason", summary.uploadFailureReason);
   if (summary.uploadFailureCause)
@@ -1391,6 +1410,7 @@ type RunCleanupState = {
   userId: string;
   subagentsEnabled: boolean;
   finishCloudSandboxLifecycle: () => Promise<void>;
+  cleanupBrowserSessions: () => Promise<void>;
 };
 const runCleanupMap = new Map<string, RunCleanupState>();
 
@@ -1579,6 +1599,7 @@ export const agentLongTask = task({
       ).catch(() => undefined);
     }
     await ptySessionManager.closeAll(cleanup.chatId).catch(() => {});
+    await cleanup.cleanupBrowserSessions();
     await cleanup.finishCloudSandboxLifecycle();
     await phLogger.flush().catch(() => {});
     runCleanupMap.delete(ctx.run.id);
@@ -1630,17 +1651,6 @@ export const agentLongTask = task({
     let selectedModelOverride = rawSelectedModelOverride;
     const endpoint = payloadEndpoint ?? LEGACY_AGENT_API_ENDPOINT;
     const freeUsageSubject = freeQuotaSubject ?? userId;
-
-    if (
-      (agentPermissionMode === "ask_approval" ||
-        agentPermissionMode === "auto_review") &&
-      approvalProtocolVersion !== AGENT_TOOL_APPROVAL_PROTOCOL_VERSION
-    ) {
-      throw new ChatSDKError(
-        "bad_request:api",
-        "This Agent approval request uses an unsupported protocol version. Refresh HackerAI and start a new Agent request.",
-      );
-    }
 
     // Stable across retries so a failed-then-retried run upserts the same
     // message record rather than creating a duplicate.
@@ -1792,6 +1802,7 @@ export const agentLongTask = task({
     let chatLogger: ChatLogger | undefined = createChatLogger({
       chatId,
       endpoint,
+      requestId: ctx.run.id,
     });
     chatLogger.setRequestDetails({
       mode,
@@ -1835,6 +1846,7 @@ export const agentLongTask = task({
         });
       }
     };
+    let cleanupBrowserSessions = async () => {};
     let cloudSandboxLifecyclePromise: Promise<void> | undefined;
     let finishE2BIdleLeaseRelease: (() => Promise<void>) | undefined;
     const finishCloudSandboxLifecycle = () => {
@@ -1855,21 +1867,54 @@ export const agentLongTask = task({
       userId,
       subagentsEnabled,
       finishCloudSandboxLifecycle,
+      cleanupBrowserSessions: () => cleanupBrowserSessions(),
     });
 
+    // Available before the first database read, including failed setup.
+    const posthog = PostHogClient();
+    const runReporting = createAgentRunReporting({
+      posthog,
+      runId: ctx.run.id,
+      userId,
+      chatId,
+      subscription,
+      endpoint,
+    });
     let activeRuntimeBudget: ActiveRuntimeBudget | undefined;
     let runtimeSettlementWatchdog: RuntimeSettlementWatchdog | undefined;
+    let terminalAgentState: AgentStreamState | undefined;
+    const stopSignal = createAgentStopSignal({
+      onAbort: (source) => {
+        triggerLogger.warn("[agent-long] stop signal aborted", {
+          event: "agent_long_stop_signal_aborted",
+          run_id: ctx.run.id,
+          chat_id: chatId,
+          stop_source: source,
+        });
+      },
+      getStreamState: () => terminalAgentState,
+    });
     // Register before async setup and handle a signal already canceled while
     // the task was starting. Abort events are not replayed to late listeners.
-    const userStopSignal = new AbortController();
+    const userStopSignal = stopSignal.controller;
     const forwardTriggerAbort = () =>
-      userStopSignal.abort(triggerSignal.reason);
+      stopSignal.abort("trigger_platform", triggerSignal.reason);
     triggerSignal.addEventListener("abort", forwardTriggerAbort, {
       once: true,
     });
     if (triggerSignal.aborted) forwardTriggerAbort();
 
     try {
+      if (
+        (agentPermissionMode === "ask_approval" ||
+          agentPermissionMode === "auto_review") &&
+        approvalProtocolVersion !== AGENT_TOOL_APPROVAL_PROTOCOL_VERSION
+      ) {
+        throw new ChatSDKError(
+          "bad_request:api",
+          "This Agent approval request uses an unsupported protocol version. Refresh HackerAI and start a new Agent request.",
+        );
+      }
       userStopSignal.signal.throwIfAborted();
       await enforceRegionalSubscriptionFirst({
         userId,
@@ -1877,10 +1922,40 @@ export const agentLongTask = task({
         country: payload.regionalSubscriptionCountry,
         surface: "agent_worker",
       });
+      const userCustomizationPromise = getUserCustomization({ userId });
+      const maxExtraUsageConfig =
+        selectedModelOverride === "hackerai-max"
+          ? await buildExtraUsageConfig({
+              userId,
+              subscription,
+              userCustomization: await userCustomizationPromise,
+              organizationId,
+            })
+          : undefined;
+      // Resolve Max entitlement before granting its larger history allowance.
+      if (selectedModelOverride === "hackerai-max") {
+        selectedModelOverride =
+          normalizeMaxModelForSubscription(
+            selectedModelOverride,
+            subscription,
+            { extraUsageAvailable: canUseExtraUsage(maxExtraUsageConfig!) },
+          ) ?? undefined;
+      }
       // Re-fetch from DB so we have fileTokens for summarization.
       // The route already saved the user message; newMessages:[] avoids duplicates.
+      const agentModelContextVariant = await getAgentModelContextVariant(
+        userId,
+        subscription,
+        mode,
+        selectedModelOverride,
+      );
+      runReporting.setAgentModelContextVariant(
+        agentModelContextVariant,
+        getAgentModelContextFlag(selectedModelOverride),
+      );
+      const agentModelContextEnabled = agentModelContextVariant === "test";
       const [userCustomization, fetched] = await Promise.all([
-        getUserCustomization({ userId }),
+        userCustomizationPromise,
         getMessagesByChatId({
           chatId,
           userId,
@@ -1888,6 +1963,7 @@ export const agentLongTask = task({
           newMessages: [],
           regenerate,
           mode,
+          agentModelContextEnabled,
         }),
       ]);
       const { chat, fileTokens } = fetched;
@@ -1906,15 +1982,16 @@ export const agentLongTask = task({
             : messages;
       const messagesForAccounting = messagesForProcessing;
       const attachmentCounts = countFileAttachments(messagesForProcessing);
-      const baseExtraUsageConfigPromise = buildExtraUsageConfig({
-        userId,
-        subscription,
-        userCustomization,
-        organizationId,
-      });
+
       const [projectContext, baseExtraUsageConfig] = await Promise.all([
         projectContextPromise,
-        baseExtraUsageConfigPromise,
+        maxExtraUsageConfig ??
+          buildExtraUsageConfig({
+            userId,
+            subscription,
+            userCustomization,
+            organizationId,
+          }),
       ]);
       const extraUsageAvailable = canUseExtraUsage(baseExtraUsageConfig);
       selectedModelOverride =
@@ -1930,28 +2007,34 @@ export const agentLongTask = task({
         subscription,
         selectedModelOverride,
       });
-      const posthog = PostHogClient();
-      const cloudSandboxSelection =
-        !sandboxPreference || sandboxPreference === "e2b"
-          ? await selectCloudSandboxProvider({
-              userId,
-              subscription,
-              environment: ctx.environment.type,
-              triggerRegion,
-              requestRegionClass,
-              featureFlagClient: posthog,
-            })
-          : ({
-              provider: "e2b",
-              reason: "miosa_rollout_control",
-            } as const);
+      const cloudSandboxSelection = {
+        provider: "e2b",
+        reason: "e2b_only",
+      } as const;
       const cloudSandboxProvider = cloudSandboxSelection.provider;
       const regionalFreeLimits = getRegionalFreeLimits({
         userId,
         subscription,
         country: payload.regionalFreeCountry,
       });
-      const freeLimits = regionalFreeLimits;
+      const freeAgentBudget = await evaluateFreeAgentBudget({
+        posthog,
+        userId,
+        mode,
+        subscription,
+        requestId: ctx.run.id,
+      });
+      const freeLimits = freeAgentBudgetPolicy(
+        freeAgentBudget,
+        regionalFreeLimits,
+      );
+      const freeDailySettlement = freeLimits?.agentDailyBudget
+        ? new FreeDailyCostSettlement(
+            freeUsageSubject,
+            freeLimits,
+            crypto.randomUUID(),
+          )
+        : undefined;
       // Check capacity before moderation/model work, then consume the daily
       // request atomically under the free-run lock when execution starts.
       if (subscription === "free") {
@@ -1965,7 +2048,7 @@ export const agentLongTask = task({
           freeQuotaSubject,
           freeLimits,
         );
-        await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits);
+        await checkFreeCostBudget(freeUsageSubject, freeLimits);
       }
 
       const baseTodos: Todo[] = getBaseTodosForRequest(
@@ -1980,11 +2063,8 @@ export const agentLongTask = task({
         selectedModel,
         sandboxFiles,
         platformAuthorized,
-        paidFirstStepVariant,
         moderationChecked,
       } = await processChatMessages({
-        abliterationPosthog: posthog,
-        limitRescue: Boolean(limitRescue),
         messages: messagesForProcessing,
         mode,
         userId,
@@ -2012,14 +2092,12 @@ export const agentLongTask = task({
       }
 
       const abliteratedExperiment = await evaluateAbliteratedModel({
-        posthog,
         userId,
         selectedModel,
         subscription,
         mode,
         selectedModelOverride,
         moderationEligible: platformAuthorized,
-        paidFirstStepVariant,
         moderationChecked,
         messages: messagesForProcessing,
         limitRescue: Boolean(limitRescue),
@@ -2062,6 +2140,16 @@ export const agentLongTask = task({
       if (deepSeekV4Pro0813Experiment) {
         selectedModel = deepSeekV4Pro0813Experiment.modelKey;
       }
+      selectedModel = resolvePaidProAutoModel({
+        userId,
+        subscription,
+        selectedModel,
+        selectedModelOverride,
+        limitRescue: Boolean(limitRescue),
+        modelPolicyActive: Boolean(
+          abliteratedExperiment || deepSeekV4Pro0813Experiment,
+        ),
+      });
       const requestHasImages =
         countFileAttachments(messagesForProcessing).imageCount > 0 ||
         uiMessagesContainImageViewResult(processedMessages);
@@ -2072,6 +2160,10 @@ export const agentLongTask = task({
         subscription,
         selectedModel,
         hasImages: requestHasImages,
+        limitRescue: Boolean(limitRescue),
+        modelPolicyActive: Boolean(
+          abliteratedExperiment || deepSeekV4Pro0813Experiment,
+        ),
       });
       if (flashRoutingAssignment)
         selectedModel = flashRoutingAssignment.modelKey;
@@ -2082,6 +2174,7 @@ export const agentLongTask = task({
         subscription,
         userId,
         selectedModel,
+        selectedModelOverride,
         userCustomization,
         truncatedMessages: messagesForAccounting,
       });
@@ -2102,7 +2195,6 @@ export const agentLongTask = task({
 
       const summarizationTracker = new SummarizationTracker();
       chatLogger.startStream();
-      let terminalAgentState: AgentStreamState | undefined;
       let terminalRequestedModelSlug: string | undefined;
       let agentLongDurationExceeded = false;
       const markAgentLongDurationExceeded = () => {
@@ -2119,7 +2211,7 @@ export const agentLongTask = task({
         onExceeded: () => {
           markAgentLongDurationExceeded();
           runtimeSettlementWatchdog?.arm();
-          userStopSignal.abort();
+          stopSignal.abort("active_runtime_budget");
           triggerLogger.warn("[agent-long] active runtime budget exhausted", {
             event: "agent_long_runtime_budget_exhausted",
             run_id: ctx.run.id,
@@ -2206,9 +2298,21 @@ export const agentLongTask = task({
         triggerRunId: ctx.run.id,
         isUserAborted: () => userStopSignal.signal.aborted,
       });
+      runReporting.setStage("preparation");
       const uiStream = createUIMessageStream({
         onError: (error) => {
+          if (isCancellationError(error, userStopSignal.signal)) {
+            return "";
+          }
           streamError ??= error;
+          runReporting.fail(
+            error,
+            triggerSignal.aborted
+              ? "canceled"
+              : isHandledUserRateLimitError(error)
+                ? "usage_limit"
+                : "error",
+          );
           if (error instanceof ChatSDKError) {
             return serializeChatSDKErrorForStream(error);
           }
@@ -2256,7 +2360,7 @@ export const agentLongTask = task({
 
             const freeMonthlyBudgetSnapshot =
               subscription === "free"
-                ? await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits)
+                ? await checkFreeCostBudget(freeUsageSubject, freeLimits)
                 : null;
 
             try {
@@ -2391,7 +2495,10 @@ export const agentLongTask = task({
                   variant: activeAbliteratedExperiment.variant,
                   requestId: assistantMessageId,
                 }
-              : (activeFlashRoutingAssignment ??
+              : ((activeFlashRoutingAssignment && {
+                  ...activeFlashRoutingAssignment,
+                  requestId: assistantMessageId,
+                }) ??
                 getDeepSeekV4Pro0813ExperimentContext(
                   activeDeepSeekV4Pro0813Experiment,
                 ));
@@ -2531,12 +2638,22 @@ export const agentLongTask = task({
                 freeLimits,
               );
               if (authorization.subscription === "free") {
-                await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits);
                 const lock = await acquireFreeRunConcurrencyLock(
                   freeUsageSubject,
                   FREE_AGENT_LONG_RUN_LOCK_TTL_SECONDS,
                 );
                 releaseFreeRunLock = lock.release;
+                const refreshed = await checkFreeCostBudget(
+                  freeUsageSubject,
+                  freeLimits,
+                );
+                if (freeDailySettlement && freeMonthlyBudgetSnapshot) {
+                  // Monitor subtracts cumulative run cost; add back this run's
+                  // settled cost so other work during the wait reduces capacity.
+                  freeMonthlyBudgetSnapshot.monthlyRemainingAtStart =
+                    refreshed.monthlyRemainingAtStart +
+                    freeDailySettlement.settledPoints;
+                }
               }
             };
             const revalidateAfterAutoReview = async ({
@@ -2619,7 +2736,7 @@ export const agentLongTask = task({
                 freeLimits,
               );
               if (currentEntitlement.subscription === "free") {
-                await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits);
+                await checkFreeCostBudget(freeUsageSubject, freeLimits);
               }
             };
             let approvalSandboxManager: SandboxManager | undefined;
@@ -2655,7 +2772,18 @@ export const agentLongTask = task({
               resolveSandboxIdentity: resolveApprovalSandboxIdentity,
               workingDirectory: projectContext.workingDirectory,
               beforeSuspend:
-                subscription === "free" ? releaseFreeRunLockOnce : undefined,
+                subscription === "free"
+                  ? async () => {
+                      if (freeDailySettlement) {
+                        await freeDailySettlement.settle(
+                          usageTracker.computeCostDollars(activeModelName) +
+                            (await getSandboxSessionCost()) +
+                            getTriggerRunUsage().totalCostDollars,
+                        );
+                      }
+                      await releaseFreeRunLockOnce();
+                    }
+                  : undefined,
               revalidateAfterSuspend: revalidateAfterApprovalSuspend,
               revalidateAfterAutoReview,
               autoReviewAssignment,
@@ -2672,11 +2800,14 @@ export const agentLongTask = task({
                 usageTracker.nonModelCost += costDollars;
                 chatLogger?.getBuilder().addToolCost(costDollars);
               },
-              onAutoReviewCircuitBreaker: () => userStopSignal.abort(),
-              onPostWaitAuthorizationDenied: () => userStopSignal.abort(),
+              onAutoReviewCircuitBreaker: () =>
+                stopSignal.abort("auto_review_circuit_breaker"),
+              onPostWaitAuthorizationDenied: () =>
+                stopSignal.abort("post_wait_authorization_denied"),
               onApprovalWait: runTimingTracker.recordApprovalWait,
             });
             const {
+              cloudNetworkPrompt,
               tools,
               ensureSandbox,
               getTodoManager,
@@ -2686,6 +2817,7 @@ export const agentLongTask = task({
               getSandboxSessionUsage,
               releaseE2BSandboxIdleLease,
               stopE2BSandboxRunLeaseHeartbeat,
+              cleanupBrowserSessions: cleanupToolBrowsers,
               setCurrentModelName,
               getToolsForModel,
             } = createTools(
@@ -2723,6 +2855,7 @@ export const agentLongTask = task({
                 cloudSandboxSelectionReason: cloudSandboxSelection.reason,
                 triggerRegion,
                 environment: ctx.environment.type,
+                signal: userStopSignal.signal,
                 keepE2BLeaseAliveForRun: true,
                 ...(subagentsEnabled
                   ? {
@@ -2779,6 +2912,7 @@ export const agentLongTask = task({
                 profile: "general",
               });
             }
+            cleanupBrowserSessions = cleanupToolBrowsers;
             approvalSandboxManager = sandboxManager;
 
             const sendFileMetadataToStream = (
@@ -2954,6 +3088,7 @@ export const agentLongTask = task({
                 agentPermissionMode,
                 genericDelegationEnabled,
                 cloudSandboxProvider,
+                selectedModelOverride,
               ),
               injectNotesIntoMessages(finalMessages, noteInjectionOpts),
             ]);
@@ -3039,10 +3174,15 @@ export const agentLongTask = task({
               selectedModelOverride,
             });
             const fallbackModel =
+              !(mode === "agent" && selectedModelOverride === "hackerai-max") &&
               abliteratedExperiment &&
               isAbliterationModel(abliteratedExperiment.modelKey)
                 ? abliteratedExperiment.baselineModel
-                : getRetryFallbackModel(selectedModel, mode);
+                : getRetryFallbackModel(
+                    selectedModel,
+                    mode,
+                    selectedModelOverride,
+                  );
             let activeModelName = selectedModel;
 
             let hasRecordedUsage = false;
@@ -3174,10 +3314,16 @@ export const agentLongTask = task({
                     },
                   });
                 } else if (subscription === "free") {
-                  await recordFreeMonthlyCost(
-                    freeUsageSubject,
-                    usageCostRecord.costDollars,
-                  );
+                  if (freeDailySettlement) {
+                    await freeDailySettlement.settle(
+                      usageCostRecord.costDollars,
+                    );
+                  } else {
+                    await recordFreeMonthlyCost(
+                      freeUsageSubject,
+                      usageCostRecord.costDollars,
+                    );
+                  }
                 } else {
                   const deductionResult = await deductUsage(
                     userId,
@@ -3256,7 +3402,7 @@ export const agentLongTask = task({
                     billingBreakdown,
                   });
                 }
-                captureUsageCost({
+                runReporting.captureCost(captureUsageCost, {
                   cacheHistoryTelemetry: state.cacheHistoryTelemetry,
                   usageMeasurement:
                     usageTracker.measurementProperties(selectedModel),
@@ -3272,6 +3418,7 @@ export const agentLongTask = task({
                   agentPermissionMode,
                   analyticsRequestContext,
                   experiment: routingExperimentContext,
+                  freeAgentBudget,
                   usage: usageCostRecord,
                   ...(sandboxCost > 0 && { sandboxUsage }),
                   ...(triggerRunCost > 0 && { triggerRunUsage }),
@@ -3303,7 +3450,12 @@ export const agentLongTask = task({
                 force,
                 model,
               }) => {
-                if (!usageSettlementState || hasRecordedUsage) return;
+                if (hasRecordedUsage) return;
+                if (freeDailySettlement) {
+                  await freeDailySettlement.settle(currentCostDollars);
+                  return;
+                }
+                if (!usageSettlementState) return;
                 if (
                   !shouldSettleUsageMidRun({
                     state: usageSettlementState,
@@ -3380,6 +3532,7 @@ export const agentLongTask = task({
                   deduction: deductionResult,
                   forced: force,
                   experiment: routingExperimentContext,
+                  freeAgentBudget,
                 });
 
                 usageRefundTracker.addDeductions(deductionResult);
@@ -3414,7 +3567,7 @@ export const agentLongTask = task({
                     cumulativeDeduction.usageDeductionFailureReason,
                   force,
                 });
-                userStopSignal.abort();
+                stopSignal.abort("usage_settlement_uncovered");
               };
 
             let parentFinishBlockedObserved = false;
@@ -3595,9 +3748,13 @@ export const agentLongTask = task({
                 }),
               providerStreamTimeout: {
                 timeoutMs: AGENT_PROVIDER_IDLE_TIMEOUT_MS,
+                totalTimeoutMs: AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
                 onTimeout: ({ phase, timeoutMs, modelId }) => {
                   triggerLogger.warn("[agent-long] provider stalled", {
-                    event: "agent_long_provider_idle_timeout",
+                    event:
+                      phase === "total"
+                        ? "agent_long_provider_total_timeout"
+                        : "agent_long_provider_idle_timeout",
                     run_id: ctx.run.id,
                     chat_id: chatId,
                     phase,
@@ -3617,6 +3774,8 @@ export const agentLongTask = task({
                 isAbliterationModel(activeAbliteratedExperiment.modelKey) && {
                   abliteratedStepRouting: {
                     baselineModel: activeAbliteratedExperiment.baselineModel,
+                    generationStepLimit:
+                      activeAbliteratedExperiment.generationStepLimit,
                   },
                 }),
               onProviderRequestStart: (configuredModel) => {
@@ -3624,6 +3783,7 @@ export const agentLongTask = task({
               },
               trackedProvider,
               currentSystemPrompt,
+              cloudNetworkPrompt,
               tools,
               mode,
               endpoint,
@@ -3636,6 +3796,8 @@ export const agentLongTask = task({
               systemPromptTokens,
               ctxSystemTokens,
               ctxMaxTokens,
+              agentModelContextEnabled,
+              agentModelContextVariant,
               streamStartTime,
               triggerRunId: ctx.run.id,
               contextUsageOn,
@@ -3660,9 +3822,20 @@ export const agentLongTask = task({
               getSandboxCostDollars: getSandboxSessionCost,
               getTriggerRunCostDollars: () =>
                 getTriggerRunUsage().totalCostDollars,
-              onModelStreamStart: runTimingTracker.startModelStream,
+              onModelStreamStart: () => {
+                runReporting.setStage("model_stream");
+                runTimingTracker.startModelStream();
+              },
               onModelStreamFinish: runTimingTracker.finishModelStream,
-              onModelChunk: runTimingTracker.recordFirstModelChunk,
+              onModelChunk: () => {
+                if (
+                  routingExperimentContext &&
+                  routingExperimentContext.firstModelChunkAt === undefined
+                ) {
+                  routingExperimentContext.firstModelChunkAt = Date.now();
+                }
+                runTimingTracker.recordFirstModelChunk();
+              },
               onModelStepSelected: (modelName) => {
                 activeModelName = modelName;
                 terminalRequestedModelSlug =
@@ -3686,6 +3859,11 @@ export const agentLongTask = task({
                 }
               },
               settleUsageAfterStep,
+              checkBudgetBeforeStep: freeDailySettlement
+                ? async () => {
+                    await checkFreeCostBudget(freeUsageSubject, freeLimits);
+                  }
+                : undefined,
               ...(subagentCompletionGate ? { subagentCompletionGate } : {}),
               ...(useMaxKimiReasoning && {
                 providerReasoningOverride: {
@@ -3736,7 +3914,10 @@ export const agentLongTask = task({
             const getProviderRecoveryAnalytics = (
               outcome: "success" | "error" | "aborted",
             ) => {
-              const terminalError = getTerminalProviderStreamError(state);
+              const terminalError = getTerminalProviderStreamError(
+                state,
+                userStopSignal.signal.aborted,
+              );
               const providerError = terminalError
                 ? wrapProviderTerminalError(terminalError, {
                     model: terminalRequestedModelSlug,
@@ -3829,6 +4010,29 @@ export const agentLongTask = task({
               retryMessageId: string;
               retryStartTime: number;
             }) => {
+              const lastRetryAssistant = retryMessages.findLast(
+                (message) => message.role === "assistant",
+              );
+              if (
+                !retryAborted &&
+                !userStopSignal.signal.aborted &&
+                isTerminalEmptyAssistantResponse(
+                  stripAgentLongHeartbeatParts(
+                    lastRetryAssistant ?? { parts: [] },
+                  ).parts ?? [],
+                  state.streamFinishReason,
+                )
+              ) {
+                state.streamFinishReason = "error";
+                state.providerError = new Error(
+                  "Provider completed without a usable answer",
+                );
+                appendProviderEmptyResponseFailure(
+                  retryMessages,
+                  retryMessageId,
+                  writer,
+                );
+              }
               const fallbackCacheRead =
                 usageTracker.cacheReadTokens - preFallbackCacheRead;
               const fallbackCacheWrite =
@@ -3860,14 +4064,14 @@ export const agentLongTask = task({
                 : isTerminalProviderStreamError(state)
                   ? "error"
                   : "success";
-              captureAgentCompletionAnalytics({
+              runReporting.captureTerminal(captureAgentCompletionAnalytics, {
+                responseMessageId: retryMessageId,
                 cacheHistoryTelemetry: state.cacheHistoryTelemetry,
                 usageMeasurement:
                   usageTracker.measurementProperties(selectedModel),
-                hasResponseContent: hasCompletedAssistantText(
-                  retryMessages,
-                  retryMessageId,
-                ),
+                hasResponseContent:
+                  outcome === "success" &&
+                  hasCompletedAssistantText(retryMessages, retryMessageId),
                 handledToolFailureCount,
                 abliteratedProviderSummary: abliteratedTelemetry?.getSummary(),
                 posthog,
@@ -3906,6 +4110,7 @@ export const agentLongTask = task({
                 hadSummarization: summarizationTracker.hasSummarized,
                 isAutoContinue: !!isAutoContinue,
                 experiment: routingExperimentContext,
+                freeAgentBudget,
                 stepLimitTelemetry: buildAgentStepLimitTelemetry({
                   configuredMaxSteps: state.configuredMaxSteps,
                   stepCount: state.agentStepCount,
@@ -4013,7 +4218,6 @@ export const agentLongTask = task({
                   recoveryFields,
                 );
               }
-              posthog?.shutdown();
             };
 
             let result;
@@ -4248,6 +4452,11 @@ export const agentLongTask = task({
                             detectAssistantContentLoop: !isAborted,
                           },
                         );
+                      const terminalEmptyResponse =
+                        isTerminalEmptyAssistantResponse(
+                          lastAssistantMessageParts,
+                          state.streamFinishReason,
+                        );
                       const imageRecovery =
                         state.providerRejectedMultimodalToolResults
                           ? omitImageViewToolResultsForProviderRetry(
@@ -4289,8 +4498,13 @@ export const agentLongTask = task({
                             (message.parts?.length ?? 0) > 0,
                         );
                       const providerDisconnectContinuation =
-                        hasTerminalProviderStreamError &&
-                        (shouldRecoverAbliterationStreamError ||
+                        (hasTerminalProviderStreamError ||
+                          terminalEmptyResponse) &&
+                        ((terminalEmptyResponse &&
+                          !hasUncertainProviderToolOutcome(
+                            lastAssistantMessageParts,
+                          )) ||
+                          shouldRecoverAbliterationStreamError ||
                           isRetriableProviderStreamDisconnectError(
                             state.providerError,
                           )) &&
@@ -4301,6 +4515,7 @@ export const agentLongTask = task({
                               normalizedFinishedMessages,
                               {
                                 allowCompletedTail:
+                                  terminalEmptyResponse ||
                                   shouldRecoverAbliterationStreamError ||
                                   isProviderResponseTimeout(
                                     state.providerError,
@@ -4388,7 +4603,10 @@ export const agentLongTask = task({
                         }
                       }
 
-                      if (hasTerminalProviderStreamError) {
+                      if (
+                        hasTerminalProviderStreamError ||
+                        terminalEmptyResponse
+                      ) {
                         const failure = wrapProviderTerminalError(
                           state.providerError,
                           {
@@ -4427,6 +4645,7 @@ export const agentLongTask = task({
                           retry_already_used: isRetryWithFallback,
                           user_cancelled: userStopSignal.signal.aborted,
                           stream_aborted: isAborted,
+                          terminal_empty_response: terminalEmptyResponse,
                           has_safe_continuation:
                             shouldContinueAfterProviderDisconnect,
                           ...getProviderOutputDiagnostics(
@@ -4450,25 +4669,31 @@ export const agentLongTask = task({
                         !visionSummaryRecoveryFailure &&
                         !userStopSignal.signal.aborted
                       ) {
-                        const retryReason = shouldRetryWithVisionSummary
-                          ? "vision_summary_recovery"
-                          : shouldRetryWithoutImageToolResults
-                            ? "image_tool_result_rejection"
-                            : shouldContinueAfterProviderDisconnect
-                              ? "provider_disconnect_continuation"
-                              : providerContentBlocked
-                                ? "content_filter"
-                                : stoppedDueToAssistantContentLoop
-                                  ? "assistant_content_loop"
-                                  : state.stoppedDueToDoomLoop
-                                    ? "doom_loop"
-                                    : shouldRetryInterruptedToolInput
-                                      ? "interrupted_tool_input"
-                                      : shouldRetryNonDurableOutputLimit
-                                        ? "non_durable_output_limit"
-                                        : shouldRetryReasoningOnlyProviderError
-                                          ? "reasoning_only_provider_error"
-                                          : "incomplete_stream";
+                        const retryReason =
+                          terminalEmptyResponse &&
+                          shouldContinueAfterProviderDisconnect
+                            ? "empty_answer_continuation"
+                            : terminalEmptyResponse
+                              ? "empty_answer"
+                              : shouldRetryWithVisionSummary
+                                ? "vision_summary_recovery"
+                                : shouldRetryWithoutImageToolResults
+                                  ? "image_tool_result_rejection"
+                                  : shouldContinueAfterProviderDisconnect
+                                    ? "provider_disconnect_continuation"
+                                    : providerContentBlocked
+                                      ? "content_filter"
+                                      : stoppedDueToAssistantContentLoop
+                                        ? "assistant_content_loop"
+                                        : state.stoppedDueToDoomLoop
+                                          ? "doom_loop"
+                                          : shouldRetryInterruptedToolInput
+                                            ? "interrupted_tool_input"
+                                            : shouldRetryNonDurableOutputLimit
+                                              ? "non_durable_output_limit"
+                                              : shouldRetryReasoningOnlyProviderError
+                                                ? "reasoning_only_provider_error"
+                                                : "incomplete_stream";
                         const blockedProviderModel = providerContentBlocked
                           ? state.responseModel
                           : undefined;
@@ -4485,7 +4710,8 @@ export const agentLongTask = task({
                               )
                             : shouldRetryWithoutImageToolResults
                               ? selectedModel
-                              : providerContentBlocked
+                              : providerContentBlocked &&
+                                  selectedModelOverride !== "hackerai-max"
                                 ? getContentFilterRetryModel(
                                     selectedModel,
                                     mode,
@@ -4537,6 +4763,7 @@ export const agentLongTask = task({
                         );
                         if (
                           providerDisconnectContinuation &&
+                          !terminalEmptyResponse &&
                           !shouldRetryWithVisionSummary
                         ) {
                           recordProviderDisconnectRecoveryAttempt({
@@ -4673,6 +4900,9 @@ export const agentLongTask = task({
                                       ? prepareProviderDisconnectContinuation(
                                           normalizedRetryMessages,
                                           {
+                                            allowEmptyResponse:
+                                              selectedModelOverride ===
+                                              "hackerai-max",
                                             allowCompletedTail:
                                               isProviderResponseTimeout(
                                                 state.providerError,
@@ -4680,12 +4910,63 @@ export const agentLongTask = task({
                                           },
                                         )
                                       : undefined;
+                                  const nextRecoveryMessages:
+                                    UIMessage[] | undefined = nextContinuation
+                                    ? [
+                                        ...state.finalMessages,
+                                        ...nextContinuation.messages,
+                                        {
+                                          id: generateId(),
+                                          role: "user",
+                                          parts: [
+                                            {
+                                              type: "text",
+                                              text: PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
+                                            },
+                                          ],
+                                        },
+                                      ]
+                                    : undefined;
+                                  let requiredContextTokens: number | undefined;
+                                  if (
+                                    selectedModelOverride === "hackerai-max" &&
+                                    nextRecoveryMessages
+                                  ) {
+                                    try {
+                                      const raw = await convertToModelMessages(
+                                        nextRecoveryMessages,
+                                        {
+                                          tools: createPromptSerializationTools(
+                                            streamCtx.tools,
+                                          ),
+                                        },
+                                      );
+                                      const projected =
+                                        restoreProviderRecoveryContext(
+                                          state.providerRecoveryContext,
+                                          raw,
+                                        ) ?? raw;
+                                      requiredContextTokens =
+                                        estimateSummaryInputTokens(projected) +
+                                        streamCtx.systemPromptTokens +
+                                        safeCountTokens(
+                                          (await streamCtx.cloudNetworkPrompt?.()) ??
+                                            "",
+                                        );
+                                    } catch {
+                                      // Unknown input size cannot admit the smaller fallback.
+                                    }
+                                  }
                                   const finalRetryModel = nextContinuation
-                                    ? getNextDeepSeekProDisconnectRetryModel({
+                                    ? getNextProviderDisconnectRetryModel({
                                         originalModel: selectedModel,
                                         failedModel: retryModel,
                                         completedRetryCount:
                                           providerRecoveryAttempts,
+                                        selectedModelOverride,
+                                        agentModelContextEnabled,
+                                        subscription,
+                                        requiredContextTokens,
                                       })
                                     : undefined;
 
@@ -4708,20 +4989,7 @@ export const agentLongTask = task({
                                     streamError = undefined;
                                     resetAgentStreamStateForRetry(state);
                                     retryUsedFallbackModel = true;
-                                    state.finalMessages = [
-                                      ...state.finalMessages,
-                                      ...nextContinuation.messages,
-                                      {
-                                        id: generateId(),
-                                        role: "user",
-                                        parts: [
-                                          {
-                                            type: "text",
-                                            text: PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
-                                          },
-                                        ],
-                                      },
-                                    ];
+                                    state.finalMessages = nextRecoveryMessages!;
                                     const finalRetryStartTime = Date.now();
                                     const preservedFileIds =
                                       getFileAccumulator()
@@ -4842,6 +5110,22 @@ export const agentLongTask = task({
                         return;
                       }
 
+                      if (
+                        terminalEmptyResponse &&
+                        !isAborted &&
+                        !userStopSignal.signal.aborted
+                      ) {
+                        state.streamFinishReason = "error";
+                        state.providerError = new Error(
+                          "Provider completed without a usable answer",
+                        );
+                        appendProviderEmptyResponseFailure(
+                          finishedMessages,
+                          assistantMessageId,
+                          writer,
+                        );
+                      }
+
                       // User-initiated cancel via trigger.dev: clear finish reason
                       // so the client doesn't show spurious "going off course" messages.
                       if (
@@ -4877,63 +5161,70 @@ export const agentLongTask = task({
                         : isTerminalProviderStreamError(state)
                           ? "error"
                           : "success";
-                      captureAgentCompletionAnalytics({
-                        cacheHistoryTelemetry: state.cacheHistoryTelemetry,
-                        usageMeasurement:
-                          usageTracker.measurementProperties(selectedModel),
-                        hasResponseContent: hasCompletedAssistantText(
-                          finishedMessages,
-                          assistantMessageId,
-                        ),
-                        handledToolFailureCount,
-                        abliteratedProviderSummary:
-                          abliteratedTelemetry?.getSummary(),
-                        posthog,
-                        userId,
-                        chatId,
-                        endpoint,
-                        mode,
-                        subscription,
-                        sandboxInfo,
-                        outcome,
-                        abortSource: resolveAgentAbortSource({
+                      runReporting.captureTerminal(
+                        captureAgentCompletionAnalytics,
+                        {
+                          responseMessageId: assistantMessageId,
+                          cacheHistoryTelemetry: state.cacheHistoryTelemetry,
+                          usageMeasurement:
+                            usageTracker.measurementProperties(selectedModel),
+                          hasResponseContent:
+                            outcome === "success" &&
+                            hasCompletedAssistantText(
+                              finishedMessages,
+                              assistantMessageId,
+                            ),
+                          handledToolFailureCount,
+                          abliteratedProviderSummary:
+                            abliteratedTelemetry?.getSummary(),
+                          posthog,
+                          userId,
+                          chatId,
+                          endpoint,
+                          mode,
+                          subscription,
+                          sandboxInfo,
                           outcome,
-                          stoppedDueToBudgetExhaustion:
-                            state.stoppedDueToBudgetExhaustion,
-                          stoppedDueToAgentRunSpendCap:
-                            state.stoppedDueToAgentRunSpendCap,
-                          stoppedDueToElapsedTimeout:
-                            state.stoppedDueToElapsedTimeout,
-                          requestCancelled: triggerSignal.aborted,
-                        }),
-                        chatLogger,
-                        selectedModel,
-                        configuredModelId,
-                        responseModel: state.responseModel,
-                        fallbackServed:
-                          state.responseModel && retryUsedFallbackModel
-                            ? true
-                            : state.fallbackServed,
-                        finishReason: state.streamFinishReason,
-                        budgetAbortDetails: state.budgetAbortDetails,
-                        agentPermissionMode,
-                        messageCount: messagesForAccounting.length,
-                        estimatedInputTokens,
-                        attachmentCount: attachmentCounts.totalFiles,
-                        imageAttachmentCount: attachmentCounts.imageCount,
-                        isNewChat: !!isNewChat,
-                        hadSummarization: summarizationTracker.hasSummarized,
-                        isAutoContinue: !!isAutoContinue,
-                        experiment: routingExperimentContext,
-                        stepLimitTelemetry: buildAgentStepLimitTelemetry({
-                          configuredMaxSteps: state.configuredMaxSteps,
-                          stepCount: state.agentStepCount,
-                          stepLimitReached: state.stoppedDueToStepLimit,
-                          todoRunMetrics: getTodoManager().getRunMetrics(),
-                        }),
-                        ...getProviderRecoveryAnalytics(outcome),
-                        ...getTriggerRunTelemetry(),
-                      });
+                          abortSource: resolveAgentAbortSource({
+                            outcome,
+                            stoppedDueToBudgetExhaustion:
+                              state.stoppedDueToBudgetExhaustion,
+                            stoppedDueToAgentRunSpendCap:
+                              state.stoppedDueToAgentRunSpendCap,
+                            stoppedDueToElapsedTimeout:
+                              state.stoppedDueToElapsedTimeout,
+                            requestCancelled: triggerSignal.aborted,
+                          }),
+                          chatLogger,
+                          selectedModel,
+                          configuredModelId,
+                          responseModel: state.responseModel,
+                          fallbackServed:
+                            state.responseModel && retryUsedFallbackModel
+                              ? true
+                              : state.fallbackServed,
+                          finishReason: state.streamFinishReason,
+                          budgetAbortDetails: state.budgetAbortDetails,
+                          agentPermissionMode,
+                          messageCount: messagesForAccounting.length,
+                          estimatedInputTokens,
+                          attachmentCount: attachmentCounts.totalFiles,
+                          imageAttachmentCount: attachmentCounts.imageCount,
+                          isNewChat: !!isNewChat,
+                          hadSummarization: summarizationTracker.hasSummarized,
+                          isAutoContinue: !!isAutoContinue,
+                          experiment: routingExperimentContext,
+                          freeAgentBudget,
+                          stepLimitTelemetry: buildAgentStepLimitTelemetry({
+                            configuredMaxSteps: state.configuredMaxSteps,
+                            stepCount: state.agentStepCount,
+                            stepLimitReached: state.stoppedDueToStepLimit,
+                            todoRunMetrics: getTodoManager().getRunMetrics(),
+                          }),
+                          ...getProviderRecoveryAnalytics(outcome),
+                          ...getTriggerRunTelemetry(),
+                        },
+                      );
                       if (!isTerminalProviderStreamError(state)) {
                         chatLogger?.emitSuccess({
                           finishReason: state.streamFinishReason,
@@ -5067,7 +5358,6 @@ export const agentLongTask = task({
                             }),
                           );
                           await deductAccumulatedUsage();
-                          posthog?.shutdown();
                           return;
                         }
 
@@ -5178,7 +5468,6 @@ export const agentLongTask = task({
                           reason: "continuation_run",
                         });
                       }
-                      posthog?.shutdown();
                     } finally {
                       if (!retryScheduled) {
                         await releaseFreeRunLockOnce();
@@ -5190,14 +5479,24 @@ export const agentLongTask = task({
               ),
             );
           } catch (error) {
+            const canceledDuringPreparation =
+              userStopSignal.signal.aborted &&
+              error === userStopSignal.signal.reason;
+            runReporting.fail(
+              error,
+              canceledDuringPreparation
+                ? agentLongDurationExceeded
+                  ? "elapsed_timeout"
+                  : "canceled"
+                : isHandledUserRateLimitError(error)
+                  ? "usage_limit"
+                  : "error",
+            );
             if (!hasObservedUsage()) {
               await releasePaidDailyFreeAllowanceReservation();
             }
             await releaseFreeRunLockOnce();
-            if (
-              userStopSignal.signal.aborted &&
-              error === userStopSignal.signal.reason
-            ) {
+            if (canceledDuringPreparation) {
               preparationCanceled = true;
               await usageRefundTracker.refund().catch(() => {});
               writer.write({ type: "abort" });
@@ -5258,7 +5557,11 @@ export const agentLongTask = task({
       memoryTelemetry.checkpoint({ phase: "stream_finished" });
 
       const terminalStreamError =
-        streamError ?? getTerminalProviderStreamError(terminalAgentState);
+        streamError ??
+        getTerminalProviderStreamError(
+          terminalAgentState,
+          userStopSignal.signal.aborted,
+        );
       if (terminalStreamError) {
         if (isHandledUserRateLimitError(terminalStreamError)) {
           await recordAgentLongHandledRateLimitForDashboard(
@@ -5289,9 +5592,20 @@ export const agentLongTask = task({
         });
       }
 
-      metadata.set("status", preparationCanceled ? "canceled" : "done");
+      metadata.set(
+        "status",
+        preparationCanceled || triggerSignal.aborted ? "canceled" : "done",
+      );
       await phLogger.flush().catch(() => {});
     } catch (error) {
+      runReporting.fail(
+        error,
+        triggerSignal.aborted && error === triggerSignal.reason
+          ? "canceled"
+          : isHandledUserRateLimitError(error)
+            ? "usage_limit"
+            : "error",
+      );
       if (!hasObservedUsage()) {
         await releasePaidDailyFreeAllowanceReservation();
       }
@@ -5403,7 +5717,27 @@ export const agentLongTask = task({
 
       throw error;
     } finally {
+      // Fill only missing reports; never repeat billing or manufacture a full cost.
+      let reportingUsage:
+        ReturnType<typeof triggerUsage.getCurrent> | undefined;
+      try {
+        reportingUsage = triggerUsage.getCurrent();
+      } catch {
+        /* Usage unavailable. */
+      }
+      runReporting.finalize({
+        canceled: triggerSignal.aborted,
+        triggerCostDollars:
+          typeof reportingUsage?.totalCostInCents === "number"
+            ? reportingUsage.totalCostInCents / 100
+            : undefined,
+        triggerDurationMs: reportingUsage?.compute?.total?.durationMs,
+        observedAccumulatedCostDollars: observedUsageTracker?.providerCost,
+      });
+      // Flush fallback records and quota-check exposure before the worker exits.
+      await posthog?.shutdown().catch(() => undefined);
       triggerSignal.removeEventListener("abort", forwardTriggerAbort);
+      stopSignal.dispose();
       await releaseFreeRunLockBestEffort("outer_finally");
       runtimeSettlementWatchdog?.dispose();
       memoryTelemetry.dispose();
@@ -5429,6 +5763,7 @@ export const agentLongTask = task({
           );
         }
       }
+      await cleanupBrowserSessions();
       await finishE2BIdleLeaseRelease?.().catch((error) => {
         triggerLogger.warn("[agent-long] E2B idle lease release failed", {
           event: "agent_e2b_idle_lease_release_failed",

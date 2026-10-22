@@ -41,6 +41,11 @@ import {
 } from "@/lib/ai/provider-response-guard";
 import { namespaceLanguageModelToolCalls } from "@/lib/ai/tool-call-id-namespace";
 import { withProviderModelHistory } from "@/lib/ai/provider-model-history";
+import {
+  AGENT_PROVIDER_IDLE_TIMEOUT_MS,
+  AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
+  withProviderStreamTimeout,
+} from "@/lib/ai/provider-stream-timeout";
 import { createSubagentProviderHistory } from "@/lib/ai/subagents/provider-history";
 import {
   SUBAGENT_MAX_ACTIVE_SECONDS,
@@ -105,10 +110,12 @@ import { UsageTracker } from "@/lib/usage-tracker";
 import { resolveTriggerRunCost } from "@/lib/billing/trigger-run-cost";
 import {
   deductUsage,
+  checkFreeCostBudget,
   isHandledUserRateLimitError,
   recordFreeMonthlyCost,
 } from "@/lib/rate-limit";
 import { checkSubagentBillingCapacity } from "@/lib/ai/subagents/billing";
+import { FreeDailyCostSettlement } from "@/lib/rate-limit/free-cost-budget";
 import {
   finalizeHandledSubagentRateLimit,
   type SubagentTerminalOutput as SubagentTaskOutput,
@@ -189,6 +196,7 @@ type CancellationCleanup = {
   parentTriggerRunId: string;
   profile: "general" | "security_task" | "security_validation";
   flushProviderHistory: () => void;
+  cleanupBrowserSessions: () => Promise<void>;
 };
 
 const cancellationCleanup = new Map<string, CancellationCleanup>();
@@ -392,6 +400,7 @@ export const subagentTask = task({
       cancelReason: "parent_or_user_canceled",
     }).catch(() => null);
     await ptySessionManager.closeAll(cleanup.subagentId).catch(() => undefined);
+    await cleanup.cleanupBrowserSessions();
     if (finishOutcome === "updated") {
       captureSubagentTerminalOutcome({
         userId: cleanup.userId,
@@ -454,11 +463,13 @@ export const subagentTask = task({
       (event) => triggerLogger.info("[subagent] provider call history", event),
     );
 
+    let cleanupBrowserSessions = async () => {};
     cancellationCleanup.set(ctx.run.id, {
       subagentId: row.subagent_id,
       userId: row.user_id,
       parentTriggerRunId: row.parent_trigger_run_id,
       profile: row.profile,
+      cleanupBrowserSessions: () => cleanupBrowserSessions(),
       flushProviderHistory: () =>
         providerHistory.flush(true, "cancellation_hook"),
     });
@@ -547,6 +558,7 @@ export const subagentTask = task({
     let runtimeAuthorizationRevoked = false;
     const abortFromParent = () => activeAbort.abort();
     triggerSignal.addEventListener("abort", abortFromParent, { once: true });
+    if (triggerSignal.aborted) abortFromParent();
     const activeRuntimeBudget: ActiveRuntimeBudget = createActiveRuntimeBudget({
       maxDurationMs: SUBAGENT_MAX_ACTIVE_SECONDS * 1_000,
       onExceeded: () => {
@@ -587,6 +599,15 @@ export const subagentTask = task({
       Awaited<ReturnType<typeof buildExtraUsageConfig>> | undefined;
     let rateLimitInfo: Awaited<ReturnType<typeof checkSubagentBillingCapacity>>;
     let usageSettled = false;
+    const freeDailySettlement =
+      row.subscription === "free" &&
+      payload.regionalFreeLimits?.agentDailyBudget
+        ? new FreeDailyCostSettlement(
+            row.free_quota_subject ?? row.user_id,
+            payload.regionalFreeLimits,
+            crypto.randomUUID(),
+          )
+        : undefined;
     let triggerRunCostRecorded = false;
     const selectedModel =
       row.selected_model ?? resolveSubagentTextModel(row.subscription);
@@ -633,10 +654,14 @@ export const subagentTask = task({
         return { costDollars, billingFailure: false };
       }
       if (row.subscription === "free") {
-        await recordFreeMonthlyCost(
-          row.free_quota_subject ?? row.user_id,
-          costDollars,
-        );
+        if (freeDailySettlement) {
+          await freeDailySettlement.settle(costDollars);
+        } else {
+          await recordFreeMonthlyCost(
+            row.free_quota_subject ?? row.user_id,
+            costDollars,
+          );
+        }
         usageSettled = true;
         return { costDollars, billingFailure: false };
       }
@@ -1029,7 +1054,9 @@ export const subagentTask = task({
                 permissionMode,
               );
             const {
+              cloudNetworkPrompt,
               tools: unguardedTools,
+              cleanupBrowserSessions: cleanupToolBrowsers,
               ensureSandbox,
               setCurrentModelName,
             } = createTools(
@@ -1064,6 +1091,7 @@ export const subagentTask = task({
                   ...allowedToolNames,
                   profile.finalResultTool.name,
                 ],
+                signal: activeAbort.signal,
                 additionalTools: () => ({
                   search_skills: createSearchSkillsTool(),
                   load_skill: createLoadSkillTool(),
@@ -1077,6 +1105,7 @@ export const subagentTask = task({
                 environment: ctx.environment.type,
               },
             );
+            cleanupBrowserSessions = cleanupToolBrowsers;
             approvalEnsureSandbox = ensureSandbox;
             const authorizedTools = guardSubagentToolExecutions(
               unguardedTools,
@@ -1104,8 +1133,26 @@ export const subagentTask = task({
                     providerHistory.record(entry, generationAttempt),
                 },
               );
+              const boundedModel = withProviderStreamTimeout(languageModel, {
+                timeoutMs: AGENT_PROVIDER_IDLE_TIMEOUT_MS,
+                totalTimeoutMs: AGENT_PROVIDER_TOTAL_TIMEOUT_MS,
+                onTimeout: ({ phase, timeoutMs, modelId }) => {
+                  triggerLogger.warn("[subagent] provider timed out", {
+                    event: "subagent_provider_timeout",
+                    service: "hackerai-subagent",
+                    subagent_id: row.subagent_id,
+                    parent_trigger_run_id: row.parent_trigger_run_id,
+                    trigger_run_id: ctx.run.id,
+                    generation_attempt: generationAttempt,
+                    step: stepIndex + 1,
+                    phase,
+                    timeout_ms: timeoutMs,
+                    model: modelId,
+                  });
+                },
+              });
               return namespaceLanguageModelToolCalls(
-                guardLanguageModelProviderResponse(languageModel, {
+                guardLanguageModelProviderResponse(boundedModel, {
                   maxToolCalls: MAX_PROVIDER_TOOL_CALLS_PER_RESPONSE,
                   perToolCallLimits: {
                     [profile.finalResultTool.name]: 1,
@@ -1289,7 +1336,7 @@ export const subagentTask = task({
                   generationAttempt,
                   0,
                 ),
-                system: systemPrompt,
+                system: systemPrompt + (await cloudNetworkPrompt()),
                 messages: conversationMessages,
                 tools: structuredResultRecovery ? undefined : tools,
                 output: structuredResultRecovery
@@ -1307,6 +1354,12 @@ export const subagentTask = task({
                 prepareStep: async ({ messages, steps }) => {
                   runtimeStage = "authorization";
                   await assertRuntimeAuthorized();
+                  if (freeDailySettlement) {
+                    await checkFreeCostBudget(
+                      row.free_quota_subject ?? row.user_id,
+                      payload.regionalFreeLimits,
+                    );
+                  }
                   runtimeStage = "generation";
                   let deadlineMessage: ModelMessage | undefined;
                   if (
@@ -1438,6 +1491,7 @@ export const subagentTask = task({
                       generationAttempt,
                       steps.length,
                     ),
+                    system: systemPrompt + (await cloudNetworkPrompt()),
                     messages: compacted.messages as ModelMessage[],
                   };
                 },
@@ -1462,6 +1516,21 @@ export const subagentTask = task({
                     index,
                     openRouter.openrouter_upstream_inference_cost,
                   );
+                  if (freeDailySettlement) {
+                    try {
+                      await freeDailySettlement.settle(
+                        usageTracker.computeCostDollars(
+                          selectedModel,
+                          responseModel,
+                        ) +
+                          resolveTriggerRunCost(triggerUsage.getCurrent())
+                            .totalCostDollars,
+                      );
+                    } catch (error) {
+                      activeAbort.abort();
+                      throw error;
+                    }
+                  }
                   if (
                     usageTracker.computeCostDollars(
                       selectedModel,
@@ -1530,6 +1599,7 @@ export const subagentTask = task({
                 conversationMessages.push(...partialMessages);
               }
 
+              if (isHandledUserRateLimitError(attemptError)) throw attemptError;
               if (resultValue) break;
               if (attemptError) {
                 if (structuredResultRecovery) {
@@ -2104,6 +2174,7 @@ export const subagentTask = task({
       triggerSignal.removeEventListener("abort", abortFromParent);
       cancellationCleanup.delete(ctx.run.id);
       await ptySessionManager.closeAll(row.subagent_id).catch(() => undefined);
+      await cleanupBrowserSessions();
       await phLogger.flush().catch(() => undefined);
     }
   },

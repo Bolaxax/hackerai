@@ -1,4 +1,6 @@
 import "server-only";
+import { getAgentHistoryBudget } from "@/lib/ai/agent-context-budget";
+import { extractPreviewFileIdsFromParts } from "@/lib/utils/file-preview-ids";
 import {
   countIndependentAbliterationResponses,
   type AbliterationHistoryEntry,
@@ -7,7 +9,9 @@ import {
 
 import { api } from "@/convex/_generated/api";
 import { ChatSDKError } from "../errors";
-import { getConvexClient, setConvexUrl } from "./convex-client";
+import { abortableDelay } from "@/lib/utils/abortable-delay";
+import { createServiceConvexClient } from "./service-client";
+import { getConvexClient, getConvexUrl, setConvexUrl } from "./convex-client";
 import { UIMessage, UIMessagePart } from "ai";
 import { extractFileIdsFromParts } from "@/lib/utils/file-token-utils";
 import {
@@ -17,7 +21,6 @@ import {
 } from "@/lib/utils/file-token-utils";
 import {
   countMessagesTokens,
-  getMaxTokensForSubscription,
   truncateMessagesToTokenLimit,
 } from "@/lib/token-utils";
 import { fixIncompleteMessageParts } from "@/lib/chat/chat-processor";
@@ -27,6 +30,10 @@ import type {
   SubscriptionTier,
   NoteCategory,
 } from "@/types";
+import type {
+  UpdateVulnerabilityReportInput,
+  CreateVulnerabilityReportInput,
+} from "@/lib/findings/validation";
 import type { Id } from "@/convex/_generated/dataModel";
 import { v4 as uuidv4 } from "uuid";
 import { buildTodoContext } from "@/lib/chat/todo-context";
@@ -239,6 +246,7 @@ const getUpstreamHttpError = (
 
   const statusMatch =
     message.match(/<title>[^<|]+\|\s*(5\d{2}):/i) ??
+    message.match(/<title>\s*(502)\s+Bad Gateway\s*<\/title>/i) ??
     message.match(/Error code\s+(5\d{2})/i);
   if (!statusMatch) return undefined;
 
@@ -359,6 +367,21 @@ const getRetryableDatabaseErrorReason = (
   return undefined;
 };
 
+// Response-body termination is safe to retry only for this read. Do not
+// broaden mutation retries: the write may already have committed.
+const getRetryableHistoryPageErrorReason = (
+  error: unknown,
+): string | undefined => {
+  if (
+    error instanceof TypeError &&
+    error.message === "terminated" &&
+    getErrorData(error) === undefined
+  ) {
+    return "network_response_terminated";
+  }
+  return getRetryableDatabaseErrorReason(error);
+};
+
 const getRetryableSaveMessageErrorReason = (
   error: unknown,
 ): string | undefined => {
@@ -414,6 +437,9 @@ const getRetryableReasonForDatabaseOperation = (
   operation: string,
   error: unknown,
 ): string | undefined => {
+  if (operation === "messages.getMessagesPageForBackend") {
+    return getRetryableHistoryPageErrorReason(error);
+  }
   if (operation === "messages.saveMessage") {
     return getRetryableSaveMessageErrorReason(error);
   }
@@ -628,6 +654,7 @@ const getMessagesPageForBackendWithRetry = async ({
   mode,
   regenerate,
   newMessagesCount,
+  retryBudget,
 }: {
   chatId: string;
   userId: string;
@@ -635,6 +662,7 @@ const getMessagesPageForBackendWithRetry = async ({
   mode?: ChatMode;
   regenerate: boolean;
   newMessagesCount: number;
+  retryBudget: { used: number };
 }): Promise<MessagesPageForBackendResult> => {
   const queryArgs = {
     serviceKey,
@@ -650,12 +678,13 @@ const getMessagesPageForBackendWithRetry = async ({
         queryArgs,
       );
     } catch (error) {
-      const retryReason = getRetryableDatabaseErrorReason(error);
-      const retryDelayMs = GET_MESSAGES_PAGE_RETRY_DELAYS_MS[attemptIndex];
+      const retryReason = getRetryableHistoryPageErrorReason(error);
+      const retryDelayMs = GET_MESSAGES_PAGE_RETRY_DELAYS_MS[retryBudget.used];
       if (!retryReason || retryDelayMs === undefined) {
         throw error;
       }
 
+      retryBudget.used++;
       console.warn(
         JSON.stringify({
           level: "warn",
@@ -667,6 +696,8 @@ const getMessagesPageForBackendWithRetry = async ({
           attempt: attemptIndex + 1,
           next_attempt: attemptIndex + 2,
           retry_delay_ms: retryDelayMs,
+          history_retry_count: retryBudget.used,
+          history_retry_limit: GET_MESSAGES_PAGE_RETRY_DELAYS_MS.length,
           chat_id: chatId,
           user_id: userId,
           mode,
@@ -913,11 +944,13 @@ export async function saveChat({
   userId,
   title,
   projectId,
+  sandboxType,
 }: {
   id: string;
   userId: string;
   title: string;
   projectId?: string;
+  sandboxType?: string;
 }) {
   const mutationArgs = {
     serviceKey,
@@ -925,6 +958,7 @@ export async function saveChat({
     userId,
     title,
     ...(projectId ? { projectId } : {}),
+    ...(sandboxType ? { sandboxType } : {}),
   };
 
   try {
@@ -979,6 +1013,8 @@ export async function saveMessage({
   generationTimeMs,
   finishReason,
   triggerRunId,
+  expectedActiveTriggerRunId,
+  signal,
   usage,
   updateOnly,
   isHidden,
@@ -1001,6 +1037,8 @@ export async function saveMessage({
   generationTimeMs?: number;
   finishReason?: string;
   triggerRunId?: string;
+  expectedActiveTriggerRunId?: string;
+  signal?: AbortSignal;
   usage?: Record<string, unknown>;
   updateOnly?: boolean;
   isHidden?: boolean;
@@ -1039,6 +1077,7 @@ export async function saveMessage({
       any,
       any
     >[];
+    const previewFileIds = extractPreviewFileIdsFromParts(convexSafeParts);
     const storageSafeMessage =
       message.role === "assistant"
         ? compactMessageForStorage({ ...message, parts: convexSafeParts })
@@ -1102,24 +1141,30 @@ export async function saveMessage({
       role: message.role,
       parts: partsForSave,
       fileIds: mergedFileIds.length > 0 ? (mergedFileIds as any) : undefined,
+      previewFileIds: previewFileIds.length > 0 ? previewFileIds : undefined,
       model,
       mode,
       generationStartedAt,
       generationTimeMs,
       finishReason,
       triggerRunId,
+      expectedActiveTriggerRunId,
       usage: usageForSave,
       updateOnly,
       isHidden,
     };
 
+    // A request-scoped client avoids changing the shared singleton's fetch
+    // options while another request or task is persisting its own result.
+    const client = signal
+      ? createServiceConvexClient(getConvexUrl(), { signal })
+      : getConvexClient();
     for (let attemptIndex = 0; ; attemptIndex++) {
+      signal?.throwIfAborted();
       try {
-        return await getConvexClient().mutation(
-          api.messages.saveMessage,
-          mutationArgs,
-        );
+        return await client.mutation(api.messages.saveMessage, mutationArgs);
       } catch (error) {
+        signal?.throwIfAborted();
         const retryReason = getRetryableSaveMessageErrorReason(error);
         const retryDelayMs = SAVE_MESSAGE_RETRY_DELAYS_MS[attemptIndex];
         if (!retryReason || retryDelayMs === undefined) {
@@ -1149,7 +1194,8 @@ export async function saveMessage({
             ...persistenceDiagnostics,
           }),
         );
-        await waitForRetryDelay(retryDelayMs);
+        if (signal) await abortableDelay(retryDelayMs, signal);
+        else await waitForRetryDelay(retryDelayMs);
       }
     }
   } catch (error) {
@@ -1172,6 +1218,9 @@ export async function saveMessage({
   }
 }
 
+export type InitialChatPersistenceStep =
+  "save_chat" | "reset_stream" | "save_user_message";
+
 export async function handleInitialChatAndUserMessage({
   chatId,
   userId,
@@ -1180,6 +1229,8 @@ export async function handleInitialChatAndUserMessage({
   chat,
   isHidden,
   projectId,
+  sandboxType,
+  onPersistenceStep,
 }: {
   chatId: string;
   userId: string;
@@ -1188,7 +1239,16 @@ export async function handleInitialChatAndUserMessage({
   chat: any; // Chat data from getMessagesByChatId
   isHidden?: boolean;
   projectId?: string;
+  sandboxType?: string;
+  onPersistenceStep?: (step: InitialChatPersistenceStep) => void;
 }) {
+  const reportPersistenceStep = (step: InitialChatPersistenceStep) => {
+    try {
+      onPersistenceStep?.(step);
+    } catch {
+      // Diagnostics must not interrupt or retry persistence.
+    }
+  };
   if (!chat) {
     // Save new chat and get the document _id
     let title = "New Chat";
@@ -1210,11 +1270,13 @@ export async function handleInitialChatAndUserMessage({
     // Ensure title is a string and truncate safely
     title = (title ?? "New Chat").substring(0, 100);
 
+    reportPersistenceStep("save_chat");
     await saveChat({
       id: chatId,
       userId,
       title,
       projectId,
+      sandboxType,
     });
   } else {
     // Check if user owns the chat
@@ -1226,8 +1288,16 @@ export async function handleInitialChatAndUserMessage({
     }
   }
 
+  // Regeneration skips the user-message write that clears cancellation. Reset
+  // it after ownership validation, before tools or cancellation polling start.
+  if (regenerate && chat) {
+    reportPersistenceStep("reset_stream");
+    await prepareForNewStream({ chatId });
+  }
+
   // Only save user message if this is not a regeneration
   if (!regenerate && Array.isArray(messages) && messages.length > 0) {
+    reportPersistenceStep("save_user_message");
     await saveMessage({
       chatId,
       userId,
@@ -1369,6 +1439,7 @@ export async function getMessagesByChatId({
   subscription,
   mode,
   useClientMessagesForRegenerate,
+  agentModelContextEnabled = false,
 }: {
   chatId: string;
   userId: string;
@@ -1377,11 +1448,29 @@ export async function getMessagesByChatId({
   regenerate?: boolean;
   mode?: import("@/types").ChatMode;
   useClientMessagesForRegenerate?: boolean;
+  agentModelContextEnabled?: boolean;
 }) {
   let chat = undefined;
   let isNewChat = true;
   let existingMessages: UIMessage[] = [];
   const abliterationHistory: AbliterationHistoryEntry[] = [];
+
+  // Retry payloads can include client history for local attachment restaging.
+  // Keep stored records authoritative and append only the unseen client tail;
+  // older client rows must not be reintroduced after paginated/truncated history.
+  const appendNewClientMessages = (history: UIMessage[]): UIMessage[] => {
+    const seen = new Set(history.map((message) => message.id));
+    let lastStoredIndex = -1;
+    newMessages.forEach((message, index) => {
+      if (seen.has(message.id)) lastStoredIndex = index;
+    });
+    const newTail = newMessages.slice(lastStoredIndex + 1).filter((message) => {
+      if (seen.has(message.id)) return false;
+      seen.add(message.id);
+      return true;
+    });
+    return [...history, ...newTail];
+  };
 
   {
     // Check if chat exists first to avoid unnecessary Convex query
@@ -1415,6 +1504,8 @@ export async function getMessagesByChatId({
         const PAGE_SIZE = 24;
         const MAX_PAGES = 4;
 
+        // One budget for the complete history read, not a fresh budget per page.
+        const retryBudget = { used: 0 };
         let cursor: string | null = null;
         let pagesFetched = 0;
         let fetchedDesc: UIMessage[] = [];
@@ -1439,6 +1530,7 @@ export async function getMessagesByChatId({
             mode,
             regenerate: !!regenerate,
             newMessagesCount: newMessages.length,
+            retryBudget,
           });
           const {
             page,
@@ -1463,7 +1555,7 @@ export async function getMessagesByChatId({
           const existingChrono = [...fetchedDesc].reverse();
           const candidate = regenerate
             ? existingChrono
-            : [...existingChrono, ...newMessages];
+            : appendNewClientMessages(existingChrono);
 
           // Incrementally fetch file tokens only for new file IDs not yet cached
           if (!skipFileTokens) {
@@ -1477,9 +1569,11 @@ export async function getMessagesByChatId({
             }
           }
 
-          const maxTokens = getMaxTokensForSubscription(subscription, {
+          const maxTokens = getAgentHistoryBudget(
+            subscription,
             mode,
-          });
+            agentModelContextEnabled,
+          );
           const truncatedMessages = truncateMessagesToTokenLimit(
             candidate,
             fileTokensFromLoop,
@@ -1546,9 +1640,11 @@ export async function getMessagesByChatId({
             };
 
             // Re-truncate real messages to leave room for the summary message
-            const maxTokens = getMaxTokensForSubscription(subscription, {
+            const maxTokens = getAgentHistoryBudget(
+              subscription,
               mode,
-            });
+              agentModelContextEnabled,
+            );
             const summaryTokens = countMessagesTokens(
               [summaryMessage],
               fileTokensFromLoop,
@@ -1634,7 +1730,7 @@ export async function getMessagesByChatId({
           new_messages_count: newMessages.length,
           error_name: error instanceof Error ? error.name : typeof error,
           error_message: truncateDiagnosticString(stringifyError(error)),
-          db_retry_reason: getRetryableDatabaseErrorReason(error),
+          db_retry_reason: getRetryableHistoryPageErrorReason(error),
           db_error_data: getErrorData(error),
         });
 
@@ -1669,7 +1765,7 @@ export async function getMessagesByChatId({
     }
   } else {
     // For normal chat, merge existing messages with the new user message
-    allMessages = [...existingMessages, ...newMessages];
+    allMessages = appendNewClientMessages(existingMessages);
   }
 
   const truncateResult = await truncateMessagesWithFileTokens(
@@ -1678,6 +1774,7 @@ export async function getMessagesByChatId({
     mode === "agent", // Skip file tokens for agent mode (files go to sandbox)
     mode,
     userId,
+    agentModelContextEnabled,
   );
   const truncatedMessages = truncateResult.messages;
   const fileTokens = truncateResult.fileTokens;
@@ -1687,9 +1784,11 @@ export async function getMessagesByChatId({
     try {
       const fileIds = extractAllFileIdsFromMessages(allMessages);
       const fileTokens = await getFileTokensByIds(fileIds as any, userId);
-      const maxTokens = getMaxTokensForSubscription(subscription, {
+      const maxTokens = getAgentHistoryBudget(
+        subscription,
         mode,
-      });
+        agentModelContextEnabled,
+      );
       const totalTokensBefore = countMessagesTokens(allMessages, fileTokens);
       const largestFileToken = Object.values(fileTokens).length
         ? Math.max(...Object.values(fileTokens))
@@ -1773,6 +1872,7 @@ export async function setActiveTriggerRun({
   expectedRunId,
   expectedApprovalSessionId,
   clearApprovalPending,
+  recoveredCrash,
 }: {
   chatId: string;
   triggerRunId: string | null;
@@ -1780,6 +1880,7 @@ export async function setActiveTriggerRun({
   expectedRunId?: string;
   expectedApprovalSessionId?: string;
   clearApprovalPending?: boolean;
+  recoveredCrash?: boolean;
 }) {
   try {
     return await getConvexClient().mutation(api.chats.setActiveTriggerRun, {
@@ -1792,6 +1893,7 @@ export async function setActiveTriggerRun({
         ? { expectedApprovalSessionId }
         : {}),
       ...(clearApprovalPending !== undefined ? { clearApprovalPending } : {}),
+      ...(recoveredCrash !== undefined ? { recoveredCrash } : {}),
     });
   } catch (error) {
     throw databaseError("chats.setActiveTriggerRun", error, {
@@ -2006,6 +2108,136 @@ export async function getLatestSummary({ chatId }: { chatId: string }) {
     console.error("[DB Actions] Failed to get latest summary:", error);
     return null;
   }
+}
+
+// ============================================================================
+// Findings Actions
+// ============================================================================
+
+export async function getFindingDedupeContext(args: {
+  userId: string;
+  chatId: string;
+  dedupeKey: string;
+}) {
+  return getConvexClient().query(
+    api.findings.getFindingDedupeContextForBackend,
+    {
+      serviceKey,
+      ...args,
+    },
+  );
+}
+
+export async function createFinding({
+  userId,
+  chatId,
+  messageId,
+  toolCallId,
+  report,
+  evidenceVerification,
+  comparisonSnapshot,
+  semanticDuplicateId,
+}: {
+  userId: string;
+  chatId: string;
+  messageId: string;
+  toolCallId: string;
+  report: CreateVulnerabilityReportInput;
+  comparisonSnapshot?: import("@/lib/findings/dedupe-context").FindingDedupeVersion[];
+  semanticDuplicateId?: string;
+  evidenceVerification?: import("@/lib/ai/subagents/contracts").EvidenceVerification;
+}) {
+  try {
+    return await getConvexClient().mutation(
+      api.findings.createFindingForBackend,
+      {
+        serviceKey,
+        userId,
+        chatId,
+        messageId,
+        toolCallId,
+        report,
+        ...(comparisonSnapshot ? { comparisonSnapshot } : {}),
+        ...(semanticDuplicateId ? { semanticDuplicateId } : {}),
+        ...(evidenceVerification ? { evidenceVerification } : {}),
+      },
+    );
+  } catch (error) {
+    throw databaseError("findings.createFindingForBackend", error, {
+      user_id: userId,
+      chat_id: chatId,
+      message_id: messageId,
+      tool_call_id: toolCallId,
+    });
+  }
+}
+
+export async function listReports({
+  userId,
+  chatId,
+  limit,
+  cursor,
+  search,
+  status,
+}: {
+  userId: string;
+  chatId: string;
+  limit: number;
+  cursor: string | null;
+  search?: string;
+  status?: "active" | "closed";
+}) {
+  return getConvexClient().query(api.findings.listReportsForBackend, {
+    serviceKey,
+    userId,
+    chatId,
+    paginationOpts: { numItems: limit, cursor },
+    ...(search !== undefined ? { search } : {}),
+    ...(status ? { status } : {}),
+  });
+}
+
+export async function getReport({
+  userId,
+  chatId,
+  findingId,
+}: {
+  userId: string;
+  chatId: string;
+  findingId: string;
+}) {
+  return getConvexClient().query(api.findings.getReportForBackend, {
+    serviceKey,
+    userId,
+    chatId,
+    findingId,
+  });
+}
+
+export async function updateFinding({
+  userId,
+  chatId,
+  messageId,
+  toolCallId,
+  update,
+  evidenceVerification,
+}: {
+  userId: string;
+  chatId: string;
+  messageId: string;
+  toolCallId: string;
+  update: UpdateVulnerabilityReportInput;
+  evidenceVerification?: import("@/lib/ai/subagents/contracts").EvidenceVerification;
+}) {
+  return getConvexClient().mutation(api.findings.updateFindingForBackend, {
+    serviceKey,
+    userId,
+    chatId,
+    messageId,
+    toolCallId,
+    update,
+    ...(evidenceVerification ? { evidenceVerification } : {}),
+  });
 }
 
 // ============================================================================

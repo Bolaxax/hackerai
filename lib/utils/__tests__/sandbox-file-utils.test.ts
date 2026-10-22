@@ -7,6 +7,11 @@ jest.mock("../sandbox-upload-readiness", () => ({
 jest.mock("server-only", () => ({}), { virtual: true });
 
 import type { UIMessage } from "ai";
+import {
+  CloudAcquisitionBudget,
+  CloudAcquisitionTimeoutError,
+  CloudAcquisitionBudgetExhaustedError,
+} from "@/lib/ai/tools/utils/cloud-acquisition-budget";
 import { phLogger } from "@/lib/posthog/server";
 import {
   collectSandboxFiles,
@@ -26,8 +31,7 @@ const LOCAL_COMMAND_NO_RESPONSE_MESSAGE =
 
 it.each([
   "E2BAcquisitionError",
-  "MiosaWorkspaceUnavailableError",
-  "CloudMigrationUnavailableError",
+  "CloudWorkspaceUnavailableError",
   "private-error-name",
 ])(
   "retains bounded acquisition diagnostics for %s without retrying",
@@ -73,68 +77,6 @@ it.each([
     }
   },
 );
-
-it("records safe validation fields for a Miosa attachment rejection without retrying it", async () => {
-  const error = Object.assign(new Error("Provider rejected the request"), {
-    name: "ValidationError",
-    status: 422,
-    code: "UNKNOWN_ERROR",
-    requestId: "request-attachment",
-    retryable: false,
-    details: {
-      errors: [
-        {
-          loc: ["body", "command"],
-          input: "private command",
-          msg: "private message",
-        },
-      ],
-    },
-  });
-  const run = jest.fn().mockRejectedValue(error);
-  const eventSpy = jest.spyOn(phLogger, "event").mockImplementation(() => {});
-  const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
-  try {
-    const result = await uploadSandboxFiles(
-      [
-        {
-          kind: "url",
-          url: "https://example.com/file?token=private-token",
-          localPath: "/home/user/upload/private-file",
-        },
-      ],
-      async () => ({ sandboxKind: "miosa", commands: { run } }),
-      {
-        logContext: {
-          service: "agent-long",
-          requestId: "run-test",
-          userId: "user-test",
-        },
-      },
-    );
-    expect(result.failedCount).toBe(1);
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(eventSpy).toHaveBeenCalledWith(
-      "sandbox_attachment_staging_failed",
-      expect.objectContaining({
-        error_request_id: "request-attachment",
-        validation_fields: ["command"],
-        failure_stage: "transfer",
-        transfer_operation: "download_url",
-      }),
-    );
-    expect(getSandboxUploadFailureMetadata(result)).toMatchObject({
-      upload_failure_phase: "transfer",
-      upload_failure_validation_fields: ["command"],
-    });
-    expect(JSON.stringify(eventSpy.mock.calls)).not.toMatch(
-      /private-token|private-file|private command|private message/,
-    );
-  } finally {
-    eventSpy.mockRestore();
-    errorSpy.mockRestore();
-  }
-});
 
 const makeLocalMessage = (): UIMessage =>
   ({
@@ -1161,80 +1103,6 @@ describe("desktop-local sandbox file helpers", () => {
     },
   );
 
-  it("records safe Miosa diagnostics for attachment staging failures", async () => {
-    const consoleErrorSpy = jest
-      .spyOn(console, "error")
-      .mockImplementation(() => {});
-    const eventSpy = jest.spyOn(phLogger, "event").mockImplementation(() => {});
-    const providerError = Object.assign(
-      new Error("Sandbox transport failed for private attachment content"),
-      {
-        name: "MiosaError",
-        code: "FILE_TRANSPORT_UNAVAILABLE",
-        status: 503,
-        requestId: "request-safe-123",
-        retryable: true,
-      },
-    );
-
-    try {
-      const result = await uploadSandboxFiles(
-        [
-          {
-            kind: "url",
-            url: "https://example.com/private-report.pdf?signature=secret",
-            localPath: "/home/user/upload/private-report.pdf",
-          },
-        ],
-        async () => ({
-          sandboxKind: "miosa",
-          commands: { run: jest.fn().mockRejectedValue(providerError) },
-        }),
-        {
-          logContext: {
-            service: "agent-long",
-            requestId: "run-safe-123",
-            userId: "user-safe-123",
-            chatId: "chat-safe-123",
-          },
-        },
-      );
-
-      expect(getSandboxUploadFailureMetadata(result)).toMatchObject({
-        upload_failure_sandbox_provider: "miosa",
-        upload_failure_error_name: "MiosaError",
-        upload_failure_error_code: "FILE_TRANSPORT_UNAVAILABLE",
-        upload_failure_error_http_status: 503,
-        upload_failure_error_request_id: "request-safe-123",
-        upload_failure_error_retryable: true,
-      });
-      const structuredLog = JSON.parse(
-        String(consoleErrorSpy.mock.calls[0]?.[0]),
-      );
-      expect(structuredLog).toMatchObject({
-        event: "sandbox_attachment_staging_failed",
-        sandbox_provider: "miosa",
-        error_code: "FILE_TRANSPORT_UNAVAILABLE",
-        error_http_status: 503,
-        error_request_id: "request-safe-123",
-        error_retryable: true,
-      });
-      expect(JSON.stringify(structuredLog)).not.toContain("private-report");
-      expect(JSON.stringify(structuredLog)).not.toContain("signature=secret");
-      expect(eventSpy).toHaveBeenCalledWith(
-        "sandbox_attachment_staging_failed",
-        expect.objectContaining({
-          sandbox_provider: "miosa",
-          error_code: "FILE_TRANSPORT_UNAVAILABLE",
-          error_request_id: "request-safe-123",
-        }),
-      );
-    } finally {
-      consoleErrorSpy.mockRestore();
-      eventSpy.mockRestore();
-    }
-  });
-
   it("does not refresh non-retryable sandbox acquisition failures", async () => {
     const consoleErrorSpy = jest
       .spyOn(console, "error")
@@ -1924,20 +1792,27 @@ describe("attachment write fallback observability", () => {
     infoSpy.mockRestore();
     errorSpy.mockRestore();
   });
-  const makeSandbox = (finalFailure = false, probeFailure = false) => ({
+  const makeSandbox = (
+    finalFailure = false,
+    probeFailure = false,
+    diagnostics = probeOutput,
+  ) => ({
     sandboxId: "e2b-test-sandbox",
     commands: {
       run: jest.fn(async (command: string) => {
         if (command.startsWith("timeout --kill-after=1s 3s python3")) {
           if (probeFailure) throw new Error("probe timeout");
-          return { exitCode: 0, stdout: probeOutput, stderr: "" };
+          return { exitCode: 0, stdout: diagnostics, stderr: "" };
         }
-        if (command.includes("for base in"))
+        if (command.includes("for base in")) {
+          if (command.includes("df -Pk") && finalFailure)
+            return { exitCode: 1, stdout: "", stderr: "" };
           return {
             exitCode: 0,
             stdout: "/tmp/hackerai-upload/fallback/test.pdf",
             stderr: "",
           };
+        }
         if (
           command.startsWith("curl") &&
           (command.includes("/home/user/upload") || finalFailure)
@@ -1999,6 +1874,67 @@ describe("attachment write fallback observability", () => {
     expect(JSON.stringify(eventSpy.mock.calls)).not.toMatch(
       /sandbox_id|e2b-test-sandbox|DO_NOT_LOG|private\.pdf/,
     );
+  });
+
+  it.each([
+    { available_bytes: 0, write_probe_result: "writable" },
+    { available_bytes: 10000, write_probe_result: "disk_full" },
+    { available_bytes: 10000, write_probe_result: "quota_exceeded" },
+  ])(
+    "reports disk exhaustion without another transfer: %s",
+    async (diagnostics) => {
+      const sandbox = makeSandbox(
+        true,
+        false,
+        JSON.stringify({
+          ...JSON.parse(probeOutput),
+          ...diagnostics,
+        }),
+      );
+      const ensureSandbox = jest.fn(async () => sandbox);
+      const result = await uploadSandboxFiles([file], ensureSandbox, {
+        logContext: context,
+        retryAfterReconnectOnTransientFailure: true,
+      });
+      expect(result.failureDetails?.[0]).toMatchObject({
+        reason: "attachment_disk_full",
+        exitCode: 23,
+      });
+      expect(ensureSandbox).toHaveBeenCalledTimes(1);
+      expect(
+        sandbox.commands.run.mock.calls.filter(([command]) =>
+          command.startsWith("curl"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        sandbox.commands.run.mock.calls.some(([command]) =>
+          command.includes("df -Pk"),
+        ),
+      ).toBe(true);
+      expect(eventSpy).toHaveBeenCalledWith(
+        "sandbox_attachment_staging_fallback",
+        expect.objectContaining({
+          fallback_outcome: "unavailable",
+          final_failure_reason: "attachment_disk_full",
+        }),
+      );
+    },
+  );
+
+  it("can recover onto a fallback filesystem with available space", async () => {
+    const sandbox = makeSandbox(
+      false,
+      false,
+      JSON.stringify({
+        ...JSON.parse(probeOutput),
+        available_bytes: 0,
+      }),
+    );
+    const result = await uploadSandboxFiles([file], async () => sandbox, {
+      logContext: context,
+    });
+    expect(result.failedCount).toBe(0);
+    expect(result.pathRewrites).toHaveLength(1);
   });
 
   it("reports unsuccessful fallback even if the best-effort probe fails", async () => {
@@ -2084,24 +2020,134 @@ describe("attachment write fallback observability", () => {
       }),
     );
   });
+});
 
-  it("skips E2B filesystem diagnostics on the MIOSA adapter", async () => {
-    const sandbox = { ...makeSandbox(), sandboxKind: "miosa" };
-    await uploadSandboxFiles([file], async () => sandbox, {
-      logContext: context,
-    });
-    expect(
-      sandbox.commands.run.mock.calls.some(([command]) =>
-        command.startsWith("timeout --kill-after=1s 3s python3"),
-      ),
-    ).toBe(false);
-    expect(eventSpy).toHaveBeenCalledWith(
-      "sandbox_attachment_staging_fallback",
-      expect.objectContaining({
-        sandbox_provider: "miosa",
-        diagnostics_probe_status: "not_e2b",
-        fallback_outcome: "recovered",
-      }),
-    );
+it.each([
+  [new CloudAcquisitionTimeoutError("connect"), "connect"],
+  [
+    new CloudAcquisitionBudgetExhaustedError(
+      new CloudAcquisitionTimeoutError("discovery"),
+    ),
+    "discovery",
+  ],
+])(
+  "does not schedule an attachment reconnect after the cloud budget is spent: %s",
+  async (error, acquisitionStage) => {
+    const ensureSandbox = jest.fn().mockRejectedValue(error);
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await uploadSandboxFiles(
+        [
+          {
+            kind: "url",
+            url: "https://example.com/private?token=secret",
+            localPath: "/tmp/private",
+          },
+        ],
+        ensureSandbox,
+        { retryAfterReconnectOnTransientFailure: true },
+      );
+      expect(ensureSandbox).toHaveBeenCalledTimes(1);
+      expect(result.failedCount).toBe(1);
+      expect(result.retriedAfterReconnect).toBeUndefined();
+      expect(getSandboxUploadFailureMetadata(result)).toMatchObject({
+        upload_failure_phase: "acquisition",
+        upload_failure_reason: "sandbox_operation_timeout",
+        upload_failure_error_name: error.name,
+        upload_failure_acquisition_stage: acquisitionStage,
+      });
+      expect(getSandboxUploadUserMessage(result)).toBe(
+        "Cloud connection timed out before preparing your attachment. Your workspace is preserved. Try again shortly.",
+      );
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(warn.mock.calls[0][0]))).toMatchObject({
+        event: "sandbox_attachment_acquisition_retry_skipped",
+        skip_reason: "budget_exhausted",
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private|secret/);
+    } finally {
+      warn.mockRestore();
+      errorSpy.mockRestore();
+    }
+  },
+);
+
+it("does not copy an unsupported or spoofed acquisition stage into failure metadata", async () => {
+  const invalid = new CloudAcquisitionTimeoutError("connect");
+  Object.defineProperty(invalid, "acquisitionStage", {
+    value: "PRIVATE_STAGE_CANARY",
   });
+  const spoofed = Object.assign(new Error("Cloud connection unavailable"), {
+    name: "CloudAcquisitionTimeoutError",
+    acquisitionStage: "connect",
+  });
+  const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (const error of [invalid, spoofed]) {
+      const ensureSandbox = jest.fn().mockRejectedValue(error);
+      const result = await uploadSandboxFiles(
+        [
+          {
+            kind: "url",
+            url: "https://example.com/test",
+            localPath: "/tmp/test",
+          },
+        ],
+        ensureSandbox,
+      );
+      expect(ensureSandbox).toHaveBeenCalledTimes(1);
+      const metadata = getSandboxUploadFailureMetadata(result);
+      expect(metadata).not.toHaveProperty("upload_failure_acquisition_stage");
+      expect(JSON.stringify(metadata)).not.toContain("PRIVATE_STAGE_CANARY");
+    }
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+it("skips attachment refresh when an earlier acquisition has already spent the first attempt", async () => {
+  const budget = new CloudAcquisitionBudget();
+  const acquire = jest.fn(async () => {
+    throw new Error("connection timed out");
+  });
+  const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+  const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await expect(budget.run(acquire, { userId: "test" })).rejects.toThrow(
+      "connection timed out",
+    );
+    const ensureSandbox = jest.fn(() =>
+      budget.run(acquire, { userId: "test" }),
+    );
+    const result = await uploadSandboxFiles(
+      [
+        {
+          kind: "url",
+          url: "https://example.com/test",
+          localPath: "/tmp/test",
+        },
+      ],
+      ensureSandbox,
+      { retryAfterReconnectOnTransientFailure: true },
+    );
+    expect(ensureSandbox).toHaveBeenCalledTimes(1);
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(result.retriedAfterReconnect).toBeUndefined();
+    expect(getSandboxUploadFailureMetadata(result)).toMatchObject({
+      upload_failure_phase: "acquisition",
+      upload_failure_reason: "sandbox_operation_timeout",
+      upload_failure_error_name: "CloudAcquisitionBudgetExhaustedError",
+    });
+    const events = warn.mock.calls.map(
+      ([value]) => JSON.parse(String(value)).event,
+    );
+    expect(events).toContain("sandbox_attachment_acquisition_retry_skipped");
+    expect(events).not.toContain(
+      "sandbox_attachment_acquisition_retry_scheduled",
+    );
+  } finally {
+    warn.mockRestore();
+    errorSpy.mockRestore();
+  }
 });

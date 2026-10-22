@@ -1,3 +1,9 @@
+import { networkPolicy } from "./cloudNetworkValidators";
+import { scopeRule, scopePolicy } from "./engagementScopeValidators";
+import {
+  findingRevisionValidator,
+  findingFeedbackValidator,
+} from "./findingValidators";
 import { analyticsFields } from "./lib/influencerAnalytics";
 import { defineSchema, defineTable } from "convex/server";
 import {
@@ -96,6 +102,57 @@ const agentApprovalTargetGrantValidator = v.union(
   }),
 );
 
+const findingSeverityValidator = v.union(
+  v.literal("critical"),
+  v.literal("high"),
+  v.literal("medium"),
+  v.literal("low"),
+  v.literal("info"),
+);
+
+const findingCategoryValidator = v.union(
+  v.literal("access_control"),
+  v.literal("authentication_session"),
+  v.literal("injection"),
+  v.literal("cross_site_scripting"),
+  v.literal("request_forgery"),
+  v.literal("file_path_access"),
+  v.literal("data_exposure"),
+  v.literal("cryptography_secrets"),
+  v.literal("parsing_deserialization"),
+  v.literal("security_misconfiguration"),
+  v.literal("denial_of_service"),
+  v.literal("business_logic"),
+  v.literal("other"),
+);
+
+const findingStatusValidator = v.union(
+  v.literal("active"),
+  v.literal("closed"),
+);
+
+const findingClosureReasonValidator = v.union(
+  v.literal("already_fixed"),
+  v.literal("wont_fix"),
+  v.literal("false_positive"),
+);
+
+const cvss31BreakdownValidator = v.object({
+  attack_vector: v.union(
+    v.literal("N"),
+    v.literal("A"),
+    v.literal("L"),
+    v.literal("P"),
+  ),
+  attack_complexity: v.union(v.literal("L"), v.literal("H")),
+  privileges_required: v.union(v.literal("N"), v.literal("L"), v.literal("H")),
+  user_interaction: v.union(v.literal("N"), v.literal("R")),
+  scope: v.union(v.literal("U"), v.literal("C")),
+  confidentiality: v.union(v.literal("N"), v.literal("L"), v.literal("H")),
+  integrity: v.union(v.literal("N"), v.literal("L"), v.literal("H")),
+  availability: v.union(v.literal("N"), v.literal("L"), v.literal("H")),
+});
+
 const subagentStatusValidator = v.union(
   v.literal("queued"),
   v.literal("running"),
@@ -133,6 +190,18 @@ const agentAutoReviewConversationContextValidator = v.object({
 });
 
 export default defineSchema({
+  cloud_network_settings: defineTable({
+    user_id: v.string(),
+    policy: networkPolicy,
+    revision: v.number(),
+    status: v.union(
+      v.literal("ready"),
+      v.literal("applying"),
+      v.literal("failed"),
+    ),
+    token: v.optional(v.string()),
+    leaseUntil: v.optional(v.number()),
+  }).index("by_user_id", ["user_id"]),
   influencer_analytics_optouts: defineTable({ visitor_id: v.string() }).index(
     "by_visitor",
     ["visitor_id"],
@@ -178,7 +247,37 @@ export default defineSchema({
     .index("by_user_and_updated", ["user_id", "updated_at"])
     .index("by_user_and_pinned", ["user_id", "pinned_at"]),
 
+  // Deprecated scope data stays schema-compatible; runtime no longer reads or writes it.
+  // Normal chat/account deletion still cleans these records. No bulk migration.
+  engagement_scopes: defineTable({
+    chat_id: v.string(),
+    user_id: v.string(),
+    active: v.boolean(),
+    revision: v.number(),
+    rules: v.array(scopeRule),
+    restrictions: v.array(v.string()),
+    status: v.union(
+      v.literal("ready"),
+      v.literal("processing"),
+      v.literal("unavailable"),
+      v.literal("ambiguous"),
+    ),
+    clarification: v.string(),
+    clarificationRequested: v.boolean(),
+    source_id: v.string(),
+  }).index("by_chat_id", ["chat_id"]),
+  engagement_scope_events: defineTable({
+    chat_id: v.string(),
+    source_id: v.string(),
+    source_text: v.string(),
+    source_kind: v.union(v.literal("user_message"), v.literal("user_edit")),
+    status: v.union(v.literal("pending"), v.literal("applied")),
+    revision: v.number(),
+    policy: v.optional(scopePolicy),
+  }).index("by_chat_source", ["chat_id", "source_id"]),
   chats: defineTable({
+    // Legacy field retained for existing chat documents only.
+    engagement_scope_expected: v.optional(v.boolean()),
     id: v.string(),
     title: v.string(),
     user_id: v.string(),
@@ -327,6 +426,181 @@ export default defineSchema({
       searchField: "content",
       filterFields: ["user_id"],
     }),
+
+  findings: defineTable({
+    finding_id: v.string(),
+    user_id: v.string(),
+    chat_id: v.string(),
+    message_id: v.string(),
+    tool_call_id: v.string(),
+    title: v.string(),
+    description: v.string(),
+    impact: v.string(),
+    target: v.string(),
+    technical_analysis: v.string(),
+    poc_description: v.string(),
+    poc_script_code: v.string(),
+    remediation_steps: v.string(),
+    evidence: v.string(),
+    evidence_refs: v.optional(v.array(v.string())),
+    evidence_verification: v.optional(
+      v.object({
+        checked_refs: v.array(v.string()),
+        unavailable_refs: v.array(v.string()),
+        warning: v.optional(v.string()),
+      }),
+    ),
+    assumptions: v.string(),
+    confidence: v.optional(
+      v.union(v.literal("low"), v.literal("medium"), v.literal("high")),
+    ),
+    counterevidence: v.optional(v.string()),
+    severity_change_conditions: v.optional(v.string()),
+    fix_effort: v.union(
+      v.literal("trivial"),
+      v.literal("low"),
+      v.literal("medium"),
+      v.literal("high"),
+    ),
+    cvss_breakdown: cvss31BreakdownValidator,
+    cvss_score: v.number(),
+    cvss_vector: v.string(),
+    severity: findingSeverityValidator,
+    // Optional only for findings created before lifecycle/category support.
+    // Every new finding persists both fields, and reads derive safe defaults.
+    category: v.optional(findingCategoryValidator),
+    status: v.optional(findingStatusValidator),
+    endpoint: v.optional(v.string()),
+    method: v.optional(v.string()),
+    cve: v.optional(v.string()),
+    cwe: v.optional(v.string()),
+    code_locations: v.optional(
+      v.array(
+        v.object({
+          file: v.string(),
+          start_line: v.number(),
+          end_line: v.number(),
+          snippet: v.optional(v.string()),
+          label: v.optional(v.string()),
+          fix_before: v.optional(v.string()),
+          fix_after: v.optional(v.string()),
+        }),
+      ),
+    ),
+    confidence_rationale: v.optional(v.string()),
+    correction_history: v.optional(v.array(findingRevisionValidator)),
+    correction_count: v.optional(v.number()),
+    usefulness_feedback: v.optional(findingFeedbackValidator),
+    last_update: v.optional(
+      v.object({
+        message_id: v.string(),
+        tool_call_id: v.string(),
+        reason: v.string(),
+      }),
+    ),
+    dedupe_key: v.string(),
+    search_text: v.string(),
+    closure_reason: v.optional(findingClosureReasonValidator),
+    closure_context: v.optional(v.string()),
+    closed_at: v.optional(v.number()),
+    created_at: v.number(),
+    updated_at: v.number(),
+  })
+    .index("by_finding_id", ["finding_id"])
+    .index("by_user_and_created", ["user_id", "created_at"])
+    .index("by_user_severity_created", ["user_id", "severity", "created_at"])
+    .index("by_user_category_created", ["user_id", "category", "created_at"])
+    .index("by_user_category_severity_created", [
+      "user_id",
+      "category",
+      "severity",
+      "created_at",
+    ])
+    .index("by_user_status_created", ["user_id", "status", "created_at"])
+    .index("by_user_status_severity_created", [
+      "user_id",
+      "status",
+      "severity",
+      "created_at",
+    ])
+    .index("by_user_status_category_created", [
+      "user_id",
+      "status",
+      "category",
+      "created_at",
+    ])
+    .index("by_user_status_category_severity_created", [
+      "user_id",
+      "status",
+      "category",
+      "severity",
+      "created_at",
+    ])
+    .index("by_user_severity_chat_created", [
+      "user_id",
+      "severity",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_chat_created", ["user_id", "chat_id", "created_at"])
+    .index("by_user_category_chat_created", [
+      "user_id",
+      "category",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_category_severity_chat_created", [
+      "user_id",
+      "category",
+      "severity",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_status_chat_created", [
+      "user_id",
+      "status",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_status_severity_chat_created", [
+      "user_id",
+      "status",
+      "severity",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_status_category_chat_created", [
+      "user_id",
+      "status",
+      "category",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_status_category_severity_chat_created", [
+      "user_id",
+      "status",
+      "category",
+      "severity",
+      "chat_id",
+      "created_at",
+    ])
+    .index("by_user_chat_dedupe", ["user_id", "chat_id", "dedupe_key"])
+    .searchIndex("search_findings", {
+      searchField: "search_text",
+      filterFields: ["user_id", "status", "category", "severity", "chat_id"],
+    }),
+
+  // Compact source-chat metadata keeps the Findings filter bounded without
+  // reading large PoC/evidence payloads from every finding.
+  finding_sources: defineTable({
+    user_id: v.string(),
+    chat_id: v.string(),
+    chat_title: v.string(),
+    finding_count: v.number(),
+    latest_finding_at: v.number(),
+  })
+    .index("by_user_and_latest", ["user_id", "latest_finding_at"])
+    .index("by_user_chat", ["user_id", "chat_id"]),
 
   files: defineTable({
     s3_key: v.optional(v.string()),
@@ -609,6 +883,9 @@ export default defineSchema({
     caido_enabled: v.optional(v.boolean()),
     caido_port: v.optional(v.number()),
     extra_usage_enabled: v.optional(v.boolean()),
+    // A saved product preference, not consent or eligibility for a data export.
+    model_improvement_enabled: v.optional(v.boolean()),
+    model_improvement_updated_at: v.optional(v.number()),
     // Legacy MAX Mode flag retained on historical rows. The feature was
     // removed and nothing reads or writes this anymore — kept in the schema
     // so old rows still pass validation.

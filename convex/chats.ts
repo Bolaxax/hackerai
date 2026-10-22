@@ -1,7 +1,8 @@
+import { deleteScopeBatch } from "./lib/legacyEngagementScope";
 import { scheduleFileDeletion } from "./lib/fileDeletion";
 import { deleteModelHistory } from "./modelHistory";
-import { query, mutation, internalMutation } from "./_generated/server";
-import type { MutationCtx } from "./_generated/server";
+import { query, mutation, internalMutation } from "./lib/serviceFunctions";
+import type { MutationCtx } from "./lib/serviceFunctions";
 import type { Doc, Id } from "./_generated/dataModel";
 import { v, ConvexError, type Value } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
@@ -32,6 +33,7 @@ import { isUserDeletionFenced } from "./lib/userDeletionFence";
 
 const DELETE_ALL_CHATS_MESSAGE_BATCH_SIZE = 10;
 const DELETE_ALL_CHATS_SUMMARY_BATCH_SIZE = 25;
+const DELETE_ALL_CHATS_FINDING_BATCH_SIZE = 25;
 const DELETE_CHAT_SUBAGENT_BATCH_SIZE = 10;
 const CHAT_DELETION_FENCE_BATCH_SIZE = 100;
 const MAX_ACTIVE_TRIGGER_RUNS_TO_RETURN = 100;
@@ -272,6 +274,57 @@ async function deleteMessageForChatDeletion(
   await ctx.db.delete(message._id);
 }
 
+async function deleteFindingsForChatBatch(
+  ctx: MutationCtx,
+  chat: Doc<"chats">,
+): Promise<boolean> {
+  const findings = await ctx.db
+    .query("findings")
+    .withIndex("by_user_chat_created", (q) =>
+      q.eq("user_id", chat.user_id).eq("chat_id", chat.id),
+    )
+    .take(DELETE_ALL_CHATS_FINDING_BATCH_SIZE + 1);
+
+  for (const finding of findings.slice(
+    0,
+    DELETE_ALL_CHATS_FINDING_BATCH_SIZE,
+  )) {
+    await ctx.db.delete(finding._id);
+  }
+
+  return findings.length > DELETE_ALL_CHATS_FINDING_BATCH_SIZE;
+}
+
+async function deleteFindingSourceForChat(
+  ctx: MutationCtx,
+  chat: Doc<"chats">,
+) {
+  const source = await ctx.db
+    .query("finding_sources")
+    .withIndex("by_user_chat", (q) =>
+      q.eq("user_id", chat.user_id).eq("chat_id", chat.id),
+    )
+    .unique();
+  if (source) await ctx.db.delete(source._id);
+}
+
+async function syncFindingSourceChatTitle(
+  ctx: MutationCtx,
+  userId: string,
+  chatId: string,
+  title: string,
+) {
+  const source = await ctx.db
+    .query("finding_sources")
+    .withIndex("by_user_chat", (q) =>
+      q.eq("user_id", userId).eq("chat_id", chatId),
+    )
+    .unique();
+  if (source && source.chat_title !== title) {
+    await ctx.db.patch(source._id, { chat_title: title });
+  }
+}
+
 async function deleteSubagentDataForChat(
   ctx: MutationCtx,
   chatId: string,
@@ -333,6 +386,13 @@ async function deleteSubagentDataForChat(
 async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
   await prepareChatForDeletion(ctx, chat);
 
+  if (await deleteFindingsForChatBatch(ctx, chat)) {
+    await scheduleDeleteChatDocumentBatch(ctx, chat.id, chat.user_id);
+    return;
+  }
+
+  await deleteFindingSourceForChat(ctx, chat);
+
   const messages = await ctx.db
     .query("messages")
     .withIndex("by_chat_id", (q) => q.eq("chat_id", chat.id))
@@ -382,6 +442,10 @@ async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
     return;
   }
 
+  if (await deleteScopeBatch(ctx, chat.id)) {
+    await scheduleDeleteChatDocumentBatch(ctx, chat.id, chat.user_id);
+    return;
+  }
   // Delete the chat itself
   await ctx.db.delete(chat._id);
 }
@@ -397,6 +461,13 @@ async function deleteNextUserChatBatch(ctx: MutationCtx, userId: string) {
   }
 
   await prepareChatForDeletion(ctx, chat);
+
+  if (await deleteFindingsForChatBatch(ctx, chat)) {
+    await scheduleDeleteAllChatsBatch(ctx, userId);
+    return true;
+  }
+
+  await deleteFindingSourceForChat(ctx, chat);
 
   const messages = await ctx.db
     .query("messages")
@@ -431,6 +502,10 @@ async function deleteNextUserChatBatch(ctx: MutationCtx, userId: string) {
     return true;
   }
 
+  if (await deleteScopeBatch(ctx, chat.id)) {
+    await scheduleDeleteAllChatsBatch(ctx, userId);
+    return true;
+  }
   await ctx.db.delete(chat._id);
   await scheduleDeleteAllChatsBatch(ctx, userId);
   return true;
@@ -448,6 +523,7 @@ export const getChatByIdFromClient = query({
       id: v.string(),
       title: v.string(),
       user_id: v.string(),
+      engagement_scope_expected: v.optional(v.boolean()),
       finish_reason: v.optional(v.string()),
       last_run_finished_at: v.optional(v.number()),
       active_stream_id: v.optional(v.string()),
@@ -561,6 +637,7 @@ export const getChatById = query({
       id: v.string(),
       title: v.string(),
       user_id: v.string(),
+      engagement_scope_expected: v.optional(v.boolean()),
       finish_reason: v.optional(v.string()),
       last_run_finished_at: v.optional(v.number()),
       active_stream_id: v.optional(v.string()),
@@ -643,6 +720,7 @@ export const saveChat = mutation({
     userId: v.string(),
     title: v.string(),
     projectId: v.optional(v.string()),
+    sandboxType: v.optional(v.string()),
   },
   returns: v.string(),
   handler: async (ctx, args) => {
@@ -714,6 +792,7 @@ export const saveChat = mutation({
         title: args.title,
         user_id: args.userId,
         project_id: projectId,
+        ...(args.sandboxType ? { sandbox_type: args.sandboxType } : {}),
         update_time: Date.now(),
       });
 
@@ -955,6 +1034,12 @@ export const updateChat = mutation({
 
       if (args.title !== undefined) {
         updateData.title = args.title;
+        await syncFindingSourceChatTitle(
+          ctx,
+          chat.user_id,
+          chat.id,
+          args.title,
+        );
       }
 
       if (args.finishReason !== undefined) {
@@ -1489,6 +1574,12 @@ export const renameChat = mutation({
         title: trimmedTitle,
         update_time: Date.now(),
       });
+      await syncFindingSourceChatTitle(
+        ctx,
+        chat.user_id,
+        chat.id,
+        trimmedTitle,
+      );
 
       return null;
     } catch (error) {
@@ -1626,6 +1717,7 @@ export const setActiveTriggerRun = mutation({
     expectedRunId: v.optional(v.string()),
     expectedApprovalSessionId: v.optional(v.string()),
     clearApprovalPending: v.optional(v.boolean()),
+    recoveredCrash: v.optional(v.boolean()),
   },
   returns: v.union(
     v.literal("updated"),
@@ -1661,6 +1753,18 @@ export const setActiveTriggerRun = mutation({
     ) {
       return "stale" as const;
     }
+    if (
+      args.recoveredCrash &&
+      (args.triggerRunId !== null || !args.expectedRunId)
+    )
+      throw new Error("Crash recovery requires a conditional detach");
+    if (
+      args.recoveredCrash &&
+      (chat.canceled_at !== undefined ||
+        chat.deletion_started_at !== undefined ||
+        (await isUserDeletionFenced(ctx.db, chat.user_id)))
+    )
+      return "stale" as const;
     const shouldClearApprovalPending =
       args.clearApprovalPending === true || args.triggerRunId !== null;
     const finishedActiveRun =
@@ -1668,6 +1772,11 @@ export const setActiveTriggerRun = mutation({
 
     await ctx.db.patch(chat._id, {
       active_trigger_run_id: args.triggerRunId ?? undefined,
+      ...(args.recoveredCrash &&
+      !chat.finish_reason &&
+      chat.canceled_at === undefined
+        ? { finish_reason: "trigger_crashed_client_saved" }
+        : {}),
       ...(finishedActiveRun ? { last_run_finished_at: Date.now() } : {}),
       ...(args.triggerRunId !== null ? { canceled_at: undefined } : {}),
       ...(args.approvalSessionId !== undefined
@@ -1892,86 +2001,7 @@ export const deleteAllChatsForUser = mutation({
   returns: v.null(),
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
-
-    const userChats = await ctx.db
-      .query("chats")
-      .withIndex("by_user_and_updated", (q) => q.eq("user_id", args.userId))
-      .collect();
-
-    for (const chat of userChats) {
-      const messages = await ctx.db
-        .query("messages")
-        .withIndex("by_chat_id", (q) => q.eq("chat_id", chat.id))
-        .collect();
-
-      for (const message of messages) {
-        if (!message.source_message_id && message.file_ids?.length) {
-          for (const fileId of message.file_ids) {
-            try {
-              const file = await ctx.db.get(fileId);
-              if (file) {
-                if (file.s3_key) {
-                  await ctx.scheduler.runAfter(
-                    0,
-                    internal.s3Cleanup.deleteS3ObjectAction,
-                    {
-                      s3Key: file.s3_key,
-                      ...(file.s3_region ? { s3Region: file.s3_region } : {}),
-                      ...(file.s3_bucket ? { s3Bucket: file.s3_bucket } : {}),
-                    },
-                  );
-                }
-                await fileCountAggregate.deleteIfExists(ctx, file);
-                await ctx.db.delete(file._id);
-              }
-            } catch (error) {
-              console.error(`Failed to delete file ${fileId}:`, error);
-            }
-          }
-        }
-        if (message.feedback_id) {
-          try {
-            await ctx.db.delete(message.feedback_id);
-          } catch (error) {
-            console.error(
-              `Failed to delete feedback ${message.feedback_id}:`,
-              error,
-            );
-          }
-        }
-        await ctx.db.delete(message._id);
-      }
-
-      if (chat.latest_summary_id) {
-        try {
-          await ctx.db.delete(chat.latest_summary_id);
-        } catch (error) {
-          console.error(
-            `Failed to delete summary ${chat.latest_summary_id}:`,
-            error,
-          );
-        }
-      }
-
-      const summaries = await ctx.db
-        .query("chat_summaries")
-        .withIndex("by_chat_id", (q) => q.eq("chat_id", chat.id))
-        .collect();
-      for (const summary of summaries) {
-        try {
-          await ctx.db.delete(summary._id);
-        } catch (error) {
-          console.error(`Failed to delete summary ${summary._id}:`, error);
-        }
-      }
-
-      while (await deleteSubagentDataForChat(ctx, chat.id)) {
-        // Test-hygiene helper intentionally drains the whole chat in one call.
-      }
-      await deleteModelHistory(ctx, chat.id);
-      await ctx.db.delete(chat._id);
-    }
-
+    await deleteNextUserChatBatch(ctx, args.userId);
     return null;
   },
 });

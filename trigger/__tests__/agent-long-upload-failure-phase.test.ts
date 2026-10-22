@@ -3,6 +3,7 @@ import path from "node:path";
 import ts from "typescript";
 import { ChatSDKError } from "@/lib/errors";
 import { extractErrorDetails } from "@/lib/utils/error-utils";
+import { parseCloudAcquisitionStage } from "@/lib/ai/tools/utils/cloud-acquisition-budget";
 
 // Execute the real classifier and terminal recorder without registering a task
 // or loading the Agent's model, billing, and sandbox dependencies.
@@ -48,7 +49,11 @@ const code = ts.transpileModule(
   { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
 ).outputText;
 
-async function recordFailure(error: ChatSDKError, phase = "setup") {
+async function recordFailure(
+  error: ChatSDKError,
+  phase = "setup",
+  reconnectRequired = false,
+) {
   const metadata = {
     set: jest.fn().mockReturnThis(),
     flush: jest.fn(async () => {}),
@@ -59,6 +64,7 @@ async function recordFailure(error: ChatSDKError, phase = "setup") {
   const dependencies = {
     ChatSDKError,
     extractErrorDetails,
+    parseCloudAcquisitionStage,
     metadata,
     triggerLogger,
     addAgentLongTags,
@@ -73,12 +79,15 @@ async function recordFailure(error: ChatSDKError, phase = "setup") {
     runId: "run-opaque",
     phase,
   });
-  expect(result).toEqual({ userCorrectable: false });
-  expect(metadata.set).toHaveBeenCalledWith("status", "failed");
+  expect(result).toEqual({ userCorrectable: reconnectRequired });
+  expect(metadata.set).toHaveBeenCalledWith(
+    "status",
+    reconnectRequired ? "reconnect_required" : "failed",
+  );
   expect(metadata.set).toHaveBeenCalledWith("terminalPhase", phase);
   expect(metadata.flush).toHaveBeenCalledTimes(1);
-  expect(triggerLogger.error).toHaveBeenCalledTimes(1);
-  expect(triggerLogger.warn).not.toHaveBeenCalled();
+  expect(triggerLogger.error).toHaveBeenCalledTimes(reconnectRequired ? 0 : 1);
+  expect(triggerLogger.warn).toHaveBeenCalledTimes(reconnectRequired ? 1 : 0);
   expect(recordGroupedSpikeAlert).not.toHaveBeenCalled();
   return { metadata, triggerLogger };
 }
@@ -153,4 +162,67 @@ it("keeps metadata-free errors compatible with the terminal recorder", async () 
   expect(metadata.set.mock.calls.map(([key]) => key)).not.toContain(
     "uploadFailurePhase",
   );
+});
+
+it.each(["connect", "workspace_lookup", "unknown"])(
+  "preserves bounded cloud acquisition stage %s in terminal diagnostics",
+  async (stage) => {
+    const { metadata, triggerLogger } = await recordFailure(
+      new ChatSDKError("bad_request:sandbox", "Cloud connection timed out", {
+        upload_failure_kind: "url",
+        upload_failure_phase: "acquisition",
+        upload_failure_acquisition_stage: stage,
+      }),
+    );
+    expect(metadata.set).toHaveBeenCalledWith(
+      "uploadFailureAcquisitionStage",
+      stage,
+    );
+    expect(triggerLogger.error).toHaveBeenCalledWith(
+      "[agent-long] run failed",
+      expect.objectContaining({ uploadFailureAcquisitionStage: stage }),
+    );
+  },
+);
+
+it.each([
+  ["acquisition", "PRIVATE_STAGE_CANARY"],
+  ["acquisition", { stage: "connect" }],
+  ["transfer", "connect"],
+  [undefined, "connect"],
+])("omits unsupported or unrelated cloud stage %p/%p", async (phase, stage) => {
+  const { metadata, triggerLogger } = await recordFailure(
+    new ChatSDKError("bad_request:sandbox", "Upload failed", {
+      upload_failure_kind: "url",
+      upload_failure_phase: phase,
+      upload_failure_acquisition_stage: stage,
+    }),
+  );
+  expect(metadata.set.mock.calls.map(([key]) => key)).not.toContain(
+    "uploadFailureAcquisitionStage",
+  );
+  expect(
+    triggerLogger.error.mock.calls[0][1].uploadFailureAcquisitionStage,
+  ).toBeUndefined();
+  expect(JSON.stringify(triggerLogger.error.mock.calls)).not.toContain(
+    "PRIVATE_STAGE_CANARY",
+  );
+});
+
+it("records a disconnected computer as actionable reconnection rather than a platform failure", async () => {
+  const { metadata } = await recordFailure(
+    new ChatSDKError("offline:sandbox", "Reconnect the selected computer."),
+    "setup",
+    true,
+  );
+  expect(metadata.set).toHaveBeenCalledWith("errorCategory", "sandbox_offline");
+});
+
+it("keeps connection lookup failures actionable as platform failures", async () => {
+  const { metadata } = await recordFailure(
+    new ChatSDKError("bad_request:sandbox", "Connection lookup failed", {
+      localConnectionLookupFailed: true,
+    }),
+  );
+  expect(metadata.set).toHaveBeenCalledWith("errorCategory", "chat_error");
 });

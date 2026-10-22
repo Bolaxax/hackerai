@@ -59,10 +59,9 @@ describe("terminal execution records", () => {
     jest.useRealTimers();
   });
 
-  it("separates cloud providers and preserves local environment identity across relay reconnects", async () => {
+  it("separates cloud from local and preserves local environment identity across relay reconnects", async () => {
     const { sandbox } = sandboxFixture();
-    const miosa = { ...sandbox, sandboxKind: "miosa" };
-    expect(terminalSandboxInstance(miosa)).toBe("miosa:sandbox-one");
+    expect(terminalSandboxInstance(sandbox)).toBe("e2b:sandbox-one");
     const local = {
       ...sandbox,
       sandboxKind: "centrifugo",
@@ -94,55 +93,110 @@ describe("terminal execution records", () => {
       ),
     ).toMatchObject({ status: "completed" });
     expect(
-      await createTerminalRecordStore(miosa, "u", "reconnect").read("abcdef12"),
+      await createTerminalRecordStore(sandbox, "u", "reconnect").read(
+        "abcdef12",
+      ),
     ).toBeNull();
   });
+  it.each([
+    ["/Users/test/Selected project", false],
+    ["C:/Users/test/Selected project", true],
+  ])(
+    "persists and recovers Desktop records inside %s",
+    async (project, windows) => {
+      const { sandbox, data } = sandboxFixture();
+      const local = {
+        ...sandbox,
+        sandboxKind: "centrifugo" as const,
+        getConnectionId: () => "desktop-scoped",
+        getWorkingDirectory: () => project,
+        isWindows: () => windows,
+        supportsNativeFileRelay: () => true,
+      };
+      // Model the native file API's selected-project boundary, not a permissive map.
+      sandbox.files.write.mockImplementation(
+        async (path: string, content: string) => {
+          if (!path.startsWith(project + "/"))
+            throw new Error("outside allowed root");
+          data.set(path, content);
+        },
+      );
+      const store = createTerminalRecordStore(local, "u", "scoped-project");
+      const saved = await store.save(
+        record({ sandboxInstance: terminalSandboxInstance(local) }),
+      );
+      expect(saved).not.toBeNull();
+      expect(
+        await createTerminalRecordStore(local, "u", "scoped-project").read(
+          "abcdef12",
+        ),
+      ).toMatchObject({ output: "final result", status: "completed" });
+      expect([...data.keys()][0]).toContain(
+        `${project}/.hackerai/terminal_execution_records/`,
+      );
+    },
+  );
 
-  it("uses lifecycle-only record persistence for MIOSA", async () => {
-    jest.useFakeTimers();
-    const { sandbox, data } = sandboxFixture();
-    const miosa = { ...sandbox, sandboxKind: "miosa" };
-    const store = createTerminalRecordStore(miosa as any, "u", "c");
-    expect(store).toMatchObject({
-      checkpointOnStart: false,
-      checkpointOnOutput: false,
-      pruneOnStart: false,
-    });
-
-    const manager = new PtySessionManager();
+  it("does not retransmit unchanged output when polling, but persists changes and retries failures", async () => {
+    const { sandbox } = sandboxFixture();
+    const store = createTerminalRecordStore(sandbox, "u", "polling");
     const handle = createCommandSessionHandle({ kill: async () => true });
-    const session = await manager.create("c", {
+    const manager = new PtySessionManager();
+    const session = await manager.create("polling", {
       createHandle: async () => handle,
       cols: 120,
       rows: 30,
       kind: "command",
-      sandboxIdentity: "miosa",
+      sandboxIdentity: "e2b",
       originalCommand: "bounded test",
       executionRecord: {
         ...store,
-        sandboxInstance: "miosa:sandbox-one",
+        checkpointOnStart: false,
+        pruneOnStart: false,
+        sandboxInstance: "e2b:sandbox-one",
         artifactPaths: [],
       },
     });
-
-    await jest.advanceTimersByTimeAsync(10_001);
-    expect(sandbox.files.write).not.toHaveBeenCalled();
-    expect(sandbox.files.list).not.toHaveBeenCalled();
-
-    handle.emitText("final evidence");
-    handle.resolveExit(0);
-    await Promise.resolve();
-    await manager.forget("c", session.sessionId);
-
-    expect(sandbox.files.list).not.toHaveBeenCalled();
-    expect(
-      JSON.parse(data.get(store.pathFor(session.sessionId))!),
-    ).toMatchObject({
-      status: "completed",
-      exitCode: 0,
-      output: "final evidence",
-    });
+    try {
+      handle.emitText("x".repeat(MAX_BUFFER_BYTES));
+      await manager.checkpoint(session);
+      const initialBytes = sandbox.files.write.mock.calls.reduce(
+        (bytes: number, call: [string, string]) =>
+          bytes + Buffer.byteLength(call[1]),
+        0,
+      );
+      for (let i = 0; i < 10; i++) await manager.checkpoint(session);
+      expect(
+        sandbox.files.write.mock.calls.reduce(
+          (bytes: number, call: [string, string]) =>
+            bytes + Buffer.byteLength(call[1]),
+          0,
+        ),
+      ).toBe(initialBytes);
+      handle.emitText("new evidence");
+      sandbox.files.write.mockRejectedValueOnce(new Error("offline"));
+      await manager.checkpoint(session);
+      expect(session.recordPersistenceFailed).toBe(true);
+      await manager.checkpoint(session);
+      expect(session.recordPersistenceFailed).toBe(false);
+      expect(
+        (await store.read(session.sessionId))?.output.endsWith("new evidence"),
+      ).toBe(true);
+      session.outputPath = "/tmp/new-artifact.txt";
+      await manager.checkpoint(session);
+      expect((await store.read(session.sessionId))?.artifactPaths).toContain(
+        "/tmp/new-artifact.txt",
+      );
+      await manager.close("polling", session.sessionId);
+      expect(await store.read(session.sessionId)).toMatchObject({
+        status: "stopped",
+        exitReason: "user_cancelled",
+      });
+    } finally {
+      await manager.closeAll("polling");
+    }
   });
+
   it("recovers in a fresh store and isolates user, scope, and sandbox instance", async () => {
     const { sandbox } = sandboxFixture();
     const store = createTerminalRecordStore(sandbox, "user-one", "chat-one");
@@ -240,6 +294,41 @@ describe("terminal execution records", () => {
     });
     expect(saved?.output).toHaveLength(MAX_BUFFER_BYTES);
     expect(saved?.output.endsWith("FINAL_EVIDENCE")).toBe(true);
+  });
+
+  it("periodically restores a quiet record removed by retention", async () => {
+    jest.useFakeTimers();
+    const { sandbox, data } = sandboxFixture();
+    const store = createTerminalRecordStore(sandbox, "u", "quiet-record");
+    const handle = createCommandSessionHandle({ kill: async () => true });
+    const manager = new PtySessionManager();
+    const session = await manager.create("quiet-record", {
+      createHandle: async () => handle,
+      cols: 120,
+      rows: 30,
+      kind: "command",
+      sandboxIdentity: "e2b",
+      originalCommand: "bounded test",
+      executionRecord: {
+        ...store,
+        checkpointOnStart: false,
+        pruneOnStart: false,
+        sandboxInstance: "e2b:sandbox-one",
+        artifactPaths: [],
+      },
+    });
+    try {
+      await manager.checkpoint(session);
+      data.delete(store.pathFor(session.sessionId));
+      await jest.advanceTimersByTimeAsync(60_000);
+      await manager.checkpoint(session);
+      expect(await store.read(session.sessionId)).toMatchObject({
+        status: "running",
+        updatedAt: Date.now(),
+      });
+    } finally {
+      await manager.closeAll("quiet-record");
+    }
   });
 
   it("distinguishes cancellation from completion while retaining partial evidence", async () => {

@@ -1,5 +1,17 @@
 import { redactSensitiveErrorMessage } from "@/lib/utils/error-redaction";
 
+/** A canceled signal alone does not establish that an unrelated error is cancellation. */
+export const isCancellationError = (
+  error: unknown,
+  signal: AbortSignal,
+): boolean =>
+  signal.aborted &&
+  (error === signal.reason ||
+    (typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      error.name === "AbortError"));
+
 /**
  * Extracts a readable error message from any error type.
  */
@@ -12,10 +24,12 @@ export const getErrorMessage = (err: unknown): string => {
   }
   if (err && typeof err === "object" && "message" in err) {
     const msg = (err as { message: unknown }).message;
-    return typeof msg === "string" ? msg : JSON.stringify(msg);
+    return typeof msg === "string"
+      ? msg
+      : (JSON.stringify(msg) ?? "Unknown error occurred");
   }
   try {
-    return JSON.stringify(err);
+    return JSON.stringify(err) ?? "Unknown error occurred";
   } catch {
     return String(err);
   }

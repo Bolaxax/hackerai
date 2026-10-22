@@ -1,3 +1,10 @@
+import { resolvePaidProAutoModel } from "@/lib/ai/paid-model-routing";
+import { isAgentModelContextEnabled } from "@/lib/experiments/agent-model-context";
+import { FreeDailyCostSettlement } from "@/lib/rate-limit/free-cost-budget";
+import {
+  evaluateFreeAgentBudget,
+  freeAgentBudgetPolicy,
+} from "@/lib/experiments/free-agent-budget";
 import { isAbliterationModel } from "@/lib/ai/abliteration";
 import {
   enforceRegionalSubscriptionFirst,
@@ -8,6 +15,10 @@ import { hasCompletedAssistantText } from "@/lib/analytics/free-activation";
 import { getRegionalFreeLimits } from "@/lib/rate-limit/regional-free-limits";
 import { regionalFreeCountryFromRequest } from "@/lib/rate-limit/regional-free-limits-request";
 import {
+  appendProviderEmptyResponseFailure,
+  getProviderOutputDiagnostics,
+  hasUncertainProviderToolOutcome,
+  isTerminalEmptyAssistantResponse,
   prepareProviderDisconnectContinuation,
   PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
 } from "@/lib/chat/agent-long-provider-retry";
@@ -50,7 +61,7 @@ import {
 import { getBaseTodosForRequest } from "@/lib/utils/todo-utils";
 import {
   acquireFreeRunConcurrencyLock,
-  checkFreeMonthlyCostLimit,
+  checkFreeCostBudget,
   checkRateLimit,
   deductUsage,
   deductUsageDelta,
@@ -80,7 +91,6 @@ import {
 } from "@/lib/token-utils";
 import { ChatSDKError } from "@/lib/errors";
 import PostHogClient from "@/app/posthog";
-import { selectCloudSandboxProvider } from "@/lib/ai/tools/utils/cloud-sandbox-provider";
 import { getRegionalExecutionContextForVercelRequest } from "@/lib/api/trigger-region";
 import {
   captureAgentBudgetAbort,
@@ -376,7 +386,10 @@ export const createChatHandler = () => {
           coerceSelectedModel(rawSelectedModel ?? null),
           subscription,
         );
-      await assertUserCanMakeCostIncurringRequest(userId);
+      await assertUserCanMakeCostIncurringRequest(userId, {
+        retryNetworkFailure: true,
+        signal: req.signal,
+      });
       await enforceRegionalSubscriptionFirst({
         userId,
         subscription,
@@ -426,6 +439,12 @@ export const createChatHandler = () => {
       // These reads only depend on the authenticated user, so overlap them
       // instead of paying one Convex round-trip after another before the
       // model call. Mirrors the Trigger agent route's preflight.
+      const agentModelContextEnabled = await isAgentModelContextEnabled(
+        userId,
+        subscription,
+        mode,
+        selectedModelOverride,
+      );
       const [userCustomization, fetched] = await Promise.all([
         getUserCustomization({ userId }),
         getMessagesByChatId({
@@ -435,6 +454,7 @@ export const createChatHandler = () => {
           newMessages: requestMessages,
           regenerate,
           mode,
+          agentModelContextEnabled,
           useClientMessagesForRegenerate,
         }),
       ]);
@@ -504,10 +524,27 @@ export const createChatHandler = () => {
         subscription,
         country: regionalFreeCountryFromRequest(req),
       });
-      const freeLimits = regionalFreeLimits;
+      const freeAgentBudget = await evaluateFreeAgentBudget({
+        posthog: (posthog ??= PostHogClient()),
+        userId,
+        mode,
+        subscription,
+        requestId,
+      });
+      const freeLimits = freeAgentBudgetPolicy(
+        freeAgentBudget,
+        regionalFreeLimits,
+      );
+      const freeDailySettlement = freeLimits?.agentDailyBudget
+        ? new FreeDailyCostSettlement(
+            freeUsageSubject,
+            freeLimits,
+            crypto.randomUUID(),
+          )
+        : undefined;
       const freeMonthlyBudgetSnapshot =
         subscription === "free"
-          ? await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits)
+          ? await checkFreeCostBudget(freeUsageSubject, freeLimits)
           : null;
 
       // Free ask: pre-flight rate-limit before any token counting/model work.
@@ -535,11 +572,8 @@ export const createChatHandler = () => {
         selectedModel,
         sandboxFiles,
         platformAuthorized,
-        paidFirstStepVariant,
         moderationChecked,
       } = await processChatMessages({
-        abliterationPosthog: (posthog ??= PostHogClient()),
-        limitRescue: Boolean(limitRescue),
         messages: truncatedMessages,
         mode,
         userId,
@@ -569,14 +603,12 @@ export const createChatHandler = () => {
 
       const assistantMessageId = uuidv4();
       const abliteratedExperiment = await evaluateAbliteratedModel({
-        posthog: (posthog ??= PostHogClient()),
         userId,
         selectedModel,
         subscription,
         mode,
         selectedModelOverride,
         moderationEligible: platformAuthorized,
-        paidFirstStepVariant,
         moderationChecked,
         messages: truncatedMessages,
         limitRescue: Boolean(limitRescue),
@@ -618,6 +650,16 @@ export const createChatHandler = () => {
       if (deepSeekV4Pro0813Experiment) {
         selectedModel = deepSeekV4Pro0813Experiment.modelKey;
       }
+      selectedModel = resolvePaidProAutoModel({
+        userId,
+        subscription,
+        selectedModel,
+        selectedModelOverride,
+        limitRescue: Boolean(limitRescue),
+        modelPolicyActive: Boolean(
+          abliteratedExperiment || deepSeekV4Pro0813Experiment,
+        ),
+      });
       const requestHasImages =
         countFileAttachments(fetched.truncatedMessages).imageCount > 0 ||
         uiMessagesContainImageViewResult(processedMessages);
@@ -628,6 +670,10 @@ export const createChatHandler = () => {
         subscription,
         selectedModel,
         hasImages: requestHasImages,
+        limitRescue: Boolean(limitRescue),
+        modelPolicyActive: Boolean(
+          abliteratedExperiment || deepSeekV4Pro0813Experiment,
+        ),
       });
       if (flashRoutingAssignment)
         selectedModel = flashRoutingAssignment.modelKey;
@@ -640,26 +686,17 @@ export const createChatHandler = () => {
         subscription,
         userId,
         selectedModel,
+        selectedModelOverride,
         userCustomization,
         truncatedMessages,
       });
 
       // PostHog client for analytics.
       posthog ??= PostHogClient();
-      const cloudSandboxSelection =
-        isAgentMode(mode) && (!sandboxPreference || sandboxPreference === "e2b")
-          ? await selectCloudSandboxProvider({
-              userId,
-              subscription,
-              environment: process.env.VERCEL_ENV ?? "development",
-              triggerRegion: executionRegion,
-              requestRegionClass,
-              featureFlagClient: posthog,
-            })
-          : ({
-              provider: "e2b",
-              reason: "miosa_rollout_control",
-            } as const);
+      const cloudSandboxSelection = {
+        provider: "e2b",
+        reason: "e2b_only",
+      } as const;
 
       const fileCounts = countFileAttachments(truncatedMessages);
       const chatLogContext = {
@@ -809,7 +846,10 @@ export const createChatHandler = () => {
             variant: activeAbliteratedExperiment.variant,
             requestId: assistantMessageId,
           }
-        : (activeFlashRoutingAssignment ??
+        : ((activeFlashRoutingAssignment && {
+            ...activeFlashRoutingAssignment,
+            requestId: assistantMessageId,
+          }) ??
           getDeepSeekV4Pro0813ExperimentContext(
             activeDeepSeekV4Pro0813Experiment,
           ));
@@ -905,6 +945,7 @@ export const createChatHandler = () => {
             });
 
             const {
+              cloudNetworkPrompt,
               tools,
               ensureSandbox,
               getTodoManager,
@@ -948,6 +989,7 @@ export const createChatHandler = () => {
                 cloudSandboxSelectionReason: cloudSandboxSelection.reason,
                 triggerRegion: executionRegion,
                 environment: process.env.VERCEL_ENV ?? "development",
+                signal: userStopSignal.signal,
               },
             );
 
@@ -1108,6 +1150,7 @@ export const createChatHandler = () => {
               "full_access",
               false,
               cloudSandboxSelection.provider,
+              selectedModelOverride,
             );
 
             const systemPromptTokens = safeCountTokens(currentSystemPrompt);
@@ -1354,10 +1397,16 @@ export const createChatHandler = () => {
                     },
                   });
                 } else if (subscription === "free") {
-                  await recordFreeMonthlyCost(
-                    freeUsageSubject,
-                    usageCostRecord.costDollars,
-                  );
+                  if (freeDailySettlement) {
+                    await freeDailySettlement.settle(
+                      usageCostRecord.costDollars,
+                    );
+                  } else {
+                    await recordFreeMonthlyCost(
+                      freeUsageSubject,
+                      usageCostRecord.costDollars,
+                    );
+                  }
                 } else {
                   const deductionResult = await deductUsage(
                     userId,
@@ -1453,6 +1502,7 @@ export const createChatHandler = () => {
                   responseModel: state.responseModel,
                   analyticsRequestContext,
                   experiment: routingExperimentContext,
+                  freeAgentBudget,
                   fallbackServed:
                     state.responseModel && retryUsedFallbackModel
                       ? true
@@ -1483,7 +1533,12 @@ export const createChatHandler = () => {
                 force,
                 model,
               }) => {
-                if (!usageSettlementState || hasRecordedUsage) return;
+                if (hasRecordedUsage) return;
+                if (freeDailySettlement) {
+                  await freeDailySettlement.settle(currentCostDollars);
+                  return;
+                }
+                if (!usageSettlementState) return;
                 if (
                   !shouldSettleUsageMidRun({
                     state: usageSettlementState,
@@ -1558,6 +1613,7 @@ export const createChatHandler = () => {
                   deduction: deductionResult,
                   forced: force,
                   experiment: routingExperimentContext,
+                  freeAgentBudget,
                 });
 
                 usageRefundTracker.addDeductions(deductionResult);
@@ -1643,6 +1699,8 @@ export const createChatHandler = () => {
                 isAbliterationModel(activeAbliteratedExperiment.modelKey) && {
                   abliteratedStepRouting: {
                     baselineModel: activeAbliteratedExperiment.baselineModel,
+                    generationStepLimit:
+                      activeAbliteratedExperiment.generationStepLimit,
                   },
                 }),
               onProviderRequestStart: (configuredModel) => {
@@ -1650,6 +1708,7 @@ export const createChatHandler = () => {
               },
               trackedProvider,
               currentSystemPrompt,
+              cloudNetworkPrompt,
               tools,
               mode,
               endpoint,
@@ -1662,8 +1721,17 @@ export const createChatHandler = () => {
               systemPromptTokens,
               ctxSystemTokens,
               ctxMaxTokens,
+              agentModelContextEnabled,
               streamStartTime,
-              onModelChunk: () => chatLogger?.markFirstChunk(),
+              onModelChunk: () => {
+                if (
+                  routingExperimentContext &&
+                  routingExperimentContext.firstModelChunkAt === undefined
+                ) {
+                  routingExperimentContext.firstModelChunkAt = Date.now();
+                }
+                chatLogger?.markFirstChunk();
+              },
               onModelStepSelected: (modelName) => {
                 activeModelName = modelName;
                 setCurrentModelName(modelName);
@@ -1689,6 +1757,11 @@ export const createChatHandler = () => {
               registerBackgroundWork: registerBackgroundStreamWork,
               getSandboxCostDollars: getSandboxSessionCost,
               settleUsageAfterStep,
+              checkBudgetBeforeStep: freeDailySettlement
+                ? async () => {
+                    await checkFreeCostBudget(freeUsageSubject, freeLimits);
+                  }
+                : undefined,
               ...(useMaxKimiReasoning && {
                 providerReasoningOverride: {
                   modelName: selectedModel,
@@ -1973,6 +2046,20 @@ export const createChatHandler = () => {
                           detectAssistantContentLoop: !isAborted,
                         },
                       );
+                    const terminalEmptyResponse =
+                      isTerminalEmptyAssistantResponse(
+                        lastAssistantMessageParts,
+                        state.streamFinishReason,
+                      );
+                    const emptyResponseContinuation =
+                      terminalEmptyResponse &&
+                      !hasUncertainProviderToolOutcome(
+                        lastAssistantMessageParts,
+                      )
+                        ? prepareProviderDisconnectContinuation(messages, {
+                            allowCompletedTail: true,
+                          })
+                        : undefined;
                     const imageRecovery =
                       state.providerRejectedMultimodalToolResults
                         ? omitImageViewToolResultsForProviderRetry(messages)
@@ -2002,6 +2089,7 @@ export const createChatHandler = () => {
                     if (
                       (shouldRecoverAbliterationStreamError ||
                         shouldRetryWithFallback ||
+                        emptyResponseContinuation ||
                         shouldRetryWithoutImageToolResults ||
                         shouldRetryWithVisionSummary) &&
                       !isRetryWithFallback
@@ -2009,23 +2097,28 @@ export const createChatHandler = () => {
                       const loopTriggeredRetry =
                         stoppedDueToAssistantContentLoop ||
                         state.stoppedDueToDoomLoop;
-                      const retryReason = shouldRetryWithVisionSummary
-                        ? "vision_summary_recovery"
-                        : shouldRetryWithoutImageToolResults
-                          ? "image_tool_result_rejection"
-                          : providerContentBlocked
-                            ? "content_filter"
-                            : stoppedDueToAssistantContentLoop
-                              ? "assistant_content_loop"
-                              : state.stoppedDueToDoomLoop
-                                ? "doom_loop"
-                                : shouldRetryInterruptedToolInput
-                                  ? "interrupted_tool_input"
-                                  : shouldRetryNonDurableOutputLimit
-                                    ? "non_durable_output_limit"
-                                    : shouldRetryReasoningOnlyProviderError
-                                      ? "reasoning_only_provider_error"
-                                      : "incomplete_stream";
+                      const retryReason =
+                        terminalEmptyResponse && emptyResponseContinuation
+                          ? "empty_answer_continuation"
+                          : terminalEmptyResponse
+                            ? "empty_answer"
+                            : shouldRetryWithVisionSummary
+                              ? "vision_summary_recovery"
+                              : shouldRetryWithoutImageToolResults
+                                ? "image_tool_result_rejection"
+                                : providerContentBlocked
+                                  ? "content_filter"
+                                  : stoppedDueToAssistantContentLoop
+                                    ? "assistant_content_loop"
+                                    : state.stoppedDueToDoomLoop
+                                      ? "doom_loop"
+                                      : shouldRetryInterruptedToolInput
+                                        ? "interrupted_tool_input"
+                                        : shouldRetryNonDurableOutputLimit
+                                          ? "non_durable_output_limit"
+                                          : shouldRetryReasoningOnlyProviderError
+                                            ? "reasoning_only_provider_error"
+                                            : "incomplete_stream";
                       const blockedProviderModel = providerContentBlocked
                         ? state.responseModel
                         : undefined;
@@ -2061,6 +2154,7 @@ export const createChatHandler = () => {
                         (!isAborted || stoppedDueToAssistantContentLoop) &&
                         !userStopSignal.signal.aborted &&
                         (isAutoModel ||
+                          Boolean(emptyResponseContinuation) ||
                           shouldRecoverAbliterationStreamError ||
                           shouldRetryWithVisionSummary ||
                           providerContentBlocked ||
@@ -2140,7 +2234,9 @@ export const createChatHandler = () => {
                           userId,
                           subscription,
                           messageCount: messages.length,
-                          parts: lastAssistantMessage?.parts,
+                          ...getProviderOutputDiagnostics(
+                            lastAssistantMessageParts,
+                          ),
                           isRetryWithFallback,
                           assistantMessageId,
                           retryReason,
@@ -2204,8 +2300,12 @@ export const createChatHandler = () => {
                           retryUsesDifferentModel(selectedModel, retryModel) ||
                           providerContentBlocked;
                         resetServedModelTelemetryForRetry(state);
-                        if (shouldRecoverAbliterationStreamError) {
+                        if (
+                          emptyResponseContinuation ||
+                          shouldRecoverAbliterationStreamError
+                        ) {
                           const continuation =
+                            emptyResponseContinuation ??
                             prepareProviderDisconnectContinuation(messages, {
                               allowCompletedTail: true,
                             });
@@ -2283,6 +2383,27 @@ export const createChatHandler = () => {
                               isAborted: retryAborted,
                             }) => {
                               try {
+                                const retryAssistant = retryMessages.findLast(
+                                  (message) => message.role === "assistant",
+                                );
+                                const retryEmptyResponse =
+                                  !retryAborted &&
+                                  !userStopSignal.signal.aborted &&
+                                  isTerminalEmptyAssistantResponse(
+                                    retryAssistant?.parts ?? [],
+                                    state.streamFinishReason,
+                                  );
+                                if (retryEmptyResponse) {
+                                  state.streamFinishReason = "error";
+                                  state.providerError = new Error(
+                                    "Provider completed without a usable answer",
+                                  );
+                                  appendProviderEmptyResponseFailure(
+                                    retryMessages,
+                                    retryMessageId,
+                                    writer,
+                                  );
+                                }
                                 // Cleanup for retry
                                 preemptiveTimeout?.clear();
                                 if (!subscriberStopped) {
@@ -2328,20 +2449,23 @@ export const createChatHandler = () => {
                                   );
                                 const outcome = retryAborted
                                   ? "aborted"
-                                  : providerContentBlocked
+                                  : providerContentBlocked || retryEmptyResponse
                                     ? "error"
                                     : "success";
                                 captureAgentCompletionAnalytics({
+                                  responseMessageId: retryMessageId,
                                   cacheHistoryTelemetry:
                                     state.cacheHistoryTelemetry,
                                   usageMeasurement:
                                     usageTracker.measurementProperties(
                                       selectedModel,
                                     ),
-                                  hasResponseContent: hasCompletedAssistantText(
-                                    retryMessages,
-                                    retryMessageId,
-                                  ),
+                                  hasResponseContent:
+                                    !retryEmptyResponse &&
+                                    hasCompletedAssistantText(
+                                      retryMessages,
+                                      retryMessageId,
+                                    ),
                                   abliteratedProviderSummary:
                                     abliteratedTelemetry?.getSummary(),
                                   posthog,
@@ -2376,6 +2500,7 @@ export const createChatHandler = () => {
                                   budgetAbortDetails: state.budgetAbortDetails,
                                   isAutoContinue: !!isAutoContinue,
                                   experiment: routingExperimentContext,
+                                  freeAgentBudget,
                                   stepLimitTelemetry:
                                     buildAgentStepLimitTelemetry({
                                       configuredMaxSteps:
@@ -2387,7 +2512,10 @@ export const createChatHandler = () => {
                                         getTodoManager().getRunMetrics(),
                                     }),
                                 });
-                                if (providerContentBlocked) {
+                                if (
+                                  providerContentBlocked ||
+                                  retryEmptyResponse
+                                ) {
                                   chatLogger!.emitUnexpectedError(
                                     state.providerError ??
                                       createProviderContentBlockedFinishReasonError(),
@@ -2506,7 +2634,8 @@ export const createChatHandler = () => {
                                   fallbackAssistantMessageId: retryMessageId,
                                   fallbackDurationMs:
                                     Date.now() - fallbackStartTime,
-                                  fallbackSuccess: fallbackHasContent,
+                                  fallbackSuccess:
+                                    fallbackHasContent && !retryEmptyResponse,
                                   fallbackWasAborted: retryAborted,
                                   fallbackMessageCount: retryMessages.length,
                                   fallbackPartTypes,
@@ -2539,6 +2668,22 @@ export const createChatHandler = () => {
                         retryScheduled = true;
                         return; // Skip normal cleanup - retry handles it
                       }
+                    }
+
+                    if (
+                      terminalEmptyResponse &&
+                      !isAborted &&
+                      !userStopSignal.signal.aborted
+                    ) {
+                      state.streamFinishReason = "error";
+                      state.providerError = new Error(
+                        "Provider completed without a usable answer",
+                      );
+                      appendProviderEmptyResponseFailure(
+                        messages,
+                        assistantMessageId,
+                        writer,
+                      );
                     }
 
                     const isPreemptiveAbort =
@@ -2672,17 +2817,19 @@ export const createChatHandler = () => {
                     const outcome = isAborted
                       ? "aborted"
                       : finalProviderContentBlocked ||
-                          visionSummaryRecoveryFailure
+                          visionSummaryRecoveryFailure ||
+                          (terminalEmptyResponse &&
+                            state.streamFinishReason === "error")
                         ? "error"
                         : "success";
                     captureAgentCompletionAnalytics({
+                      responseMessageId: assistantMessageId,
                       cacheHistoryTelemetry: state.cacheHistoryTelemetry,
                       usageMeasurement:
                         usageTracker.measurementProperties(selectedModel),
-                      hasResponseContent: hasCompletedAssistantText(
-                        messages,
-                        assistantMessageId,
-                      ),
+                      hasResponseContent:
+                        outcome === "success" &&
+                        hasCompletedAssistantText(messages, assistantMessageId),
                       abliteratedProviderSummary:
                         abliteratedTelemetry?.getSummary(),
                       posthog,
@@ -2715,6 +2862,7 @@ export const createChatHandler = () => {
                       budgetAbortDetails: state.budgetAbortDetails,
                       isAutoContinue: !!isAutoContinue,
                       experiment: routingExperimentContext,
+                      freeAgentBudget,
                       stepLimitTelemetry: buildAgentStepLimitTelemetry({
                         configuredMaxSteps: state.configuredMaxSteps,
                         stepCount: state.agentStepCount,
@@ -2726,7 +2874,11 @@ export const createChatHandler = () => {
                       chatLogger!.emitUnexpectedError(
                         visionSummaryRecoveryFailure,
                       );
-                    } else if (finalProviderContentBlocked) {
+                    } else if (
+                      finalProviderContentBlocked ||
+                      (terminalEmptyResponse &&
+                        state.streamFinishReason === "error")
+                    ) {
                       chatLogger!.emitUnexpectedError(
                         state.providerError ??
                           createProviderContentBlockedFinishReasonError(),

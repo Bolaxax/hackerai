@@ -8,6 +8,8 @@
  * @module
  */
 
+import type * as engagementScopes from "../engagementScopes.js";
+import type * as cloudNetwork from "../cloudNetwork.js";
 import type * as accountIdentities from "../accountIdentities.js";
 import type * as agentAutoReviewActions from "../agentAutoReviewActions.js";
 import type * as cancellationReasons from "../cancellationReasons.js";
@@ -22,6 +24,7 @@ import type * as feedback from "../feedback.js";
 import type * as fileActions from "../fileActions.js";
 import type * as fileAggregate from "../fileAggregate.js";
 import type * as fileStorage from "../fileStorage.js";
+import type * as findings from "../findings.js";
 import type * as influencerAnalytics from "../influencerAnalytics.js";
 import type * as influencerValidators from "../influencerValidators.js";
 import type * as influencers from "../influencers.js";
@@ -32,6 +35,7 @@ import type * as lib_extraUsagePricing from "../lib/extraUsagePricing.js";
 import type * as lib_extraUsageValidation from "../lib/extraUsageValidation.js";
 import type * as lib_fileDeletion from "../lib/fileDeletion.js";
 import type * as lib_influencerAnalytics from "../lib/influencerAnalytics.js";
+import type * as lib_legacyEngagementScope from "../lib/legacyEngagementScope.js";
 import type * as lib_logger from "../lib/logger.js";
 import type * as lib_retainedTail from "../lib/retainedTail.js";
 import type * as lib_sharedChatSnapshot from "../lib/sharedChatSnapshot.js";
@@ -75,6 +79,8 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  engagementScopes: typeof engagementScopes;
+  cloudNetwork: typeof cloudNetwork;
   accountIdentities: typeof accountIdentities;
   agentAutoReviewActions: typeof agentAutoReviewActions;
   cancellationReasons: typeof cancellationReasons;
@@ -89,6 +95,7 @@ declare const fullApi: ApiFromModules<{
   fileActions: typeof fileActions;
   fileAggregate: typeof fileAggregate;
   fileStorage: typeof fileStorage;
+  findings: typeof findings;
   influencerAnalytics: typeof influencerAnalytics;
   influencerValidators: typeof influencerValidators;
   influencers: typeof influencers;
@@ -99,6 +106,7 @@ declare const fullApi: ApiFromModules<{
   "lib/extraUsageValidation": typeof lib_extraUsageValidation;
   "lib/fileDeletion": typeof lib_fileDeletion;
   "lib/influencerAnalytics": typeof lib_influencerAnalytics;
+  "lib/legacyEngagementScope": typeof lib_legacyEngagementScope;
   "lib/logger": typeof lib_logger;
   "lib/retainedTail": typeof lib_retainedTail;
   "lib/sharedChatSnapshot": typeof lib_sharedChatSnapshot;

@@ -1,4 +1,14 @@
 import "server-only";
+import { DEEPSEEK_1017_MODEL_KEY } from "@/lib/experiments/paid-deepseek-1017";
+
+import { getCompactionResponseFormat } from "./structured-summary";
+
+import {
+  CompactionModelPolicy,
+  MAX_CONTEXT_SUMMARY_INPUT_TOKENS,
+  hasStructuredCompactionSummary,
+} from "@/lib/chat/summarization/compaction-policy";
+import { isAbliterationModel } from "@/lib/ai/abliteration";
 
 import {
   UIMessage,
@@ -17,13 +27,18 @@ import {
   writeSummarizationFailed,
   writeSummarizationCompleted,
 } from "@/lib/utils/stream-writer-utils";
-import { isCloudSandbox } from "@/lib/ai/tools/utils/sandbox-types";
+import {
+  getSandboxArtifactDirectory,
+  isCloudSandbox,
+} from "@/lib/ai/tools/utils/sandbox-types";
 import type { Id } from "@/convex/_generated/dataModel";
 import { KIMI_K3_SLUG, myProvider } from "@/lib/ai/providers";
 import {
   isRecoverableStartupCompactionError,
+  isCompactionTimeout,
   STARTUP_COMPACTION_FALLBACK_MODELS,
   STARTUP_COMPACTION_VARIANT,
+  InvalidCompactionSummaryError,
   type StartupCompactionContext,
 } from "./startup-compaction";
 import type { ProviderPromptPressure } from "./provider-pressure";
@@ -252,10 +267,28 @@ const buildContextCompactionProviderOptions = (
 
 const buildStartupCompactionProviderOptions = (
   providerOptions?: Record<string, Record<string, unknown>>,
+  structuredMode?: ChatMode,
+  preferGlmProvider = true,
 ): Record<string, Record<string, unknown>> => ({
   openrouter: {
     ...buildContextCompactionProviderOptions(providerOptions).openrouter,
-    provider: { sort: "throughput", data_collection: "deny" },
+    // Request JSON at the adapter boundary; validate after capturing billable usage.
+    ...(structuredMode
+      ? { response_format: getCompactionResponseFormat(structuredMode) }
+      : {}),
+    provider: {
+      sort: structuredMode ? "latency" : "throughput",
+      ...(structuredMode ? { require_parameters: true } : {}),
+      ...(structuredMode && preferGlmProvider
+        ? {
+            // Modal can stop with reasoning but no final checkpoint. Prefer the
+            // validated route, retaining other providers and model fallback.
+            order: ["baseten"],
+            ignore: ["modal"],
+          }
+        : {}),
+      data_collection: "deny",
+    },
   },
 });
 
@@ -344,6 +377,7 @@ const logContextCompactionFailed = ({
 };
 
 export interface CheckAndSummarizeOptions {
+  compactionPolicy?: CompactionModelPolicy;
   uiMessages: UIMessage[];
   /** History before injected notes/reminders; falls back to uiMessages for direct callers. */
   sourceUiMessages?: UIMessage[];
@@ -358,6 +392,8 @@ export interface CheckAndSummarizeOptions {
   ensureSandbox?: EnsureSandbox;
   systemPromptTokens?: number;
   providerInputTokens?: number;
+  /** Prepared model request estimate, including its system prompt. */
+  preparedInputTokens?: number;
   chatSystemPrompt?: string;
   tools?: ToolSet;
   providerOptions?: Record<string, Record<string, unknown>>;
@@ -429,13 +465,16 @@ const logContextCompactionStarted = ({
   totalEstimatedTokens,
   systemPromptTokens,
   providerInputTokens,
+  preparedInputTokens,
   maxTokens,
   summarizationThreshold,
   providerPromptPressure,
   fileTokens,
   cutoffMessageId,
   retainedTail,
+  compactionModel,
 }: {
+  compactionModel: string;
   chatId: string | null;
   mode: ChatMode;
   subscription: SubscriptionTier;
@@ -443,6 +482,7 @@ const logContextCompactionStarted = ({
   totalEstimatedTokens: number;
   systemPromptTokens: number;
   providerInputTokens: number;
+  preparedInputTokens: number;
   maxTokens: number;
   summarizationThreshold: number;
   providerPromptPressure?: ProviderPromptPressure | null;
@@ -468,10 +508,11 @@ const logContextCompactionStarted = ({
       mode,
       subscription,
       reason,
-      compaction_model: CONTEXT_COMPACTION_MODEL_NAME,
+      compaction_model: compactionModel,
       total_estimated_tokens: totalEstimatedTokens,
       system_prompt_tokens: systemPromptTokens,
       provider_input_tokens: providerInputTokens,
+      prepared_input_tokens: preparedInputTokens,
       max_tokens: maxTokens,
       threshold_tokens: summarizationThreshold,
       ...fileTokenSummary,
@@ -508,6 +549,8 @@ const generateSummaryTextWithRetry = async ({
   onPhaseDuration,
   startupCompaction,
   onRetry,
+  compactionPolicy,
+  persistence = "durable",
 }: {
   messagesToSummarize: UIMessage[];
   modelMessages?: ModelMessage[];
@@ -524,6 +567,8 @@ const generateSummaryTextWithRetry = async ({
   onPhaseDuration?: ContextCompactionPhaseReporter;
   startupCompaction?: StartupCompactionContext;
   onRetry?: () => void;
+  compactionPolicy?: CompactionModelPolicy;
+  persistence?: "durable" | "run_scoped";
 }): Promise<
   Awaited<ReturnType<typeof generateSummaryText>> & {
     languageModel: LanguageModel;
@@ -533,6 +578,152 @@ const generateSummaryTextWithRetry = async ({
   const startedAt = Date.now();
   abortSignal?.throwIfAborted();
   try {
+    const assignment = await compactionPolicy?.resolve();
+    abortSignal?.throwIfAborted();
+    if (assignment && compactionPolicy) {
+      const telemetry = compactionPolicy.start(assignment, persistence);
+      const deepSeekFirst =
+        assignment.expandedAgentContext &&
+        isAbliterationModel(assignment.model);
+      const models = [
+        assignment.model,
+        // Expanded recovery tries the exact 1M-context DeepSeek route before
+        // GLM, retaining the 484K projection and independent summary fallbacks.
+        ...(deepSeekFirst ? [DEEPSEEK_1017_MODEL_KEY] : []),
+        ...(assignment.fallbackModel ? [assignment.fallbackModel] : []),
+        ...(deepSeekFirst
+          ? []
+          : assignment.expandedAgentContext
+            ? [DEEPSEEK_1017_MODEL_KEY]
+            : STARTUP_COMPACTION_FALLBACK_MODELS),
+      ];
+      let servedModel: string | undefined;
+      try {
+        for (const [index, modelName] of models.entries()) {
+          abortSignal?.throwIfAborted();
+          const languageModel = myProvider.languageModel(modelName);
+          const attemptStartedAt = Date.now();
+          // Expanded Max recovery needs the same complete-checkpoint safeguards
+          // even when the separate moderation compaction experiment is paused.
+          const isStructuredRecovery =
+            (assignment.expandedAgentContext === true &&
+              !isAbliterationModel(modelName)) ||
+            (assignment.flagEnabled === true &&
+              modelName === "model-glm-5.3-flash");
+          let discardedUsage: SummarizationUsage | undefined;
+          startupCompaction?.onAttempt?.({
+            variant: assignment.policy,
+            fallbackUsed: index > 0,
+          });
+          try {
+            const result = await generateSummaryText(
+              messagesToSummarize,
+              languageModel,
+              mode,
+              chatSystemPrompt,
+              hasExistingSummary,
+              undefined,
+              isAbliterationModel(modelName)
+                ? {
+                    abliteration: {
+                      reasoningEffort: "low",
+                    },
+                  }
+                : buildStartupCompactionProviderOptions(
+                    providerOptions,
+                    isStructuredRecovery ? mode : undefined,
+                    modelName === "model-glm-5.3-flash",
+                  ),
+              abortSignal,
+              modelMessages,
+              assignment.expandedAgentContext
+                ? MAX_CONTEXT_SUMMARY_INPUT_TOKENS
+                : summaryInputMaxTokens,
+              {
+                maxRetries: 0,
+                // Abliteration must finish the full checkpoint before returning.
+                // Give it two minutes while retaining bounded recovery and cancellation.
+                timeout: isAbliterationModel(modelName)
+                  ? 120_000
+                  : isStructuredRecovery
+                    ? 75_000
+                    : 60_000,
+                // GLM shares this budget between mandatory reasoning and text.
+                maxOutputTokens: isStructuredRecovery ? 16384 : 8192,
+                structuredSummary: isStructuredRecovery,
+                validateText: (text) =>
+                  hasStructuredCompactionSummary(text, mode),
+                onDiscardedUsage: (usage) => {
+                  discardedUsage = usage;
+                  telemetry.onDiscardedUsage(usage);
+                },
+              },
+            );
+            servedModel = modelName;
+            telemetry.attempt(
+              modelName,
+              "completed",
+              Date.now() - attemptStartedAt,
+              result.usage,
+            );
+            telemetry.finish("completed", modelName);
+            return {
+              ...result,
+              languageModel,
+              attempt:
+                index === 0 ? ("primary" as const) : ("fallback" as const),
+            };
+          } catch (error) {
+            telemetry.attempt(
+              modelName,
+              abortSignal?.aborted ? "aborted" : "error",
+              Date.now() - attemptStartedAt,
+              discardedUsage,
+              abortSignal?.aborted
+                ? "canceled"
+                : error instanceof InvalidCompactionSummaryError
+                  ? error.reason
+                  : isCompactionTimeout(error)
+                    ? "timeout"
+                    : "provider_error",
+              error,
+            );
+            markSummarizationAttemptError(
+              error,
+              index === 0 ? "primary" : "fallback",
+              modelName,
+            );
+            if (
+              abortSignal?.aborted ||
+              index === models.length - 1 ||
+              !(
+                isAbliterationModel(modelName) ||
+                // Expanded DeepSeek recovery may also reject the provider
+                // request outright. Give the assigned GLM one final attempt.
+                (deepSeekFirst && modelName === DEEPSEEK_1017_MODEL_KEY) ||
+                // A cheaper primary can reject a request with a non-retryable
+                // provider error (for example HTTP 400). Still try the assigned
+                // Abliteration fallback once; never retry caller cancellation.
+                (index === 0 &&
+                  isAbliterationModel(assignment.fallbackModel)) ||
+                error instanceof InvalidCompactionSummaryError ||
+                isMalformedProviderJsonError(error) ||
+                isRecoverableStartupCompactionError(error)
+              )
+            )
+              throw error;
+            onRetry?.();
+          }
+        }
+        throw new Error("Compaction model chain was empty");
+      } catch (error) {
+        telemetry.finish(
+          abortSignal?.aborted ? "aborted" : "error",
+          servedModel,
+        );
+        throw error;
+      }
+    }
     if (!startupCompaction || mode !== "agent") {
       const languageModel = myProvider.languageModel(
         CONTEXT_COMPACTION_MODEL_NAME,
@@ -717,6 +908,7 @@ const startTranscriptSave = ({
 };
 
 export interface CompactModelMessagesInRunOptions {
+  compactionPolicy?: CompactionModelPolicy;
   modelMessages: ModelMessage[];
   /** UI history excludes synthetic SDK continuation/approval messages. */
   sourceUiMessages?: UIMessage[];
@@ -790,6 +982,7 @@ export const compactModelMessagesInRun = async ({
   cacheAlignedSummary,
   onPhaseDuration,
   registerBackgroundWork,
+  compactionPolicy,
 }: CompactModelMessagesInRunOptions): Promise<InRunModelCompactionResult | null> => {
   const summarizationThreshold = getSummarizationThresholdTokens(maxTokens);
   const compactionReason = getCompactionLogReason({
@@ -810,9 +1003,13 @@ export const compactModelMessagesInRun = async ({
       reason: compactionReason,
       compaction_index: compactionIndex,
       persistence: "run_scoped",
-      compaction_model: CONTEXT_COMPACTION_MODEL_NAME,
+      compaction_model:
+        (await compactionPolicy?.resolve())?.model ??
+        CONTEXT_COMPACTION_MODEL_NAME,
       model_message_count: modelMessages.length,
       provider_input_tokens: providerInputTokens,
+      estimated_input_tokens:
+        estimateSummaryInputTokens(modelMessages) + systemPromptTokens,
       max_tokens: maxTokens,
       threshold_tokens: summarizationThreshold,
       system_prompt_tokens: systemPromptTokens,
@@ -861,6 +1058,7 @@ export const compactModelMessagesInRun = async ({
       }
     }
     const useWarmPrefix =
+      !compactionPolicy &&
       cacheAlignedSummary &&
       prefixBudget > 0 &&
       estimateSummaryInputTokens(modelMessages) <= prefixBudget;
@@ -881,6 +1079,8 @@ export const compactModelMessagesInRun = async ({
         subscription,
         reason: compactionReason,
         onPhaseDuration,
+        compactionPolicy,
+        persistence: "run_scoped",
       });
     if (useWarmPrefix) cacheAlignedSummary.onUsed?.();
     const summaryPromise = useWarmPrefix
@@ -988,7 +1188,7 @@ export const compactModelMessagesInRun = async ({
 
 /**
  * Writes a JSON transcript of the summarized messages to the sandbox.
- * E2B (cloud) persists to ~/agent-transcripts/, local Docker to /tmp/agent-transcripts/.
+ * Native Desktop uses the selected project; other local clients use /tmp.
  *
  * Content is written as a Buffer (not a string) so that ConvexSandbox's binary
  * chunking path is used, avoiding the shell argument size limits that occur when
@@ -1005,9 +1205,7 @@ const saveTranscriptToSandbox = async (
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const transcriptId = uuidv4();
-      const dir = isCloudSandbox(sandbox)
-        ? "/home/user/agent-transcripts"
-        : "/tmp/agent-transcripts";
+      const dir = getSandboxArtifactDirectory(sandbox, "agent-transcripts");
       const path = `${dir}/${transcriptId}.json`;
 
       // E2B needs an explicit mkdir since its files.write doesn't create parents.
@@ -1069,6 +1267,7 @@ export const checkAndSummarizeIfNeeded = async ({
   ensureSandbox,
   systemPromptTokens = 0,
   providerInputTokens = 0,
+  preparedInputTokens = 0,
   chatSystemPrompt = "",
   tools,
   providerOptions,
@@ -1079,6 +1278,7 @@ export const checkAndSummarizeIfNeeded = async ({
   onPhaseDuration,
   registerBackgroundWork,
   startupCompaction,
+  compactionPolicy,
 }: CheckAndSummarizeOptions): Promise<SummarizationResult> => {
   // Detect and separate synthetic summary message from real messages
   let realMessages: UIMessage[];
@@ -1108,8 +1308,12 @@ export const checkAndSummarizeIfNeeded = async ({
   const summarizationThreshold = getSummarizationThresholdTokens(maxTokens);
   const totalEstimatedTokens =
     countMessagesTokens(uiMessages, fileTokens) + systemPromptTokens;
+  // Restored or provider-prepared history can exceed the smaller UI estimate.
+  // Use the same estimate as the final guard without changing the hard limit.
+  const preparedInputPressure = preparedInputTokens > summarizationThreshold;
   if (
     !providerPromptPressure &&
+    !preparedInputPressure &&
     !isAboveTokenThreshold(
       uiMessages,
       subscription,
@@ -1141,7 +1345,7 @@ export const checkAndSummarizeIfNeeded = async ({
 
   if (
     tailSelection.headMessages.length === 0 &&
-    providerPromptPressure &&
+    (providerPromptPressure || preparedInputPressure) &&
     !tailSelection.retainedTail?.projected_part_count
   ) {
     tailSelection = {
@@ -1171,6 +1375,9 @@ export const checkAndSummarizeIfNeeded = async ({
     summarizationThreshold,
   });
   logContextCompactionStarted({
+    compactionModel:
+      (await compactionPolicy?.resolve())?.model ??
+      CONTEXT_COMPACTION_MODEL_NAME,
     chatId,
     mode,
     subscription,
@@ -1178,6 +1385,7 @@ export const checkAndSummarizeIfNeeded = async ({
     totalEstimatedTokens,
     systemPromptTokens,
     providerInputTokens,
+    preparedInputTokens,
     maxTokens,
     summarizationThreshold,
     providerPromptPressure,
@@ -1206,6 +1414,7 @@ export const checkAndSummarizeIfNeeded = async ({
       reason: compactionReason,
       onPhaseDuration,
       startupCompaction,
+      compactionPolicy,
     });
 
     // In agent modes, save the full transcript of summarized messages to the sandbox

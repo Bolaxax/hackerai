@@ -45,107 +45,96 @@ describe("processChatMessages authorization metadata", () => {
     else process.env.ABLITERATION_API_KEY = originalAbliterationKey;
   });
 
+  it.each([
+    { mode: "ask", subscription: "free" },
+    { mode: "agent", subscription: "free" },
+    { mode: "agent", subscription: "pro" },
+  ] as const)(
+    "authorizes a score of 0.05 for $subscription users in $mode mode",
+    async ({ mode, subscription }) => {
+      mockModerationsCreate.mockResolvedValue({
+        results: [
+          {
+            categories: { illicit: false },
+            category_scores: { illicit: 0.05 },
+          },
+        ],
+      });
+
+      const result = await processChatMessages({
+        messages: [makeMessage("Continue the authorized security assessment")],
+        mode,
+        userId: "user-1",
+        subscription,
+      });
+
+      expect(result.platformAuthorized).toBe(true);
+    },
+  );
+
   it.each(["ask", "agent"] as const)(
-    "keeps unavailable PDF attachments outside the unmoderated %s trial",
+    "always moderates %s despite a stale paid treatment flag",
+    async (mode) => {
+      const getFeatureFlagResult = jest
+        .fn()
+        .mockResolvedValue({ enabled: true, variant: "test" });
+      const legacyInput = { abliterationPosthog: { getFeatureFlagResult } };
+      const subscriptions =
+        mode === "ask"
+          ? (["free"] as const)
+          : (["pro", "pro-plus", "ultra", "team"] as const);
+      for (const subscription of subscriptions) {
+        mockModerationsCreate.mockResolvedValue({
+          results: [{ categories: {}, category_scores: { illicit: 0 } }],
+        });
+        const result = await processChatMessages({
+          ...legacyInput,
+          messages: [
+            makeMessage("Explain how to sort three numbers in Python"),
+          ],
+          mode,
+          userId: "user-1",
+          subscription,
+        });
+        expect(result).toMatchObject({
+          moderationChecked: true,
+          platformAuthorized: false,
+          allowsAbliterationContinuation: true,
+        });
+      }
+      expect(mockModerationsCreate).toHaveBeenCalledTimes(subscriptions.length);
+      expect(getFeatureFlagResult).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["ask", "agent"] as const)(
+    "moderates %s after dropping an unavailable PDF attachment",
     async (mode) => {
       const textOnly = makeMessage("Summarize the attached document");
       mockModerationsCreate.mockResolvedValue({
         results: [{ categories: {}, category_scores: { illicit: 0 } }],
       });
-      const getFeatureFlagResult = jest
-        .fn()
-        .mockResolvedValue({ enabled: true, variant: "test" });
       const result = await processChatMessages({
         messages: [
           {
             ...textOnly,
             parts: [
               ...textOnly.parts,
-              { type: "file", mediaType: "application/pdf", url: "" },
+              {
+                type: "file",
+                mediaType: "application/pdf",
+                url: "",
+              },
             ],
           },
         ],
         mode,
         userId: "user-1",
-        subscription: "pro",
-        abliterationPosthog: { getFeatureFlagResult },
+        subscription: mode === "ask" ? "free" : "pro",
       });
       expect(result.processedMessages).toEqual([textOnly]);
-      expect(getFeatureFlagResult).not.toHaveBeenCalled();
       expect(mockModerationsCreate).toHaveBeenCalledTimes(1);
       expect(result.moderationChecked).toBe(true);
-      expect(result.paidFirstStepVariant).toBeUndefined();
-    },
-  );
-  it("skips the moderation API only for explicit paid first-step treatment", async () => {
-    const getFeatureFlagResult = jest
-      .fn()
-      .mockResolvedValue({ enabled: true, variant: "test" });
-    const result = await processChatMessages({
-      messages: [makeMessage("Explain how to sort three numbers in Python")],
-      mode: "agent",
-      userId: "user-1",
-      subscription: "pro",
-      abliterationPosthog: { getFeatureFlagResult },
-    });
-    expect(mockModerationsCreate).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      paidFirstStepVariant: "test",
-      moderationChecked: false,
-      platformAuthorized: false,
-      allowsAbliterationContinuation: false,
-    });
-  });
-  it.each(["control", false, undefined])(
-    "preserves the moderation API for %s",
-    async (variant) => {
-      mockModerationsCreate.mockResolvedValue({
-        results: [
-          { categories: { illicit: false }, category_scores: { illicit: 0.5 } },
-        ],
-      });
-      const getFeatureFlagResult = jest
-        .fn()
-        .mockResolvedValue(
-          variant === undefined
-            ? undefined
-            : { enabled: variant !== false, variant },
-        );
-      const result = await processChatMessages({
-        messages: [makeMessage("Explain how to sort three numbers in Python")],
-        mode: "ask",
-        userId: "user-1",
-        subscription: "pro",
-        abliterationPosthog: { getFeatureFlagResult },
-      });
-      expect(mockModerationsCreate).toHaveBeenCalledTimes(1);
-      expect(result.moderationChecked).toBe(true);
-      expect(result.platformAuthorized).toBe(true);
-      expect(result.paidFirstStepVariant).toBe(
-        variant === "control" ? "control" : undefined,
-      );
-    },
-  );
-  it.each([{ subscription: "free" as const }, { limitRescue: true }])(
-    "preserves moderation and never enrolls excluded requests: %j",
-    async (overrides) => {
-      mockModerationsCreate.mockResolvedValue({
-        results: [{ categories: {}, category_scores: { illicit: 0 } }],
-      });
-      const getFeatureFlagResult = jest
-        .fn()
-        .mockResolvedValue({ enabled: true, variant: "test" });
-      const result = await processChatMessages({
-        messages: [makeMessage("Explain how to sort three numbers in Python")],
-        mode: "ask",
-        userId: "user-1",
-        subscription: "pro",
-        ...overrides,
-        abliterationPosthog: { getFeatureFlagResult },
-      });
-      expect(mockModerationsCreate).toHaveBeenCalledTimes(1);
-      expect(getFeatureFlagResult).not.toHaveBeenCalled();
-      expect(result.paidFirstStepVariant).toBeUndefined();
     },
   );
 
@@ -167,7 +156,7 @@ describe("processChatMessages authorization metadata", () => {
       messages,
       mode: "ask",
       userId: "user-1",
-      subscription: "pro",
+      subscription: "free",
     });
 
     expect(result.platformAuthorized).toBe(true);
