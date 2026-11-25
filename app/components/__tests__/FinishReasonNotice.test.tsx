@@ -85,7 +85,10 @@ function DataStreamSetter({
 
 interface RenderNoticeProps {
   finishReason?: string;
+  continueDisabledReason?: string;
+  stoppedComputerReconnected?: boolean;
   mode?: ChatMode;
+  lastSavedStep?: "request" | "agent-progress" | "conversation";
   agentRunSpendCapPremiumContinuationAllowed?: boolean;
   onContinue?: (selectedModelOverride?: SelectedModel) => void;
 }
@@ -108,6 +111,162 @@ function renderNotice(
 }
 
 describe("FinishReasonNotice", () => {
+  it.each([
+    [
+      "request",
+      "Last visible: your request above. No Agent result is shown for this turn.",
+    ],
+    ["agent-progress", "Last visible: Agent progress shown above."],
+  ] as const)(
+    "identifies the last visible %s without claiming an unconfirmed save",
+    (lastSavedStep, expected) => {
+      renderNotice({
+        finishReason: "local-connection-lost",
+        mode: "agent",
+        lastSavedStep,
+        onContinue: jest.fn(),
+      });
+
+      expect(screen.getByRole("status")).toHaveTextContent(expected);
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Only work still visible after reload is confirmed saved.",
+      );
+      expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
+    },
+  );
+  it.each([
+    {
+      finishReason: "local-connection-lost",
+      reason: "Run stopped: lost connection to the selected computer.",
+      // A stop mid-command must not read as if that command completed.
+      detail: "A command that was running may not have finished.",
+    },
+    {
+      finishReason: "browser-handoff-abandoned",
+      reason: "Browser handoff ended before the Agent continued.",
+      detail: "Browser actions, like signing in, may need to be repeated.",
+    },
+  ])("waits for one manual Resume after $finishReason", async (stop) => {
+    let finishResume!: () => void;
+    const onContinue = jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishResume = resolve;
+        }),
+    );
+    const props = {
+      finishReason: stop.finishReason,
+      mode: "agent" as const,
+      onContinue,
+    };
+    const view = renderNotice({
+      ...props,
+      continueDisabledReason: "Reconnect the selected computer.",
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(stop.reason);
+    expect(screen.getByRole("status")).toHaveTextContent(stop.detail);
+    expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Resume" }),
+    ).toHaveAccessibleDescription("Reconnect the selected computer.");
+
+    view.rerender(
+      <DataStreamProvider>
+        <FinishReasonNotice {...props} />
+      </DataStreamProvider>,
+    );
+    expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
+    expect(onContinue).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resuming…" }));
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Resuming…" })).toBeDisabled();
+    await act(async () => finishResume());
+    expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
+  });
+
+  it("offers explicit resume after a lost computer connection, even after automatic continuation was pending", () => {
+    const onContinue = jest.fn();
+    renderNotice(
+      { finishReason: "local-connection-lost", mode: "agent", onContinue },
+      { isAutoContinuing: true },
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(/lost connection/i);
+    expect(onContinue).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces the stopped computer's return without resuming on its own", () => {
+    const onContinue = jest.fn();
+    const props = {
+      finishReason: "local-connection-lost",
+      mode: "agent" as const,
+      onContinue,
+    };
+    const view = renderNotice({
+      ...props,
+      continueDisabledReason:
+        "Reconnect your computer or choose another environment",
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(/lost connection/i);
+    expect(screen.getByRole("status")).not.toHaveTextContent(
+      /computer is back/i,
+    );
+
+    view.rerender(
+      <DataStreamProvider>
+        <FinishReasonNotice {...props} stoppedComputerReconnected />
+      </DataStreamProvider>,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Your computer is back. Resume to continue this run.",
+    );
+    // What the stop may have interrupted is still stated.
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "A command that was running may not have finished.",
+    );
+    expect(onContinue).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("never announces a returning computer for another manual stop", () => {
+    renderNotice({
+      finishReason: "browser-handoff-abandoned",
+      mode: "agent",
+      stoppedComputerReconnected: true,
+      onContinue: jest.fn(),
+    });
+    expect(screen.getByRole("status")).not.toHaveTextContent(
+      /computer is back/i,
+    );
+  });
+
+  it("explains an abandoned browser handoff without a transcript Resume when the Goal owns it", () => {
+    renderNotice(
+      { finishReason: "browser-handoff-abandoned", mode: "agent" },
+      { isAutoContinuing: true },
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Browser actions, like signing in, may need to be repeated.",
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("explains a repetition halt without offering to repeat the same work", () => {
+    const onContinue = jest.fn();
+    renderNotice({ finishReason: "doom-loop", mode: "agent", onContinue });
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /repeating work without progress.*new instruction.*change the approach/i,
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(onContinue).not.toHaveBeenCalled();
+  });
+
   it("shows automatic continuation status without a manual Continue button", () => {
     const onContinue = jest.fn();
     renderNotice(

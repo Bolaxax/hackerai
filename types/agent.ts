@@ -11,6 +11,10 @@ import type { CentrifugoSandbox } from "@/lib/ai/tools/utils/centrifugo-sandbox"
 import type { SandboxFallbackInfo } from "@/lib/ai/tools/utils/hybrid-sandbox-manager";
 import type { CloudSandboxProvider } from "@/lib/ai/tools/utils/cloud-sandbox-provider";
 import type { S3StorageRegion } from "@/lib/constants/s3";
+import type {
+  LocalConnectionLostError,
+  LocalRunRecoverySummary,
+} from "@/lib/chat/local-connection-stop";
 
 // Union type for cloud providers and local CentrifugoSandbox.
 export type AnySandbox = Sandbox | CentrifugoSandbox;
@@ -26,9 +30,29 @@ export interface SandboxInfo {
   name?: string;
   /** Concrete cloud backend. Omitted for user-owned execution hosts. */
   provider?: CloudSandboxProvider;
+  /** Image generation from the attached E2B workspace, never the current default. */
+  sandboxVersion?: string;
 }
 
+/** Opaque ordering snapshot for one sandbox health check. */
+export type SandboxHealthCheckToken = {
+  readonly epoch: number;
+  readonly generation: number;
+};
+
 export interface SandboxManager {
+  /** End this run when its local connection is lost; a successor requires a new run. */
+  stopOnLocalDisconnect?(
+    onLost: (error: LocalConnectionLostError) => void,
+  ): () => void;
+  /**
+   * Before a run completes, freshly verify its watched local connection.
+   * Resolves when no connection is watched; rejects with the run's
+   * LocalConnectionLostError on loss, or with the signal's reason.
+   */
+  confirmLocalConnection?(signal?: AbortSignal): Promise<void>;
+  /** Content-free summary of the watched local host's recovered outages. */
+  getLocalRecoverySummary?(): LocalRunRecoverySummary | undefined;
   getSandbox(): Promise<{ sandbox: AnySandbox }>;
   setSandbox(sandbox: AnySandbox): void;
   resetSandbox?(reason?: string): Promise<void>;
@@ -52,10 +76,17 @@ export interface SandboxManager {
   getEffectivePreference(): string;
   /** Track consecutive sandbox health failures across all tools. Returns true if the limit has been exceeded. */
   recordHealthFailure(): boolean;
-  /** Reset the health failure counter (call on successful health check). */
-  resetHealthFailures(): void;
-  /** Check if the sandbox has been marked as permanently unavailable for this session. */
+  /** Snapshot taken before a health check wait; pass it to `resetHealthFailures`. */
+  beginHealthCheck?(): SandboxHealthCheckToken;
+  /**
+   * Reset the health failure counter (call on successful health check). With a
+   * token, a stale success cannot erase failures or a cooldown recorded since.
+   */
+  resetHealthFailures(token?: SandboxHealthCheckToken): void;
+  /** Whether sandbox tools must not run now: a cloud cooldown, a cloud failure that disables this run, or a lost local sandbox. */
   isSandboxUnavailable(): boolean;
+  /** Model-facing cloud reason while unavailable, including when tools will retry. Undefined for local sandboxes. */
+  getSandboxUnavailableMessage?(): string | undefined;
   /** Whether the effective sandbox can create interactive PTY sessions. */
   supportsInteractivePty?(): Promise<boolean>;
 }
@@ -84,6 +115,8 @@ export interface SandboxResourceMetrics {
   cpuPct: number;
   memPct: number;
   diskPct: number;
+  /** Provider timestamp age (possibly a bucket start) at return; negative means clock skew. */
+  sampleAgeMs?: number;
 }
 
 export type SandboxReadinessFailureReason =

@@ -16,13 +16,24 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { useState, useEffect, useMemo } from "react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { toast } from "sonner";
 import { openSettingsDialog } from "@/lib/utils/settings-dialog";
 import { useTauri } from "@/app/hooks/useTauri";
 import { detectPlatform } from "@/app/download/DownloadSection";
 import { useGlobalState } from "@/app/contexts/GlobalState";
 import { useInitialConnectionPending } from "@/app/hooks/useInitialConnectionPending";
+import { useIsMobile } from "@/hooks/use-mobile";
 
 import type { SetSandboxPreference } from "@/app/hooks/useSandboxPreference";
 import {
@@ -39,6 +50,14 @@ interface SandboxSelectorProps {
   size?: "sm" | "toolbar" | "md";
   triggerLabel?: string;
   compact?: boolean;
+  menuAlign?: "start" | "center" | "end";
+  className?: string;
+  /**
+   * Ask before moving a chat that already has messages to a different
+   * environment. A confirmed move resets Agent permissions to Ask for approval
+   * so scope granted for the previous host is not inherited.
+   */
+  confirmEnvironmentChange?: boolean;
 }
 
 interface ConnectionOption {
@@ -56,15 +75,31 @@ export function SandboxSelector({
   size = "sm",
   triggerLabel,
   compact = false,
+  menuAlign = "start",
+  className,
+  confirmEnvironmentChange = false,
 }: SandboxSelectorProps) {
   const [open, setOpen] = useState(false);
+  const selectorTriggerRef = useRef<HTMLButtonElement>(null);
+  const [pendingChange, setPendingChange] = useState<{
+    preference: string;
+    label: string;
+  } | null>(null);
   const [connectHovered, setConnectHovered] = useState(false);
+  const isMobile = useIsMobile();
+  useEffect(() => {
+    // The composer swaps selector triggers at this breakpoint. Close the old
+    // trigger's portals before they can remain anchored to a hidden element.
+    setOpen(false);
+    setConnectHovered(false);
+  }, [isMobile]);
   const { isTauri } = useTauri();
   const {
     subscription,
     localConnections: connections,
     desktopBridgeStatus,
     desktopEnvironmentId,
+    setAgentPermissionMode,
   } = useGlobalState();
   const isFreeUser = subscription === "free";
   const cloudSandboxDisabled = isCloudSandboxDisabled();
@@ -189,25 +224,22 @@ export function SandboxSelector({
         : remoteConnections,
     [onlineRemoteConnectionIds, remoteConnections, shouldVerifyRemotePresence],
   );
-  const remoteOptions: ConnectionOption[] = liveRemoteConnections
-    .filter(
-      (conn, index, all) =>
-        all.findIndex(
-          (candidate) =>
-            environmentPreference(candidate) === environmentPreference(conn),
-        ) === index,
-    )
-    .map((conn) => ({
-      id: value === conn.connectionId ? value : environmentPreference(conn),
-      label: conn.osInfo?.hostname || conn.name,
-      shortLabel: conn.osInfo?.hostname || conn.name,
-      icon: Laptop,
-    }));
+  const remoteOptions: ConnectionOption[] = liveRemoteConnections.map(
+    (conn) => {
+      const name = conn.osInfo?.hostname || conn.name;
+      const label = `${name} (${conn.connectionId.slice(0, 8)})`;
+      return {
+        id: environmentPreference(conn),
+        label,
+        shortLabel: label,
+        icon: Laptop,
+      };
+    },
+  );
   const options = [cloudOption, ...desktopOptions, ...remoteOptions];
 
   // A connected Convex row can briefly exist before the command relay has
-  // subscribed. Confirm live Centrifugo presence before automatically choosing
-  // a remote runner over a reconnecting embedded bridge.
+  // subscribed. Confirm live presence before presenting it as selectable.
   useEffect(() => {
     if (!remotePresenceRequest.enabled) return;
 
@@ -259,17 +291,10 @@ export function SandboxSelector({
   useEffect(() => {
     if ((!isFreeUser && !cloudSandboxDisabled) || !connections?.length) return;
 
-    const firstRemote = shouldVerifyRemotePresence
-      ? onlineRemoteConnectionIds
-        ? liveRemoteConnections[0]
-        : undefined
-      : remoteConnections[0];
     const preferredLocal =
       desktopConnection && desktopIsSelectable
         ? environmentPreference(desktopConnection)
-        : firstRemote
-          ? environmentPreference(firstRemote)
-          : undefined;
+        : undefined;
     if (!preferredLocal) return;
 
     if (value === "e2b") {
@@ -283,10 +308,6 @@ export function SandboxSelector({
     desktopConnection,
     desktopIsSelectable,
     isTauri,
-    shouldVerifyRemotePresence,
-    onlineRemoteConnectionIds,
-    liveRemoteConnections,
-    remoteConnections,
   ]);
 
   const selectedComputerLabel =
@@ -333,177 +354,116 @@ export function SandboxSelector({
     size === "md"
       ? "h-9 max-w-full px-3 gap-2 text-sm font-medium rounded-md bg-transparent hover:bg-muted/30 focus-visible:ring-1 min-w-0 shrink"
       : size === "toolbar"
-        ? "h-7 max-w-full px-2 gap-1 text-sm font-medium rounded-md bg-transparent hover:bg-muted/30 focus-visible:ring-1 min-w-0 shrink sm:max-w-64"
+        ? "h-7 max-w-full px-2 gap-1 text-sm font-medium rounded-md bg-transparent hover:bg-muted/30 focus-visible:ring-1 min-w-0 shrink sm:max-w-[min(100%,16rem)]"
         : "h-7 max-w-full px-2 gap-1 text-xs font-medium rounded-md bg-transparent hover:bg-muted/30 focus-visible:ring-1 min-w-0 shrink";
 
   const iconClassName = size === "md" ? "h-4 w-4 shrink-0" : "h-3 w-3 shrink-0";
 
+  // Explicit picks only. Automatic defaults above never open a confirmation.
+  const select = (option: ConnectionOption, preference = option.id) => {
+    setOpen(false);
+    if (confirmEnvironmentChange && option.id !== value) {
+      setPendingChange({ preference, label: option.label });
+      return;
+    }
+    onChange?.(preference);
+  };
+
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size={size === "md" ? "default" : "sm"}
-          disabled={disabled}
-          className={buttonClassName}
-          title={triggerLabel ?? selectedOption?.label}
-          aria-label={triggerLabel ?? selectedOption.label}
-        >
-          <Icon
-            aria-hidden="true"
-            className={`${iconClassName}${showReconnecting ? " animate-spin motion-reduce:animate-none" : ""}`}
-          />
-          <span className="min-w-0 flex-1 truncate text-left">
-            {triggerLabel ??
-              (compact ? compactLabel : selectedOption.shortLabel)}
-          </span>
-          <ChevronDown
-            className={
-              size === "md" ? "h-4 w-4 ml-1 shrink-0" : "h-3 w-3 ml-1 shrink-0"
-            }
-          />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-[240px] p-1" align="start">
-        <div className="space-y-0.5">
-          <button
-            key={cloudOption.id}
-            hidden={cloudSandboxDisabled}
-            onClick={() => {
-              if (isFreeUser) {
-                toast.info("Cloud sandbox requires a Pro plan", {
-                  description:
-                    "Use this computer or connect another computer for free, or upgrade to Pro for cloud access.",
-                });
-                return;
-              }
-              onChange?.(cloudOption.id);
-              setOpen(false);
-            }}
-            className={`w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors ${
-              isFreeUser
-                ? "opacity-60 cursor-not-allowed"
-                : value === cloudOption.id
-                  ? "bg-accent text-accent-foreground"
-                  : "hover:bg-muted"
-            }`}
+    <>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            ref={selectorTriggerRef}
+            type="button"
+            variant="ghost"
+            size={size === "md" ? "default" : "sm"}
+            disabled={disabled}
+            className={`${buttonClassName} ${className ?? ""}`}
+            title={triggerLabel ?? selectedOption?.label}
+            aria-label={triggerLabel ?? selectedOption.label}
           >
-            <Cloud className="h-4 w-4 shrink-0" />
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium truncate">
-                {cloudOption.label}
+            <Icon
+              aria-hidden="true"
+              className={`${iconClassName}${showReconnecting ? " animate-spin motion-reduce:animate-none" : ""}`}
+            />
+            <span className="min-w-0 flex-1 truncate text-left">
+              {triggerLabel ??
+                (compact ? compactLabel : selectedOption.shortLabel)}
+            </span>
+            <ChevronDown
+              className={
+                size === "md"
+                  ? "h-4 w-4 ml-1 shrink-0"
+                  : "h-3 w-3 ml-1 shrink-0"
+              }
+            />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          className="w-[240px] p-1 data-[state=closed]:hidden"
+          align={menuAlign}
+        >
+          <div className="space-y-0.5">
+            <button
+              key={cloudOption.id}
+              hidden={cloudSandboxDisabled}
+              onClick={() => {
+                if (isFreeUser) {
+                  toast.info("Cloud sandbox requires a Pro plan", {
+                    description:
+                      "Use this computer or connect another computer for free, or upgrade to Pro for cloud access.",
+                  });
+                  return;
+                }
+                select(cloudOption);
+              }}
+              className={`w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors ${
+                isFreeUser
+                  ? "opacity-60 cursor-not-allowed"
+                  : value === cloudOption.id
+                    ? "bg-accent text-accent-foreground"
+                    : "hover:bg-muted"
+              }`}
+            >
+              <Cloud className="h-4 w-4 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium truncate">
+                  {cloudOption.label}
+                </div>
               </div>
-            </div>
-            {isFreeUser ? (
-              <span className="text-[10px] font-semibold bg-primary/10 text-primary px-1.5 py-0.5 rounded">
-                Pro
-              </span>
-            ) : (
-              value === cloudOption.id && <Check className="h-4 w-4 shrink-0" />
-            )}
-          </button>
+              {isFreeUser ? (
+                <span className="text-[10px] font-semibold bg-primary/10 text-primary px-1.5 py-0.5 rounded">
+                  Pro
+                </span>
+              ) : (
+                value === cloudOption.id && (
+                  <Check className="h-4 w-4 shrink-0" />
+                )
+              )}
+            </button>
 
-          {desktopOptions.map((option) => {
-            const OptionIcon = option.icon;
-            return (
-              <button
-                key={option.id}
-                disabled={option.disabled}
-                onClick={() => {
-                  if (option.disabled) return;
-                  onChange?.(
-                    option.id === "desktop" && desktopConnection
-                      ? environmentPreference(desktopConnection)
-                      : option.id,
-                  );
-                  setOpen(false);
-                }}
-                className={`w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors ${
-                  option.disabled
-                    ? "opacity-60 cursor-not-allowed"
-                    : value === option.id
-                      ? "bg-accent text-accent-foreground"
-                      : "hover:bg-muted"
-                }`}
-              >
-                <OptionIcon className="h-4 w-4 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">
-                    {option.label}
-                  </div>
-                </div>
-                {value === option.id && <Check className="h-4 w-4 shrink-0" />}
-              </button>
-            );
-          })}
-
-          {!isTauri && desktopOptions.length === 0 && (
-            <Popover open={connectHovered} onOpenChange={setConnectHovered}>
-              <PopoverTrigger asChild>
-                <button
-                  onMouseEnter={() => setConnectHovered(true)}
-                  onMouseLeave={() => setConnectHovered(false)}
-                  className="w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors hover:bg-muted"
-                >
-                  <Monitor className="h-4 w-4 shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium truncate">
-                      Connect My Computer
-                    </div>
-                  </div>
-                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                </button>
-              </PopoverTrigger>
-              <PopoverContent
-                side="top"
-                sideOffset={8}
-                className="w-[240px] p-4"
-                onMouseEnter={() => setConnectHovered(true)}
-                onMouseLeave={() => setConnectHovered(false)}
-              >
-                <div className="flex items-center justify-center rounded-md border bg-gradient-to-b from-muted/50 to-muted py-5 mb-3">
-                  <Monitor className="h-10 w-10 text-muted-foreground/70" />
-                </div>
-                <h4 className="text-sm font-semibold mb-1">My Computer</h4>
-                <p className="text-xs text-muted-foreground mb-3">
-                  Download the desktop app to grant HackerAI access to your
-                  computer.
-                </p>
-                <Button asChild size="sm" className="w-full">
-                  <a
-                    href={
-                      detectedPlatform?.platform === "unknown"
-                        ? "/download"
-                        : detectedPlatform?.downloadUrl || "/download"
-                    }
-                  >
-                    {detectedPlatform && detectedPlatform.platform !== "unknown"
-                      ? `Download for ${detectedPlatform.displayName}`
-                      : "Download desktop"}
-                  </a>
-                </Button>
-              </PopoverContent>
-            </Popover>
-          )}
-
-          <div className="border-t mt-1 pt-1">
-            <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">
-              Remote control
-            </div>
-            {remoteOptions.map((option) => {
+            {desktopOptions.map((option) => {
               const OptionIcon = option.icon;
               return (
                 <button
                   key={option.id}
+                  disabled={option.disabled}
                   onClick={() => {
-                    onChange?.(option.id);
-                    setOpen(false);
+                    if (option.disabled) return;
+                    select(
+                      option,
+                      option.id === "desktop" && desktopConnection
+                        ? environmentPreference(desktopConnection)
+                        : option.id,
+                    );
                   }}
                   className={`w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors ${
-                    value === option.id
-                      ? "bg-accent text-accent-foreground"
-                      : "hover:bg-muted"
+                    option.disabled
+                      ? "opacity-60 cursor-not-allowed"
+                      : value === option.id
+                        ? "bg-accent text-accent-foreground"
+                        : "hover:bg-muted"
                   }`}
                 >
                   <OptionIcon className="h-4 w-4 shrink-0" />
@@ -518,19 +478,155 @@ export function SandboxSelector({
                 </button>
               );
             })}
-            <button
-              onClick={() => {
-                setOpen(false);
-                openSettingsDialog("Remote Control");
-              }}
-              className="w-full flex items-center gap-2.5 p-2 rounded-md text-left text-sm hover:bg-muted transition-colors"
-            >
-              <Plus className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <span className="flex-1">Add remote control</span>
-            </button>
+
+            {!isTauri && desktopOptions.length === 0 && (
+              <Popover open={connectHovered} onOpenChange={setConnectHovered}>
+                <PopoverTrigger asChild>
+                  <button
+                    onMouseEnter={() => setConnectHovered(true)}
+                    onMouseLeave={() => setConnectHovered(false)}
+                    className="w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors hover:bg-muted"
+                  >
+                    <Monitor className="h-4 w-4 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">
+                        Connect My Computer
+                      </div>
+                    </div>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="top"
+                  sideOffset={8}
+                  className="w-[240px] p-4"
+                  onMouseEnter={() => setConnectHovered(true)}
+                  onMouseLeave={() => setConnectHovered(false)}
+                >
+                  <div className="flex items-center justify-center rounded-md border bg-gradient-to-b from-muted/50 to-muted py-5 mb-3">
+                    <Monitor className="h-10 w-10 text-muted-foreground/70" />
+                  </div>
+                  <h4 className="text-sm font-semibold mb-1">My Computer</h4>
+                  <p className="text-xs text-muted-foreground mb-3">
+                    Download the desktop app to grant HackerAI access to your
+                    computer.
+                  </p>
+                  <Button asChild size="sm" className="w-full">
+                    <a
+                      href={
+                        detectedPlatform?.platform === "unknown"
+                          ? "/download"
+                          : detectedPlatform?.downloadUrl || "/download"
+                      }
+                    >
+                      {detectedPlatform &&
+                      detectedPlatform.platform !== "unknown"
+                        ? `Download for ${detectedPlatform.displayName}`
+                        : "Download desktop"}
+                    </a>
+                  </Button>
+                </PopoverContent>
+              </Popover>
+            )}
+
+            <div className="border-t mt-1 pt-1">
+              <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">
+                Remote control
+              </div>
+              {remoteOptions.map((option) => {
+                const OptionIcon = option.icon;
+                return (
+                  <button
+                    key={option.id}
+                    onClick={() => select(option)}
+                    className={`w-full flex items-center gap-2.5 p-2 rounded-md text-left transition-colors ${
+                      value === option.id
+                        ? "bg-accent text-accent-foreground"
+                        : "hover:bg-muted"
+                    }`}
+                  >
+                    <OptionIcon className="h-4 w-4 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">
+                        {option.label}
+                      </div>
+                    </div>
+                    {value === option.id && (
+                      <Check className="h-4 w-4 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  openSettingsDialog("Remote Control");
+                }}
+                className="w-full flex items-center gap-2.5 p-2 rounded-md text-left text-sm hover:bg-muted transition-colors"
+              >
+                <Plus className="h-4 w-4 shrink-0 text-muted-foreground" />
+                <span className="flex-1">Add remote control</span>
+              </button>
+            </div>
           </div>
-        </div>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      </Popover>
+      <AlertDialog
+        open={pendingChange !== null}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setPendingChange(null);
+        }}
+      >
+        <AlertDialogContent
+          className="gap-5"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            selectorTriggerRef.current?.focus();
+          }}
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle className="break-words">
+              Switch this chat to {pendingChange?.label}?
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="grid gap-4 text-left sm:grid-cols-2">
+                <div>
+                  <p className="text-xs font-medium">Comes with this chat</p>
+                  <ul className="mt-1.5 space-y-1 text-foreground">
+                    <li>Saved conversation</li>
+                    <li>Your instructions</li>
+                  </ul>
+                </div>
+                <div>
+                  <p className="text-xs font-medium">Stays behind</p>
+                  <ul className="mt-1.5 space-y-1 text-foreground">
+                    <li>Files in the current environment</li>
+                    <li>Running processes</li>
+                    <li>Browser sign-ins</li>
+                  </ul>
+                </div>
+                <p className="sm:col-span-2">
+                  Past approvals do not carry over. Agent permissions reset to
+                  Ask for approval. Check access and task scope before resuming.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (!pendingChange) return;
+                onChange?.(pendingChange.preference);
+                setAgentPermissionMode("ask_approval");
+                setPendingChange(null);
+              }}
+            >
+              Switch environment
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }

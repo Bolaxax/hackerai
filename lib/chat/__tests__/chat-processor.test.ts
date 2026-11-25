@@ -1,5 +1,7 @@
+import { getIncompleteToolErrorText } from "../tool-abort-utils";
 import { describe, it, expect } from "@jest/globals";
 import { UIMessage } from "ai";
+import { DEEPSEEK_1017_MODEL_KEY } from "@/lib/experiments/paid-deepseek-1017";
 import {
   limitImageParts,
   selectModel,
@@ -215,7 +217,7 @@ describe("selectModel", () => {
   );
 
   describe.each(paidPlans)("%s Agent routing", (subscription) => {
-    it("uses native GLM Flash for Standard and DeepSeek V4.1 Flash for Pro with all attachments", () => {
+    it("uses native DeepSeek Flash for Standard and Pro with all attachments", () => {
       for (const [hasImage, hasPdf] of attachments) {
         for (const options of [
           {},
@@ -231,7 +233,7 @@ describe("selectModel", () => {
               hasPdf,
               options,
             ),
-          ).toBe("model-glm-5.3-flash-agent");
+          ).toBe(DEEPSEEK_1017_MODEL_KEY);
           expect(
             selectModel(
               "agent",
@@ -241,7 +243,7 @@ describe("selectModel", () => {
               hasPdf,
               options,
             ),
-          ).toBe("model-deepseek-v4-flash-vision-pro");
+          ).toBe(DEEPSEEK_1017_MODEL_KEY);
         }
       }
     });
@@ -299,11 +301,7 @@ describe("selectModel", () => {
                 },
               ),
             ).toBe(
-              !maxAllowed
-                ? "model-deepseek-v4-flash-vision-pro"
-                : hasImage
-                  ? "model-grok-4.6"
-                  : "model-glm-5.3",
+              maxAllowed ? "model-kimi-k3.1-pro" : DEEPSEEK_1017_MODEL_KEY,
             );
           }
           expect(
@@ -320,8 +318,8 @@ describe("selectModel", () => {
             ),
           ).toBe(
             subscription === "ultra" || extraUsageAvailable
-              ? "model-glm-5.3"
-              : "model-deepseek-v4-flash-vision-pro",
+              ? "model-kimi-k3.1-pro"
+              : DEEPSEEK_1017_MODEL_KEY,
           );
         }
       }
@@ -628,4 +626,10 @@ describe("fixIncompleteMessageParts", () => {
     expect(result[0].type).toBe("step-start");
     expect(result[1].type).toBe("text");
   });
+});
+
+test("local connection interruption does not claim the command was canceled", () => {
+  expect(getIncompleteToolErrorText("local-connection-lost")).toContain(
+    "outcome is unknown",
+  );
 });

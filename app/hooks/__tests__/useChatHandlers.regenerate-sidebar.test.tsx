@@ -5,6 +5,7 @@ import type { ChatMessage, SidebarContent } from "@/types";
 const mockRegenerate = jest.fn();
 const mockSetMessages = jest.fn();
 const mockOpenSidebar = jest.fn();
+const mockSetSidebarContent = jest.fn();
 const mockCloseSidebar = jest.fn();
 let mockSidebarOpen = false;
 let mockSidebarContent: SidebarContent | null = null;
@@ -13,10 +14,13 @@ jest.mock("convex/react", () => ({
   useMutation: () => jest.fn(async () => undefined),
 }));
 
+const mockUploadedFiles: never[] = [];
+
 jest.mock("@/app/contexts/GlobalState", () => ({
   useGlobalState: () => ({
     getInput: () => "",
-    uploadedFiles: [],
+    uploadedFiles: mockUploadedFiles,
+    getUploadedFiles: () => mockUploadedFiles,
     chatMode: "ask",
     clearInput: jest.fn(),
     clearUploadedFiles: jest.fn(),
@@ -34,6 +38,7 @@ jest.mock("@/app/contexts/GlobalState", () => ({
     sidebarOpen: mockSidebarOpen,
     sidebarContent: mockSidebarContent,
     openSidebar: mockOpenSidebar,
+    setSidebarContent: mockSetSidebarContent,
     closeSidebar: mockCloseSidebar,
   }),
 }));
@@ -73,20 +78,26 @@ const fileToolMessage = (
   ],
 });
 
-const renderHandlers = (messages: ChatMessage[]) =>
-  renderHook(() =>
-    useChatHandlers({
-      chatId: "chat-1",
-      messages,
-      sendMessage: jest.fn(),
-      stop: jest.fn(),
-      regenerate: mockRegenerate,
-      setMessages: mockSetMessages,
-      isExistingChat: false,
-      status: "ready",
-      isSendingNowRef: { current: false },
-      hasManuallyStoppedRef: { current: false },
-    }),
+const renderHandlers = (
+  messages: ChatMessage[],
+  computerTabsEnabled?: boolean,
+) =>
+  renderHook(
+    (props?: { tabs?: boolean }) =>
+      useChatHandlers({
+        chatId: "chat-1",
+        messages,
+        sendMessage: jest.fn(),
+        stop: jest.fn(),
+        regenerate: mockRegenerate,
+        setMessages: mockSetMessages,
+        isExistingChat: false,
+        status: "ready",
+        isSendingNowRef: { current: false },
+        hasManuallyStoppedRef: { current: false },
+        computerTabsEnabled: props?.tabs,
+      }),
+    { initialProps: { tabs: computerTabsEnabled } },
   );
 
 describe("useChatHandlers regeneration sidebar reconciliation", () => {
@@ -119,12 +130,13 @@ describe("useChatHandlers regeneration sidebar reconciliation", () => {
       await regenerateFromRenderedMessage();
     });
 
-    expect(mockOpenSidebar).toHaveBeenCalledWith(
+    expect(mockSetSidebarContent).toHaveBeenCalledWith(
       expect.objectContaining({
         toolCallId: "tool-previous",
         content: "previous output",
       }),
     );
+    expect(mockOpenSidebar).not.toHaveBeenCalled();
     expect(mockCloseSidebar).not.toHaveBeenCalled();
   });
 
@@ -147,6 +159,106 @@ describe("useChatHandlers regeneration sidebar reconciliation", () => {
     });
 
     expect(mockCloseSidebar).toHaveBeenCalledTimes(1);
+    expect(mockSetSidebarContent).not.toHaveBeenCalled();
+    expect(mockOpenSidebar).not.toHaveBeenCalled();
+  });
+
+  it("keeps tabbed Computer open and clears only the deleted Activity entry", async () => {
+    const messages = [
+      userMessage("user-1", "Question"),
+      fileToolMessage("assistant-1", "tool-removed", "removed output"),
+    ];
+    mockSidebarOpen = true;
+    mockSidebarContent = {
+      path: "/tmp/result.txt",
+      content: "removed output",
+      action: "reading",
+      toolCallId: "tool-removed",
+    };
+    // The rendered Regenerate button can hold a handler from before tabs resolved.
+    const { result, rerender } = renderHandlers(messages, false);
+    const regenerateFromRenderedMessage = result.current.handleRegenerate;
+    rerender({ tabs: true });
+
+    await act(async () => {
+      await regenerateFromRenderedMessage();
+    });
+
+    expect(mockSetSidebarContent).toHaveBeenCalledTimes(1);
+    expect(mockSetSidebarContent).toHaveBeenCalledWith(null);
+    expect(mockCloseSidebar).not.toHaveBeenCalled();
+    expect(mockOpenSidebar).not.toHaveBeenCalled();
+  });
+
+  it.each(["handleRetry", "handleEditMessage"] as const)(
+    "%s clears a discarded output before starting the replacement response",
+    async (action) => {
+      const messages = [
+        userMessage("user-1", "Question"),
+        fileToolMessage("assistant-1", "tool-removed", "removed output"),
+      ];
+      mockSidebarOpen = true;
+      mockSidebarContent = {
+        path: "/tmp/result.txt",
+        content: "removed output",
+        action: "reading",
+        toolCallId: "tool-removed",
+      };
+      const { result } = renderHandlers(messages);
+
+      await act(async () => {
+        if (action === "handleEditMessage") {
+          await result.current.handleEditMessage("user-1", "Edited question");
+        } else {
+          await result.current.handleRetry();
+        }
+      });
+
+      expect(mockCloseSidebar).toHaveBeenCalledTimes(1);
+      expect(mockCloseSidebar.mock.invocationCallOrder[0]).toBeLessThan(
+        mockRegenerate.mock.invocationCallOrder[0],
+      );
+    },
+  );
+
+  it("keeps a surviving selection even when a newer tool survives", async () => {
+    const messages = [
+      userMessage("user-1", "First question"),
+      fileToolMessage("assistant-1", "tool-selected", "selected output"),
+      fileToolMessage("assistant-2", "tool-newer", "newer output"),
+      userMessage("user-2", "Second question"),
+      fileToolMessage("assistant-3", "tool-removed", "removed output"),
+    ];
+    mockSidebarOpen = true;
+    mockSidebarContent = {
+      path: "/tmp/result.txt",
+      content: "selected output",
+      action: "reading",
+      toolCallId: "tool-selected",
+    };
+    const { result } = renderHandlers(messages);
+
+    await act(async () => {
+      await result.current.handleRegenerate();
+    });
+
+    expect(mockCloseSidebar).not.toHaveBeenCalled();
+    expect(mockOpenSidebar).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen a closed sidebar", async () => {
+    const { result } = renderHandlers([
+      userMessage("user-1", "First question"),
+      fileToolMessage("assistant-1", "tool-previous", "previous output"),
+      userMessage("user-2", "Second question"),
+      fileToolMessage("assistant-2", "tool-removed", "removed output"),
+    ]);
+
+    await act(async () => {
+      await result.current.handleRegenerate();
+    });
+
+    expect(mockCloseSidebar).not.toHaveBeenCalled();
     expect(mockOpenSidebar).not.toHaveBeenCalled();
   });
 });

@@ -2,6 +2,7 @@ import "server-only";
 
 import type { UIMessageStreamWriter } from "ai";
 import type {
+  ChatMode,
   ExtraUsageConfig,
   RateLimitInfo,
   SubscriptionTier,
@@ -37,6 +38,12 @@ export interface BudgetSnapshot {
   extraUsageMonthlyRemainingAtStart?: number;
   capReasonOnExhaustion?: LimitCapReason;
   extraUsageOverflowAllowed?: boolean;
+  /**
+   * Set when this budget is a paid user's daily free allowance. Threshold
+   * warnings then update the allowance banner shown at stream start instead
+   * of a generic usage banner that does not say which limit it is.
+   */
+  paidDailyFreeAllowance?: { mode: ChatMode };
 }
 
 export type BudgetBillingStopReason =
@@ -113,6 +120,7 @@ export function captureBudgetSnapshot(args: {
 export class BudgetMonitor {
   private highestThresholdEmitted: number;
   private hasEmittedAgentRunSpendCap = false;
+  private lastUsedPercent: number | undefined;
 
   constructor(
     private readonly snapshot: BudgetSnapshot,
@@ -178,6 +186,7 @@ export class BudgetMonitor {
       usedSinceStartPoints;
     const usedPercent =
       (projectedUsedPoints / snapshot.monthlyLimitPoints) * 100;
+    this.lastUsedPercent = usedPercent;
 
     let abortDetails: BudgetAbortDetails | null = null;
 
@@ -250,6 +259,28 @@ export class BudgetMonitor {
       : { type: "continue" };
   }
 
+  /**
+   * Projected usage percent after the latest checked step, only when reaching
+   * 100% would stop this run. Extra usage that can absorb overflow continues
+   * the run, so it reports no stop pressure.
+   */
+  getStopPressurePercent(): number | undefined {
+    return this.extraUsageCanAbsorbOverflow()
+      ? undefined
+      : this.lastUsedPercent;
+  }
+
+  private extraUsageCanAbsorbOverflow(): boolean {
+    const remaining = this.snapshot.extraUsageMonthlyRemainingAtStart;
+    return (
+      this.snapshot.extraUsageOverflowAllowed !== false &&
+      this.snapshot.extraUsageEnabledAtStart &&
+      (this.snapshot.extraUsageAutoReload ||
+        this.snapshot.extraUsageBalanceAtStart > 0) &&
+      (remaining === undefined || remaining > 0)
+    );
+  }
+
   private buildAbortDetails(args: {
     capReason: LimitCapReason;
     overflowDollars: number;
@@ -261,13 +292,7 @@ export class BudgetMonitor {
       this.snapshot.monthlyRemainingAtStart / POINTS_PER_DOLLAR;
     const extraUsageMonthlyRemainingDollars =
       this.snapshot.extraUsageMonthlyRemainingAtStart;
-    const extraUsageAvailable =
-      this.snapshot.extraUsageOverflowAllowed !== false &&
-      this.snapshot.extraUsageEnabledAtStart &&
-      (this.snapshot.extraUsageAutoReload ||
-        this.snapshot.extraUsageBalanceAtStart > 0) &&
-      (extraUsageMonthlyRemainingDollars === undefined ||
-        extraUsageMonthlyRemainingDollars > 0);
+    const extraUsageAvailable = this.extraUsageCanAbsorbOverflow();
 
     return {
       capReason: args.capReason,
@@ -329,6 +354,23 @@ export class BudgetMonitor {
     cutOff?: boolean;
     capReason?: LimitCapReason;
   }): void {
+    const allowance = this.snapshot.paidDailyFreeAllowance;
+    // The cut-off keeps the token-bucket warning: it drives blocked-chat
+    // billing recovery and its cap reason already names this allowance.
+    if (allowance && !args.cutOff) {
+      writeRateLimitWarning(this.writer, {
+        warningType: "paid-daily-free-allowance",
+        resetTime: this.snapshot.monthlyResetTime.toISOString(),
+        subscription: this.subscription,
+        mode: allowance.mode,
+        costLimitDollars: this.snapshot.monthlyLimitPoints / POINTS_PER_DOLLAR,
+        usedDollars:
+          Math.round((args.projectedUsedPoints / POINTS_PER_DOLLAR) * 100) /
+          100,
+        midStream: true,
+      });
+      return;
+    }
     const ctx: TokenBucketEmitContext = {
       bucketType: this.snapshot.budgetPeriod ?? "monthly",
       usedPercent: args.usedPercent,

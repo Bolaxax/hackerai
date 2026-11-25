@@ -1,5 +1,6 @@
 import { createCloudNetworkPrompt } from "@/lib/cloud-network/prompt";
 import { BrowserSessions } from "./utils/browser-sessions";
+import { createBrowserHandoff } from "./browser-handoff";
 import { DefaultSandboxManager } from "./utils/sandbox-manager";
 import {
   HybridSandboxManager,
@@ -9,7 +10,7 @@ import { TodoManager } from "./utils/todo-manager";
 import { createRunTerminalCmd } from "./run-terminal-cmd";
 import { createInteractTerminalSession } from "./interact-terminal-session";
 import { createGetTerminalFiles } from "./get-terminal-files";
-import { createFile } from "./file";
+import { createFile, createFileEdit, createFileWrite } from "./file";
 import { createWebSearch } from "./web-search";
 import { createOpenUrlTool } from "./open-url";
 import { createTodoWrite } from "./todo-write";
@@ -18,6 +19,7 @@ import {
   createListNotes,
   createUpdateNote,
   createDeleteNote,
+  createGetNote,
 } from "./notes";
 import {
   createCreateVulnerabilityReport,
@@ -25,6 +27,17 @@ import {
   createGetReport,
   createUpdateVulnerabilityReport,
 } from "./findings";
+import {
+  createCompleteFindingRetest,
+  createGetFindingRetests,
+  createStartFindingRetest,
+} from "./finding-retests";
+import {
+  createCompleteFindingHunt,
+  createGetFindingHunts,
+  createRecordFindingHuntCandidate,
+  createStartFindingHunt,
+} from "./finding-hunts";
 // match tool removed — usage analytics showed it wasn't being used enough to justify
 // the added complexity. The agent should use run_terminal_cmd with rg instead.
 // import { createMatch } from "./match";
@@ -83,6 +96,21 @@ export type CreateToolsRuntimePolicy = {
   triggerRegion?: TriggerRunRegion;
   environment?: string;
   keepE2BLeaseAliveForRun?: boolean;
+  browserAgentId?: string;
+  onBrowserOwnershipLost?: () => void;
+  /** Parent Agent runs only: stop after an abandoned handoff was committed.
+   * Omitting it keeps an uncontrolled handoff holding the run. */
+  onBrowserHandoffAbandoned?: () => void;
+  /** Expose Agent retest history tools only when the caller has already
+   * evaluated the finding retest rollout for this user. The tools re-check
+   * the flag and fail closed on every call. */
+  findingRetestToolsEnabled?: boolean;
+  /** notes_relevant_recall_v1 decision for this request: compact list_notes,
+   * target/observation metadata and get_note. Off keeps the legacy tools. */
+  notesRelevantRecallEnabled?: boolean;
+  /** Expose variant hunt tools only when the caller already evaluated the
+   * hunt rollout for this user. Starting a hunt re-checks the flag. */
+  findingHuntToolsEnabled?: boolean;
 };
 
 export type SandboxSessionUsage = {
@@ -121,6 +149,7 @@ export const createTools = (
   auxiliaryVision?: ToolContext["auxiliaryVision"],
   runtimePolicy: CreateToolsRuntimePolicy = {},
 ) => {
+  const notesRecall = runtimePolicy.notesRelevantRecallEnabled === true;
   let sandbox: AnySandbox | null = null;
   let sandboxCostSegmentStartedAt: number | null = null;
   let sandboxCostProvider: CloudSandboxProvider | null = null;
@@ -129,6 +158,9 @@ export const createTools = (
   let sandboxBootInfo: SandboxBootInfo | null = null;
   let lastE2BSandbox: Sandbox | null = null;
   let runLeaseHeartbeat: E2BSandboxLeaseHeartbeat | null = null;
+  // Set by run-end cleanup. A slow acquisition that publishes afterwards (for
+  // example the turn-start background inventory) must not keep a lease alive.
+  let runLeaseClosed = false;
   let currentModelName = modelName;
   let sandboxOperationQueue: Promise<void> = Promise.resolve();
   let pendingSandbox: Promise<AnySandbox> | null = null;
@@ -166,7 +198,11 @@ export const createTools = (
     const provider = getCloudSandboxProviderForInstance(newSandbox);
     if (isE2BSandbox(newSandbox)) {
       lastE2BSandbox = newSandbox;
-      if (runtimePolicy.keepE2BLeaseAliveForRun && !runLeaseHeartbeat) {
+      if (runLeaseClosed) {
+        // Let the late client's sandbox auto-pause instead of holding the
+        // acquisition lease; the run has already released its own.
+        void releaseE2BSandboxIdleLeaseBestEffort(newSandbox);
+      } else if (runtimePolicy.keepE2BLeaseAliveForRun && !runLeaseHeartbeat) {
         runLeaseHeartbeat = startE2BSandboxLeaseHeartbeat(
           () => lastE2BSandbox,
           "run_heartbeat",
@@ -261,7 +297,22 @@ export const createTools = (
     triggerRunId,
   });
 
-  const browserSessions = triggerRunId ? new BrowserSessions() : undefined;
+  const browserSessions = triggerRunId
+    ? new BrowserSessions(
+        serviceKey
+          ? {
+              userId: userID,
+              chatId,
+              runId: triggerRunId,
+              agentId: runtimePolicy.browserAgentId ?? "parent",
+              triggerRegion: runtimePolicy.triggerRegion,
+              serviceKey,
+            }
+          : undefined,
+        runtimePolicy.onBrowserOwnershipLost,
+        runtimePolicy.onBrowserHandoffAbandoned,
+      )
+    : undefined;
   const context: ToolContext = {
     browserSessions,
     sandboxManager,
@@ -298,10 +349,18 @@ export const createTools = (
     // one-time object so model-specific tool schemas can be rebuilt for
     // provider fallback legs.
     const allTools = {
+      ...(browserSessions && {
+        browser_handoff: createBrowserHandoff(
+          browserSessions,
+          runtimePolicy.signal,
+        ),
+      }),
       run_terminal_cmd: createRunTerminalCmd(context),
       interact_terminal_session: createInteractTerminalSession(context),
       get_terminal_files: createGetTerminalFiles(context),
       file: createFile(context),
+      file_edit: createFileEdit(context),
+      file_write: createFileWrite(context),
       todo_write: createTodoWrite(context),
       create_vulnerability_report: createCreateVulnerabilityReport(
         context,
@@ -313,11 +372,32 @@ export const createTools = (
         context,
         () => sandbox,
       ),
+      ...(runtimePolicy.findingRetestToolsEnabled && {
+        get_finding_retests: createGetFindingRetests(context),
+        start_finding_retest: createStartFindingRetest(context),
+        complete_finding_retest: createCompleteFindingRetest(
+          context,
+          () => sandbox,
+        ),
+      }),
+      ...(runtimePolicy.findingHuntToolsEnabled && {
+        get_finding_hunts: createGetFindingHunts(context),
+        start_finding_hunt: createStartFindingHunt(context),
+        record_finding_hunt_candidate: createRecordFindingHuntCandidate(
+          context,
+          () => sandbox,
+        ),
+        complete_finding_hunt: createCompleteFindingHunt(
+          context,
+          () => sandbox,
+        ),
+      }),
       ...(notesEnabled && {
-        create_note: createCreateNote(context),
-        list_notes: createListNotes(context),
-        update_note: createUpdateNote(context),
+        create_note: createCreateNote(context, notesRecall),
+        list_notes: createListNotes(context, notesRecall),
+        update_note: createUpdateNote(context, notesRecall),
         delete_note: createDeleteNote(context),
+        ...(notesRecall && { get_note: createGetNote(context) }),
       }),
       ...(process.env.PERPLEXITY_API_KEY && {
         web_search: createWebSearch(context),
@@ -328,10 +408,14 @@ export const createTools = (
       ...(runtimePolicy.additionalTools?.(context) ?? {}),
     };
 
+    const guardedTools = browserSessions
+      ? browserSessions.guardTools(allTools, runtimePolicy.signal)
+      : allTools;
+
     if (runtimePolicy.allowedToolNames) {
       const allowed = new Set(runtimePolicy.allowedToolNames);
       return Object.fromEntries(
-        Object.entries(allTools).filter(([name]) => allowed.has(name)),
+        Object.entries(guardedTools).filter(([name]) => allowed.has(name)),
       ) as ToolSet;
     }
 
@@ -343,6 +427,7 @@ export const createTools = (
             list_notes: allTools.list_notes,
             update_note: allTools.update_note,
             delete_note: allTools.delete_note,
+            ...(notesRecall && { get_note: allTools.get_note }),
           }),
           ...(process.env.PERPLEXITY_API_KEY && {
             web_search: createWebSearch(context),
@@ -351,7 +436,7 @@ export const createTools = (
             open_url: createOpenUrlTool(context),
           }),
         }
-      : allTools;
+      : guardedTools;
   };
 
   const tools = buildTools();
@@ -442,6 +527,7 @@ export const createTools = (
   };
 
   const stopE2BSandboxRunLeaseHeartbeat = async (): Promise<void> => {
+    runLeaseClosed = true;
     const heartbeat = runLeaseHeartbeat;
     runLeaseHeartbeat = null;
     await heartbeat?.stop();
@@ -454,6 +540,15 @@ export const createTools = (
         isAgentMode(mode) && sandboxManager.getEffectivePreference() === "e2b",
     ),
     tools,
+    canRecoverBrowserHandoff: (signal?: AbortSignal) =>
+      browserSessions?.canRecoverHumanHandoff(signal ?? runtimePolicy.signal) ??
+      Promise.resolve(false),
+    waitForBrowserHandoff: (signal?: AbortSignal) =>
+      browserSessions?.waitForAgentControl(signal ?? runtimePolicy.signal) ??
+      Promise.resolve(false),
+    getBrowserHandoffNotes: () =>
+      browserSessions?.getExitNotes(runtimePolicy.signal) ??
+      Promise.resolve([]),
     cleanupBrowserSessions: () =>
       browserSessions?.cleanup() ?? Promise.resolve(),
     getSandbox,

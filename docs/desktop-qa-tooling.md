@@ -12,6 +12,61 @@ web-only work to avoid competing local builds. For a local frontend, build once
 before acceptance, using the existing documented build workflow. This runner
 never builds or launches development watchers automatically.
 
+## Pull request builds
+
+Relevant PRs compile and package the actual release-mode Desktop app on Windows
+x64, macOS arm64/x64, and Linux arm64/x64. Download the `desktop-pr-*` artifacts
+from **Desktop PR Builds** for inspection within seven days. They are unsigned
+validation builds; Apple notarization, release signing, and updater publication
+are verified by the release pipeline.
+
+These artifacts retain the production frontend, app identifier, and updater
+configuration. Launching them can connect to Production or interact with an
+installed HackerAI app. Use them for package inspection only; for local or
+Preview acceptance, follow the [isolated-build runbook](desktop-local-acceptance.md).
+
+The required **Desktop PR builds** check reports on every PR targeting `main`. Unrelated PRs skip
+platform builds while still completing the gate; a failed applicable package
+blocks the gate. **Run workflow** can build any branch manually as well.
+
+## Check the frontend origin before building
+
+Choose the loopback frontend origin before building the native QA app. Write a
+plan under `.artifacts/desktop-qa/` and run the origin doctor. It needs no app
+executable, environment, launch record or session, and contacts no provider.
+
+```json
+{
+  "frontend": "http://127.0.0.1:3100",
+  "callbackPaths": ["/callback"],
+  "developmentCallbackUrls": ["http://127.0.0.1:3100/callback"],
+  "developmentUploadOrigins": ["http://127.0.0.1:3100"]
+}
+```
+
+```bash
+corepack pnpm desktop:qa doctor origin .artifacts/desktop-qa/origin-plan.json
+```
+
+`callbackPaths` lists the auth callback paths the build needs. The optional
+lists are the complete loopback callback URLs and upload origins you verified in
+the Development configuration, copied in canonical form without wildcards,
+queries or credentials. Omit a list you did not verify; an empty list means none
+are registered. The doctor prints only the selected origin and fixed statuses:
+
+- `port`: `available` after a short exclusive bind and close on the host and
+  port `serve` would use, `occupied` if that address is in use, or `unverified`
+  for any other result.
+- `callback`: `allowed` only if each `frontend` plus path exactly matches a
+  listed scheme, host, port and path; otherwise `missing`.
+- `upload-origin`: `allowed` for an exact origin match; otherwise `rejected`.
+
+An omitted list reports `unverified`. Exit status is `0` for READY, `2` for
+BLOCKED (any negative status) or UNVERIFIED, and `1` for invalid input, which is
+never echoed. Membership is only as current as the lists you supplied, and port
+availability is point-in-time. `localhost`, `127.0.0.1` and `[::1]` are distinct
+origins; build, serve and register the same one.
+
 ## Prepare a launch record
 
 Create `.artifacts/desktop-qa/config.json` in the task's worktree. It contains
@@ -31,7 +86,7 @@ only independently verified, non-secret identity metadata. For example:
     "project": "proj_example",
     "environment": "development",
     "branch": "desktop-qa-task",
-    "version": "unverified"
+    "version": "REPLACE_WITH_CURRENT_WORKER_VERSION"
   },
   "relay": "ws://127.0.0.1:8000",
   "app": {
@@ -47,7 +102,8 @@ Use the actual executable path from your build, not the example filename. Obtain
 its hash with `shasum -a 256 '<executable-path>'`; record the source commit and
 embedded app version from the build, not merely the current checkout. The runner
 checks the hash and resolves symlinks to enforce worktree containment. It does not
-prove that operator-supplied source/version/environment labels are accurate.
+attest the native source/version labels; backend and worker targets are checked
+separately below.
 Never relabel an old native binary as the new commit. If reusing a build artifact,
 copy only the task-owned build, never installed dependencies or runtime secrets.
 
@@ -56,14 +112,94 @@ explicit window URL, distinct QA identifier and disabled updater. Changing this
 JSON does **not** change the binary's frontend or permissions. Verify the actual
 loaded URL with Computer Use after launch.
 
-For native tests against Preview, use `environment: "preview"`, the exact
-HTTPS Vercel deployment origin and `worker.environment: "preview"`. Independently
-verify the designated HackerAI Developer Convex account/project/deployment and
-matching Trigger Preview before writing the record. The runner cannot infer
-that mapping from hostnames or the word Preview. It deliberately makes no cloud
-health requests and cannot bypass deployment protection. Production is excluded
+The launcher accepts only a loopback frontend (`localhost`, `127.0.0.1` or
+`[::1]`) in every environment. A hosted Vercel deployment, including an exact
+Preview URL, can open Vercel deployment protection inside the native WebView
+instead of the app, so the runner rejects it before checking the executable or
+creating a session. Hosted Vercel Preview remains the right target for web-only
+browser QA.
+
+For native tests against Preview services, use `environment: "preview"`, a
+locally built loopback frontend configured for those services, and
+`worker.environment: "preview"`. `serve` can run that frontend; it still binds
+only to loopback. Independently verify the designated HackerAI Developer Convex account/project/deployment and
+matching Trigger Preview before writing the record. Use the Convex team slug for
+`backend.account` and project slug for `backend.project`. The verifier compares
+them with the authenticated control plane, rejects production-labeled deployments,
+checks the registered deployment URL and live instance name, and checks the
+branch-selected Trigger worker version. It cannot infer the authorized account
+boundary from hostnames or the word Preview and cannot bypass deployment protection. Production is excluded
 from the launcher; an explicitly authorized Production UI task uses the installed
 app directly.
+
+## Preflight and result reuse
+
+Choose web or native based on the behavior you need to verify.
+
+```bash
+# Web-only work: prints the Vercel Preview route. Reads no files, starts nothing.
+corepack pnpm desktop:qa preflight web
+
+# Windows QA from a host: prints manual VM ownership/sign-in guidance only.
+# It never launches, pauses or signs in to a VM, and a running VM is not proof
+# of availability. Run preflight native inside the guest for guest-local checks;
+# start/serve remain macOS/Linux only.
+corepack pnpm desktop:qa preflight windows-vm
+
+# Native: one bounded case name per acceptance check.
+corepack pnpm desktop:qa preflight native .artifacts/desktop-qa/config.json chat-sandbox
+```
+
+`preflight native` starts with the executable hash and containment, the dependency
+guard, the loopback frontend HEAD probe and the loopback backend and relay
+listeners. The first local blocker stops it before any provider control-plane
+request. It then runs the same target verification as `verify`; a missing or
+mismatched target is BLOCKED. Exit status is `0` for READY, `2` for BLOCKED and
+`1` for invalid input or another command failure. It always lists the checks it
+cannot infer: QA window and lock state, the actual native account, and the
+worker run/Desktop transport. A TCP listener is not browser, WebView or relay auth.
+
+Add a `reuse` field to the launch record if you have verified build or
+deployment identities for all three services.
+
+```json
+{
+  "reuse": {
+    "frontend": "REPLACE_WITH_64_HEX_FRONTEND_REVISION_FINGERPRINT",
+    "backend": "REPLACE_WITH_64_HEX_BACKEND_REVISION_FINGERPRINT",
+    "relay": "REPLACE_WITH_64_HEX_RELAY_REVISION_FINGERPRINT",
+    "profile": "qa-synthetic"
+  }
+}
+```
+
+Use the existing SHA-256 for each artifact, or calculate it from the verified,
+non-secret build or deployment identifier. Refresh these values if the active
+build or deployment changes. Use a synthetic lowercase slug for `profile`.
+With `reuse`, a clean checkout and `.next/BUILD_ID`, a
+READY preflight prints a fingerprint over the normalized config, case, verified
+executable hash, checkout commit, host name, platform/arch/OS release, build-ID
+hash and those revisions. Otherwise it prints why reuse is unavailable.
+
+After running the case, use the fingerprint printed by preflight to record the
+result. If preflight did not print one, put the outcome in the QA handoff.
+
+```bash
+corepack pnpm desktop:qa record-result .artifacts/desktop-qa/config.json chat-sandbox pass <fingerprint>
+```
+
+`record-result` accepts `pass`, `fail` or `blocked`. It recomputes the identity
+locally, without provider requests, and refuses a mismatch. It atomically
+replaces one owner-only file per case under `.artifacts/desktop-qa/.receipts/`.
+A later READY preflight for the same case shows the prior PASS only when the
+fingerprint matches; the latest FAIL/BLOCKED, another case, or any identity
+change requires a fresh run. If a local service is offline, preflight can cite a
+matching historical pass while still reporting BLOCKED. If the checkout or
+frontend build changes during fingerprinting, it reports BLOCKED and asks
+you to rerun preflight. Before relying
+on a saved result for a current native session, confirm the QA window and
+signed-in account. Collect a new observation when the check requires fresh
+evidence.
 
 ## Launch, inspect and stop
 
@@ -72,6 +208,10 @@ Start the backend, worker and relay through the acceptance runbook. Keep their
 ownership records; this runner does not adopt them or read their credentials.
 
 ```bash
+# Provide existing approved control-plane tokens through protected environment
+# provisioning: TRIGGER_ACCESS_TOKEN, plus CONVEX_ACCESS_TOKEN for Preview.
+# Never put token values in shell arguments or this launch record.
+corepack pnpm desktop:qa verify .artifacts/desktop-qa/config.json
 corepack pnpm desktop:qa doctor .artifacts/desktop-qa/config.json
 
 # Optional, only after this worktree has a completed .next/BUILD_ID.
@@ -104,7 +244,8 @@ the supervisor, which would prevent cleanup. Processes that intentionally daemon
 or escape the owned process group require separate ownership and cleanup; the
 runner is designed for the foreground native executable and `next start`.
 
-`serve` binds the configured loopback host and port. A busy port causes failure;
+`serve` requires an HTTP URL and binds the configured loopback host and port.
+A busy port causes failure;
 it never stops the existing server. The recorded Next build-ID hash identifies
 which prebuilt output was launched, but does not attest its source commit or
 build-time public environment. Verify those from the build record before reuse.
@@ -114,7 +255,7 @@ build-time public environment. Verify those from the build record before reuse.
 Files stay under the worktree's ignored `.artifacts/desktop-qa/<session>/`:
 
 - `identity.json`: checkout commit, declared native source/version, verified
-  executable hash, declared backend/worker/relay identities, host and load.
+  executable hash, declared identities, verified backend/worker targets, host and load.
 - `status.json`: supervisor lifecycle and heartbeat. A stale heartbeat means
   unknown, not stopped or healthy.
 - `events.jsonl`: allowlisted process start/exit/stop events. Child stdout/stderr
@@ -124,12 +265,17 @@ Files stay under the worktree's ignored `.artifacts/desktop-qa/<session>/`:
 - `observations.jsonl`: bounded run ID, status and sandbox transport explicitly
   recorded by the operator after inspection. No automatic backend verification
   or application-content capture is implied.
+- `.receipts/<case>.json`: the latest operator-observed outcome and fingerprint
+  for one case, written by `record-result`.
 
 The local frontend check sends a bounded, unauthenticated HEAD request without
 following redirects or recording response bodies/headers. Backend and relay
 checks only establish a local TCP listener; worker readiness, auth, native bridge
-connectivity and actual run routing still need acceptance evidence. External
-origins are labeled not probed. Diagnose application errors through authorized
+connectivity and actual run routing still need acceptance evidence. The `health` report leaves external origins unprobed; the separate target
+verifier performs bounded read-only requests without redirects. Control-plane tokens are removed from launched child environments. `doctor <config.json>`, `start` and
+`serve` require target verification and reject mismatches before launching.
+Verification does not prove the native frontend, the worker's runtime backend
+configuration, or the route used by an actual Agent run; retain that acceptance check. Diagnose application errors through authorized
 service tools and record only safe correlation IDs, not raw customer content.
 
 These files have owner-only permissions. They are local developer artifacts;
@@ -153,8 +299,9 @@ local full run. Avoid overlapping tests with builds, and investigate contention
 instead of increasing test timeouts or retrying the full suite repeatedly.
 
 Run `corepack pnpm test:desktop-qa` for containment/hash checks, environment and
-credential rejection, bounded health probes, output privacy, process ownership
-and shutdown escalation. Tests use disposable local processes and listeners.
+credential rejection, bounded health probes, output privacy, process ownership,
+shutdown escalation, preflight ordering, origin planning and result reuse.
+Tests use disposable local processes and listeners.
 For manual native validation, launch a verified QA build, inspect the exact
 window with Computer Use, record the actual transport/run, stop the session and
 confirm the QA process exits while unrelated apps/services remain running.

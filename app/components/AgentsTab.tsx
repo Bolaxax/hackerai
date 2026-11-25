@@ -13,11 +13,14 @@ import { useGlobalState } from "@/app/contexts/GlobalState";
 import type { QueueBehavior } from "@/types/chat";
 import { SandboxSelector } from "@/app/components/SandboxSelector";
 import { AgentPermissionSelector } from "@/app/components/AgentPermissionSelector";
+import { AgentInputNotificationSetting } from "@/app/components/AgentInputNotificationSetting";
+import { KeepAwakeSetting } from "@/app/components/KeepAwakeSetting";
 
 const AgentsTab = () => {
   const {
     queueBehavior,
     setQueueBehavior,
+    agentSteeringEnabled,
     subscription,
     sandboxPreference,
     setSandboxPreference,
@@ -27,6 +30,9 @@ const AgentsTab = () => {
     value: QueueBehavior;
     label: string;
   }> = [
+    ...(agentSteeringEnabled
+      ? [{ value: "steer" as const, label: "Steer the current run" }]
+      : []),
     {
       value: "queue",
       label: "Queue after current message",
@@ -73,6 +79,10 @@ const AgentsTab = () => {
         </div>
       </div>
 
+      <AgentInputNotificationSetting />
+
+      <KeepAwakeSetting />
+
       {subscription !== "free" && <CloudNetworkSettings />}
 
       {/* Queue Messages - Only show for Pro/Ultra/Team users */}
@@ -80,10 +90,13 @@ const AgentsTab = () => {
         <div className="space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between py-3 border-b gap-3">
             <div className="flex-1">
-              <div className="font-medium">Queue Messages</div>
+              <div className="font-medium">
+                {agentSteeringEnabled ? "Follow-up Messages" : "Queue Messages"}
+              </div>
               <div className="text-sm text-muted-foreground">
-                Adjust the default behavior of sending a message while Agent is
-                streaming
+                {agentSteeringEnabled
+                  ? "What sending does while Agent is working. Steering adds your message before its next step. Press ⌘/Ctrl+Enter to queue instead of steer, or steer instead of queue."
+                  : "Adjust the default behavior of sending a message while Agent is streaming"}
               </div>
             </div>
             <Select

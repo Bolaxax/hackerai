@@ -1,6 +1,15 @@
 import "@testing-library/jest-dom";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import {
+  render,
+  screen,
+  waitFor,
+  fireEvent,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+
+let mockIsMobile: boolean | undefined = false;
+jest.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => mockIsMobile }));
 
 const mockGlobalState = {
   subscription: "free",
@@ -15,6 +24,7 @@ const mockGlobalState = {
     | undefined,
   desktopBridgeStatus: "connecting",
   desktopEnvironmentId: undefined as string | undefined,
+  setAgentPermissionMode: jest.fn(),
 };
 let mockPresenceConnections: Array<{
   connectionId: string;
@@ -41,6 +51,43 @@ const { SandboxSelector } =
   require("../SandboxSelector") as typeof import("../SandboxSelector");
 
 describe("SandboxSelector", () => {
+  it("keeps routine cloud selection free of workspace management", () => {
+    mockGlobalState.subscription = "pro";
+    const onChange = jest.fn();
+    render(<SandboxSelector value="e2b" onChange={onChange} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cloud" }));
+
+    expect(
+      screen.queryByRole("button", { name: "Manage workspaces" }),
+    ).not.toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalledWith(
+      "/api/sandbox/workspaces?manage=1",
+      expect.any(Object),
+    );
+
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Cloud" }),
+    );
+    expect(onChange).toHaveBeenCalledWith("e2b");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+  it.each([true, false])(
+    "closes the menu when the mobile layout changes from %s",
+    async (mobile) => {
+      mockIsMobile = mobile;
+      const { rerender } = render(<SandboxSelector value="e2b" />);
+      fireEvent.click(screen.getByRole("button", { name: "Cloud" }));
+      expect(screen.getByRole("dialog")).toBeVisible();
+      mockIsMobile = !mobile;
+      rerender(<SandboxSelector value="e2b" />);
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Cloud" }));
+      expect(screen.getByRole("dialog")).toBeVisible();
+    },
+  );
+
   it("keeps its trigger within constrained mobile toolbars", () => {
     render(<SandboxSelector value="desktop" />);
 
@@ -52,10 +99,12 @@ describe("SandboxSelector", () => {
   });
 
   beforeEach(() => {
+    mockIsMobile = false;
     mockGlobalState.subscription = "free";
     mockGlobalState.localConnections = [];
     mockGlobalState.desktopBridgeStatus = "connecting";
     mockGlobalState.desktopEnvironmentId = undefined;
+    mockGlobalState.setAgentPermissionMode.mockClear();
     mockPresenceConnections = [];
     global.fetch = jest.fn().mockImplementation(async () => ({
       ok: true,
@@ -79,7 +128,7 @@ describe("SandboxSelector", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows one option per environment after a replacement session connects", () => {
+  it("shows separate exact CLI sessions despite matching claimed machine IDs", () => {
     mockGlobalState.desktopBridgeStatus = "connected";
     mockGlobalState.localConnections = [
       {
@@ -101,10 +150,21 @@ describe("SandboxSelector", () => {
         name: "Other",
       },
     ];
-    render(<SandboxSelector value="environment:same-computer" />);
-    fireEvent.click(screen.getByRole("button", { name: "Kali" }));
-    expect(screen.getAllByRole("button", { name: "Kali" })).toHaveLength(2);
-    expect(screen.getByRole("button", { name: "Other" })).toBeInTheDocument();
+    render(<SandboxSelector value="old-session" />);
+    fireEvent.click(screen.getByRole("button", { name: "Kali (old-sess)" }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Kali (old-sess)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Kali (new-sess)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Other (other-se)" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps the selected computer label neutral while connections hydrate", () => {
@@ -182,13 +242,14 @@ describe("SandboxSelector", () => {
 
     render(<SandboxSelector value="remote-office-pc" size="toolbar" />);
 
-    expect(screen.getByRole("button", { name: hostname })).toHaveClass(
+    const label = `${hostname} (remote-o)`;
+    expect(screen.getByRole("button", { name: label })).toHaveClass(
       "max-w-full",
-      "sm:max-w-64",
+      "sm:max-w-[min(100%,16rem)]",
       "min-w-0",
     );
-    expect(screen.getByTitle(hostname)).toBeInTheDocument();
-    expect(screen.getByText(hostname)).toHaveClass(
+    expect(screen.getByTitle(label)).toBeInTheDocument();
+    expect(screen.getByText(label)).toHaveClass(
       "min-w-0",
       "flex-1",
       "truncate",
@@ -251,6 +312,112 @@ describe("SandboxSelector", () => {
     },
   );
 
+  describe("moving a chat with messages to another environment", () => {
+    const remoteKali = {
+      connectionId: "remote-kali",
+      isDesktop: false,
+      name: "Kali VM",
+      osInfo: { hostname: "4p3x" },
+    };
+    const openMenuAndPick = (trigger: RegExp | string, option: string) => {
+      fireEvent.click(screen.getByRole("button", { name: trigger }));
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: option,
+        }),
+      );
+    };
+
+    beforeEach(() => {
+      mockGlobalState.subscription = "pro";
+      mockGlobalState.desktopBridgeStatus = "connected";
+      mockGlobalState.localConnections = [remoteKali];
+    });
+
+    it("keeps the selection, permissions, and keyboard position when the move is cancelled", async () => {
+      const onChange = jest.fn();
+      render(
+        <SandboxSelector
+          value="remote-kali"
+          onChange={onChange}
+          confirmEnvironmentChange
+        />,
+      );
+      openMenuAndPick("4p3x (remote-k)", "Cloud");
+
+      const confirm = screen.getByRole("alertdialog", {
+        name: "Switch this chat to Cloud?",
+      });
+      expect(confirm).toHaveTextContent(
+        /Saved conversation.*Your instructions/,
+      );
+      expect(confirm).toHaveTextContent(
+        /Files in the current environment.*Running processes.*Browser sign-ins/,
+      );
+      expect(onChange).not.toHaveBeenCalled();
+
+      fireEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
+      await waitFor(() =>
+        expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+      );
+      expect(onChange).not.toHaveBeenCalled();
+      expect(mockGlobalState.setAgentPermissionMode).not.toHaveBeenCalled();
+      expect(
+        screen.getByRole("button", { name: "4p3x (remote-k)" }),
+      ).toHaveFocus();
+    });
+
+    it("switches once and resets permissions to Ask for approval after confirming", () => {
+      const onChange = jest.fn();
+      render(
+        <SandboxSelector
+          value="remote-kali"
+          onChange={onChange}
+          confirmEnvironmentChange
+        />,
+      );
+      openMenuAndPick("4p3x (remote-k)", "Cloud");
+      fireEvent.click(
+        within(screen.getByRole("alertdialog")).getByRole("button", {
+          name: "Switch environment",
+        }),
+      );
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith("e2b");
+      expect(mockGlobalState.setAgentPermissionMode).toHaveBeenCalledWith(
+        "ask_approval",
+      );
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    });
+
+    it("reselects the current environment without asking", () => {
+      const onChange = jest.fn();
+      render(
+        <SandboxSelector
+          value="remote-kali"
+          onChange={onChange}
+          confirmEnvironmentChange
+        />,
+      );
+      openMenuAndPick("4p3x (remote-k)", "4p3x (remote-k)");
+
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(onChange).toHaveBeenCalledWith("remote-kali");
+      expect(mockGlobalState.setAgentPermissionMode).not.toHaveBeenCalled();
+    });
+
+    it("changes directly without confirmation outside a chat with messages", () => {
+      const onChange = jest.fn();
+      render(<SandboxSelector value="remote-kali" onChange={onChange} />);
+      openMenuAndPick("4p3x (remote-k)", "Cloud");
+
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(onChange).toHaveBeenCalledWith("e2b");
+      expect(mockGlobalState.setAgentPermissionMode).not.toHaveBeenCalled();
+    });
+  });
+
   it("does not select a remote runner without live relay presence", async () => {
     const onChange = jest.fn();
     mockGlobalState.localConnections = [
@@ -291,7 +458,7 @@ describe("SandboxSelector", () => {
     await waitFor(() => expect(onChange).not.toHaveBeenCalled());
   });
 
-  it("selects a computer and hides Cloud when the cloud sandbox is disabled", async () => {
+  it("lists computers and hides Cloud when the cloud sandbox is disabled", async () => {
     process.env.NEXT_PUBLIC_DISABLE_CLOUD_SANDBOX = "true";
     try {
       const onChange = jest.fn();
@@ -308,16 +475,14 @@ describe("SandboxSelector", () => {
 
       render(<SandboxSelector value="e2b" onChange={onChange} />);
 
-      await waitFor(() =>
-        expect(onChange).toHaveBeenCalledWith("environment:kali", {
-          remember: false,
-        }),
-      );
+      // Upstream only auto-selects this machine's Desktop app; a remote
+      // runner is chosen by the user, never silently replaced by Cloud.
+      expect(onChange).not.toHaveBeenCalledWith("e2b", expect.anything());
       fireEvent.click(
         screen.getByRole("button", { name: "Choose a computer" }),
       );
       expect(
-        await screen.findByRole("button", { name: "Kali VM" }),
+        await screen.findByRole("button", { name: /kali/i }),
       ).toBeInTheDocument();
       expect(
         screen.queryByRole("button", { name: "Cloud" }),

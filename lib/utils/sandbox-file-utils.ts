@@ -1,6 +1,18 @@
 import "server-only";
 
 import {
+  CURL_PROGRESS_WRITE_OUT,
+  copyAttachmentDownloadFailureContext,
+  recordAttachmentDownloadDnsFallback,
+  recordAttachmentDownloadFailure,
+  recordAttachmentDownloadRoute,
+  type AttachmentDownloadDnsFallback,
+  type AttachmentDownloadRoute,
+  getAttachmentDownloadFailureContext,
+  type AttachmentDownloadFailureContext,
+} from "@/lib/ai/tools/utils/attachment-download-diagnostics";
+
+import {
   CloudAcquisitionBudgetExhaustedError,
   CloudAcquisitionTimeoutError,
   isCloudAcquisitionBudgetSpent,
@@ -13,19 +25,37 @@ import {
   sampleAttachmentFailureMetrics,
 } from "./sandbox-upload-readiness";
 import { probeSandboxUploadWrite } from "./sandbox-upload-diagnostics";
+import {
+  CLOUD_SANDBOX_UPLOAD_ROOT,
+  LOCAL_SANDBOX_UPLOAD_ROOT,
+} from "./sandbox-upload-paths";
+import { reserveCloudUploadFallbackPath } from "./cloud-upload-path-recovery";
+import { resolveCloudAttachmentDnsPin } from "./cloud-attachment-dns";
 import { abortableDelay as delay } from "./abortable-delay";
 import {
   runAttachmentCommand,
   throwIfAttachmentAborted,
   AttachmentCommandCleanupError,
+  AttachmentLocalCopySetupDeadlineError,
+  getAttachmentCommandFailureContext,
+  copyAttachmentCommandFailureContext,
+  type AttachmentCommandFailureContext,
 } from "@/lib/ai/tools/utils/attachment-command";
+import {
+  copyLocalCopyFailureContext,
+  getLocalCopyFailureContext,
+  type LocalCopyFailureContext,
+} from "@/lib/ai/tools/utils/local-copy-failure-context";
 
 import { createHash, randomUUID } from "node:crypto";
 import { UIMessage } from "ai";
 import type { SandboxPreference, SandboxReadinessFailureReason } from "@/types";
 import { validateDownloadUrl } from "@/lib/ai/tools/utils/path-validation";
 import { classifySandboxReadinessFailureSignal } from "@/lib/ai/tools/utils/sandbox-readiness-failure";
-import { getSandboxLogFields } from "@/lib/ai/tools/utils/sandbox-types";
+import {
+  getSandboxLogFields,
+  isE2BSandbox,
+} from "@/lib/ai/tools/utils/sandbox-types";
 import { recordGroupedSpikeAlert } from "@/lib/observability/grouped-spike-alert";
 import { phLogger } from "@/lib/posthog/server";
 
@@ -60,6 +90,7 @@ export type SandboxUploadFailureReason =
   | "local_file_prepare_failed"
   | "windows_command_syntax"
   | "attachment_client_unavailable"
+  | "attachment_client_not_executable"
   | "attachment_dns_failure"
   | "attachment_resource_exhausted"
   | "sandbox_placement_failure"
@@ -77,7 +108,54 @@ type SandboxCommandResult = {
   stderr: string;
   exitCode: number;
   error?: string;
+  stderrFromErrorMessage?: true;
+  exitCodeFromErrorMessage?: true;
+  /** The SDK supplied no stdout string; `stdout` is only a placeholder. */
+  stdoutUnreported?: true;
 };
+
+type LocalCopyFailureReason =
+  | "permission_denied"
+  | "path_missing"
+  | "same_file"
+  | "destination_invalid"
+  | "disk_full"
+  | "unclassified";
+
+// Combined fallback errors retain both messages for existing reporting, but
+// terminal diagnostics describe the last attempt only.
+const finalLocalCopyReasons = new WeakMap<Error, LocalCopyFailureReason>();
+const finalUrlTransferReasons = new WeakMap<
+  Error,
+  SandboxUploadFailureReason
+>();
+
+// Diagnostic only: do not change retries or forward local paths/stderr.
+const classifyLocalCopyFailure = (error: unknown): LocalCopyFailureReason => {
+  const finalReason =
+    error instanceof Error ? finalLocalCopyReasons.get(error) : undefined;
+  if (finalReason) return finalReason;
+  const message = errorMessage(error);
+  if (
+    /permission denied|operation not permitted|access is denied|read-only file system/i.test(
+      message,
+    )
+  )
+    return "permission_denied";
+  if (/are identical|are the same file/i.test(message)) return "same_file";
+  if (/no space left on device|disk quota exceeded/i.test(message))
+    return "disk_full";
+  if (/not a directory|is a directory/i.test(message))
+    return "destination_invalid";
+  if (
+    /no such file or directory|cannot stat|cannot find the file/i.test(message)
+  )
+    return "path_missing";
+  return "unclassified";
+};
+
+type SandboxUploadReadinessProbeReason =
+  SandboxReadinessFailureReason | "process_start_missing_path";
 
 type SandboxUploadFailureDetail = {
   kind: SandboxFile["kind"];
@@ -85,9 +163,13 @@ type SandboxUploadFailureDetail = {
   error: string;
   exitCode: number | null;
   reason: SandboxUploadFailureReason;
+  localCopyFailureReason?: LocalCopyFailureReason;
   transientSandboxCommand: boolean;
   sandboxReadinessReason: SandboxReadinessFailureReason;
-  readinessProbeReason?: SandboxReadinessFailureReason;
+  readinessProbeReason?: SandboxUploadReadinessProbeReason;
+  commandFailureContext?: AttachmentCommandFailureContext;
+  downloadFailureContext?: AttachmentDownloadFailureContext;
+  localCopyFailureContext?: LocalCopyFailureContext;
   sandboxProvider?: "e2b";
   errorName?: string;
   acquisitionStage?: CloudAcquisitionStage;
@@ -110,6 +192,10 @@ type EnsureSandboxForUpload = (options?: SandboxRefreshOptions) => Promise<any>;
 
 type UploadSandboxFilesOptions = {
   signal?: AbortSignal;
+  /** Absolute epoch ms shared by every local copy's read-only setup in this
+   * call, including fallbacks; never reset per file or attempt. A copy whose
+   * write already started is not interrupted. */
+  localCopySetupDeadlineAt?: number;
   retryAfterReconnectOnTransientFailure?: boolean | (() => boolean);
   logContext?: {
     service: "agent-long" | "chat-handler" | "hackerai-web";
@@ -151,12 +237,17 @@ const logLocalAttachmentDebug = (
   console.info(`[local-attachments] ${event}`, data);
 };
 
-const extractCommandExitCode = (error: unknown): number | null => {
-  if (typeof error === "object" && error !== null) {
-    const maybeExitCode = (error as { exitCode?: unknown }).exitCode;
-    if (typeof maybeExitCode === "number") return maybeExitCode;
-  }
+const readReportedCommandExitCode = (error: unknown): number | null => {
+  if (typeof error !== "object" || error === null) return null;
+  const exitCode = (error as { exitCode?: unknown }).exitCode;
+  return typeof exitCode === "number" ? exitCode : null;
+};
 
+const extractCommandExitCode = (
+  error: unknown,
+  reportedExitCode = readReportedCommandExitCode(error),
+): number | null => {
+  if (reportedExitCode !== null) return reportedExitCode;
   const message = error instanceof Error ? error.message : String(error);
   const match =
     message.match(/\b(?:exit status|exitCode:|curl exit)\s*(\d+)\b/i) ??
@@ -167,7 +258,8 @@ const extractCommandExitCode = (error: unknown): number | null => {
 };
 
 const commandErrorToResult = (error: unknown): SandboxCommandResult | null => {
-  const exitCode = extractCommandExitCode(error);
+  const reportedExitCode = readReportedCommandExitCode(error);
+  const exitCode = extractCommandExitCode(error, reportedExitCode);
   if (exitCode === null) return null;
 
   const commandError =
@@ -175,16 +267,22 @@ const commandErrorToResult = (error: unknown): SandboxCommandResult | null => {
       ? (error as { stdout?: unknown; stderr?: unknown })
       : {};
   const message = error instanceof Error ? error.message : String(error);
+  const stdout = commandError.stdout;
+  const stderr = commandError.stderr;
+  const hasReportedStdout = typeof stdout === "string";
+  const hasReportedStderr = typeof stderr === "string" && stderr.length > 0;
 
-  return {
-    stdout: typeof commandError.stdout === "string" ? commandError.stdout : "",
-    stderr:
-      typeof commandError.stderr === "string" && commandError.stderr
-        ? commandError.stderr
-        : message,
+  return copyAttachmentCommandFailureContext(error, {
+    stdout: hasReportedStdout ? stdout : "",
+    stderr: hasReportedStderr ? stderr : message,
     exitCode,
     error: message,
-  };
+    ...(!hasReportedStderr && { stderrFromErrorMessage: true as const }),
+    ...(!hasReportedStdout && { stdoutUnreported: true as const }),
+    ...(reportedExitCode === null && {
+      exitCodeFromErrorMessage: true as const,
+    }),
+  });
 };
 
 const TRANSIENT_SANDBOX_COMMAND_ERROR_PATTERN =
@@ -222,11 +320,31 @@ const classifySandboxUploadReadinessFailure = (
 ): SandboxReadinessFailureReason =>
   classifySandboxReadinessFailureSignal(error) ?? "unknown";
 
+// Diagnostic only: acquisition/retry policy keeps the shared classification.
+const classifySandboxUploadReadinessProbeFailure = (
+  error: unknown,
+): SandboxUploadReadinessProbeReason => {
+  const reason = classifySandboxUploadReadinessFailure(error);
+  if (reason !== "unknown") return reason;
+  const message = errorMessage(error);
+  return message.startsWith("[invalid_argument] error starting process ") &&
+    message.includes(": open ") &&
+    message.endsWith(": no such file or directory") &&
+    !/[\r\n]/.test(message)
+    ? "process_start_missing_path"
+    : "unknown";
+};
+
 const classifySandboxUploadFailureReason = (
   file: SandboxFile,
   error: unknown,
   sandboxReadinessReason: SandboxReadinessFailureReason,
 ): SandboxUploadFailureReason => {
+  const finalReason =
+    file.kind === "url" && error instanceof Error
+      ? finalUrlTransferReasons.get(error)
+      : undefined;
+  if (finalReason) return finalReason;
   const message = errorMessage(error);
 
   if (LOCAL_COMMAND_NO_RESPONSE_PATTERN.test(message)) {
@@ -241,6 +359,13 @@ const classifySandboxUploadFailureReason = (
     )
   ) {
     return "attachment_client_unavailable";
+  }
+  if (
+    file.kind === "url" &&
+    extractCommandExitCode(error) === 127 &&
+    /\bcurl:\s*inaccessible or not found\b/i.test(message)
+  ) {
+    return "attachment_client_not_executable";
   }
   if (
     /getaddrinfo\(\) thread failed to start|cannot allocate memory|resource temporarily unavailable/i.test(
@@ -338,31 +463,39 @@ const runSandboxCommand = async (
   sandbox: any,
   command: string,
   signal?: AbortSignal,
+  options?: { timeoutMs: number },
+  maxAttempts = SANDBOX_COMMAND_MAX_ATTEMPTS,
 ): Promise<SandboxCommandResult> => {
-  for (let attempt = 1; attempt <= SANDBOX_COMMAND_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       signal?.throwIfAborted();
-      const result = await runAttachmentCommand(sandbox, command, signal);
+      const result = await runAttachmentCommand(
+        sandbox,
+        command,
+        signal,
+        options,
+      );
       signal?.throwIfAborted();
+      const stdout = result?.stdout;
       return {
-        stdout: result?.stdout ?? "",
+        stdout: stdout ?? "",
         stderr: result?.stderr ?? "",
         exitCode: typeof result?.exitCode === "number" ? result.exitCode : 0,
+        ...(typeof stdout !== "string" && {
+          stdoutUnreported: true as const,
+        }),
       };
     } catch (error) {
       throwIfAttachmentAborted(signal, error);
       const commandResult = commandErrorToResult(error);
       if (commandResult) return commandResult;
 
-      if (
-        attempt === SANDBOX_COMMAND_MAX_ATTEMPTS ||
-        !isTransientSandboxCommandError(error)
-      ) {
+      if (attempt === maxAttempts || !isTransientSandboxCommandError(error)) {
         throw error;
       }
 
       console.warn(
-        `[sandbox-command] transient command channel failure on attempt ${attempt}/${SANDBOX_COMMAND_MAX_ATTEMPTS}, retrying: ${errorMessage(error)}`,
+        `[sandbox-command] transient command channel failure on attempt ${attempt}/${maxAttempts}, retrying: ${errorMessage(error)}`,
       );
       await delay(SANDBOX_COMMAND_RETRY_BASE_DELAY_MS * attempt, signal);
     }
@@ -371,16 +504,13 @@ const runSandboxCommand = async (
   throw new Error("Sandbox command failed without returning a result");
 };
 
-/**
- * E2B uses /home/user/upload; any local connection uses /tmp/hackerai-upload
- * since the host machine may not have /home/user (e.g. macOS in dangerous mode).
- */
+/** E2B uses the cloud upload root; any local connection uses the local root. */
 export const getUploadBasePath = (
   sandboxPreference: SandboxPreference | undefined,
 ): string =>
   sandboxPreference === "e2b" || !sandboxPreference
-    ? "/home/user/upload"
-    : "/tmp/hackerai-upload";
+    ? CLOUD_SANDBOX_UPLOAD_ROOT
+    : LOCAL_SANDBOX_UPLOAD_ROOT;
 
 const getLastUserMessageIndex = (messages: UIMessage[]): number => {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -739,6 +869,7 @@ export const recoverProviderVisibleImagesAfterSandboxUploadFailure = (
       user_id: options.userId,
       chat_id: options.chatId,
       failed_image_count: failedImageFiles.length,
+      ...failure?.downloadFailureContext,
       failure_reason: failure?.reason ?? "unknown",
       sandbox_readiness_reason: failure?.sandboxReadinessReason ?? "unknown",
       retried_after_reconnect: uploadResult.retriedAfterReconnect ?? false,
@@ -825,6 +956,62 @@ export const prepareLocalDesktopAttachmentsForTrigger = (
   return { messages: preparedMessages, sandboxFiles };
 };
 
+type ObservedCurlFailure = Parameters<
+  typeof recordAttachmentDownloadFailure
+>[1];
+
+/**
+ * A message-derived exit may preserve existing control flow without proving a
+ * process result. Only a confirmed E2B command exit is evidence, and only SDK
+ * stderr is evidence of what curl printed. Its own SDK stdout carries only the
+ * command's static progress marker, read by the diagnostic for exit 28 or 35.
+ */
+const observedCloudCurlFailure = (
+  sandbox: any,
+  result: SandboxCommandResult,
+): ObservedCurlFailure | undefined => {
+  try {
+    const commandFailure = getAttachmentCommandFailureContext(result);
+    const observedExit =
+      result.error === undefined ||
+      (commandFailure?.attachment_command_error_kind === "command_exit" &&
+        (commandFailure.attachment_command_stage === "foreground" ||
+          (commandFailure.attachment_command_stage === "wait" &&
+            commandFailure.attachment_command_exit_observed === true)));
+    if (
+      observedExit &&
+      !result.exitCodeFromErrorMessage &&
+      isE2BSandbox(sandbox) &&
+      Number.isInteger(result.exitCode) &&
+      result.exitCode > 0 &&
+      result.exitCode <= 255
+    ) {
+      return {
+        platform: "unknown",
+        shell: "bash",
+        httpClient: "curl",
+        exitCode: result.exitCode,
+        // The legacy error keeps its fallback text; it is not SDK stderr.
+        stderr: result.stderrFromErrorMessage ? "" : result.stderr,
+        ...(!result.stdoutUnreported && {
+          cloudCurlProgressStdout: result.stdout,
+        }),
+      };
+    }
+  } catch {
+    // An optional diagnostic must not replace the transfer failure.
+  }
+  return undefined;
+};
+
+/** curl exit 6, or exit 28 whose own wording names only name resolution. */
+const isNameResolutionFailure = (failure: ObservedCurlFailure): boolean =>
+  failure.exitCode === 6 ||
+  (failure.exitCode === 28 &&
+    getAttachmentDownloadFailureContext(
+      recordAttachmentDownloadFailure({}, failure),
+    )?.attachment_download_timeout_hint === "resolving");
+
 /**
  * Downloads a file from URL to sandbox path
  * Works with both E2B and CentrifugoSandbox
@@ -835,71 +1022,161 @@ const downloadFileToSandbox = async (
   localPath: string,
   signal?: AbortSignal,
 ): Promise<void> => {
-  signal?.throwIfAborted();
-  validateDownloadUrl(url);
-
-  // CentrifugoSandbox has downloadFromUrl method
-  if (sandbox.files?.downloadFromUrl) {
-    await sandbox.files.downloadFromUrl(
-      url,
-      localPath,
-      ...(signal ? [{ signal }] : []),
-    );
-    signal?.throwIfAborted();
-    return;
-  }
-
-  // E2B sandbox - use curl with --create-dirs to avoid a separate mkdir race
-  const escapedUrl = url.replace(/'/g, "'\\''");
-  const escapedLocalPath = localPath.replace(/'/g, "'\\''");
-
-  // Transient curl exit codes worth retrying at the JS layer as a safety net
-  // on top of curl's own --retry. Covers post-resume filesystem hiccups and
-  // flaky network recv:
-  //   6  = could not resolve host (DNS lag after sandbox resume)
-  //   7  = couldn't connect
-  //   18 = partial transfer
-  //   56 = failure receiving network data
-  // Write failures go straight to the writable-path fallback. Repeating the
-  // same destination cannot repair permissions or a full filesystem.
-  const TRANSIENT_CURL_EXIT_CODES = new Set([6, 7, 18, 56]);
-  const MAX_ATTEMPTS = 3;
-
-  const curlCmd =
-    `curl -fsSL --retry 3 --retry-connrefused --retry-delay 1 --create-dirs ` +
-    `-o '${escapedLocalPath}' '${escapedUrl}'`;
-
-  let result = await runSandboxCommand(sandbox, curlCmd, signal);
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    if (result.exitCode === 0) return;
-    if (
-      attempt === MAX_ATTEMPTS ||
-      !TRANSIENT_CURL_EXIT_CODES.has(result.exitCode)
-    ) {
-      break;
-    }
-    console.warn(
-      `[sandbox-download] curl exit ${result.exitCode} on attempt ${attempt}/${MAX_ATTEMPTS}, retrying`,
-    );
-    await delay(500 * attempt, signal);
-    result = await runSandboxCommand(sandbox, curlCmd, signal);
-  }
-
-  // Redact signed query params (e.g. S3 X-Amz-Signature) before logging.
-  let safeUrl = url;
+  let route: AttachmentDownloadRoute = "selection";
   try {
-    const parsed = new URL(url);
-    safeUrl = `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    safeUrl = url.split("?")[0];
-  }
+    signal?.throwIfAborted();
+    validateDownloadUrl(url);
 
-  throw new Error(
-    `Failed to download file: ${result.stderr}\n` +
-      `  url: ${safeUrl}\n` +
-      `  path: ${localPath}\n` +
-      `  exitCode: ${result.exitCode}`,
-  );
+    // CentrifugoSandbox has downloadFromUrl method
+    if (sandbox.files?.downloadFromUrl) {
+      route = "native_method";
+      await sandbox.files.downloadFromUrl(
+        url,
+        localPath,
+        ...(signal ? [{ signal }] : []),
+      );
+      signal?.throwIfAborted();
+      return;
+    }
+
+    route = "generic_command";
+    // E2B sandbox - use curl with --create-dirs to avoid a separate mkdir race
+    const escapedUrl = url.replace(/'/g, "'\\''");
+    const escapedLocalPath = localPath.replace(/'/g, "'\\''");
+
+    // Transient curl exit codes worth retrying at the JS layer as a safety net
+    // on top of curl's own --retry. Covers post-resume filesystem hiccups and
+    // flaky network recv:
+    //   6  = could not resolve host (DNS lag after sandbox resume)
+    //   7  = couldn't connect
+    //   18 = partial transfer
+    //   56 = failure receiving network data
+    // Write failures go straight to the writable-path fallback. Repeating the
+    // same destination cannot repair permissions or a full filesystem.
+    const TRANSIENT_CURL_EXIT_CODES = new Set([6, 7, 18, 56]);
+    const MAX_ATTEMPTS = 3;
+
+    // The body goes to -o, so stdout carries only each invocation's static
+    // progress marker, read only from its own observed failing result.
+    const buildCurlCommand = (dnsPin?: string) =>
+      `curl -fsSL --connect-timeout 10 --max-time 120 ` +
+      `--retry 3 --retry-max-time 120 --retry-connrefused --retry-delay 1 --create-dirs ` +
+      `-w ${shellQuote(CURL_PROGRESS_WRITE_OUT)} ` +
+      (dnsPin ? `--resolve ${shellQuote(dnsPin)} ` : "") +
+      `-o '${escapedLocalPath}' '${escapedUrl}'`;
+    const curlCmd = buildCurlCommand();
+
+    // --retry-max-time bounds when another attempt may start, not its duration.
+    // The last attempt can consume another --max-time. Keep the SDK stream open
+    // beyond both budgets so curl reports its exit instead of replaying a healthy
+    // slow transfer after the SDK's default 60-second timeout. Stop still kills
+    // only the owned command through runAttachmentCommand.
+    const commandOptions = { timeoutMs: 250_000 };
+    let result = await runSandboxCommand(
+      sandbox,
+      curlCmd,
+      signal,
+      commandOptions,
+    );
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (result.exitCode === 0) return;
+      if (
+        attempt === MAX_ATTEMPTS ||
+        !TRANSIENT_CURL_EXIT_CODES.has(result.exitCode)
+      ) {
+        break;
+      }
+      console.warn(
+        `[sandbox-download] curl exit ${result.exitCode} on attempt ${attempt}/${MAX_ATTEMPTS}, retrying`,
+      );
+      await delay(500 * attempt, signal);
+      result = await runSandboxCommand(
+        sandbox,
+        curlCmd,
+        signal,
+        commandOptions,
+      );
+    }
+
+    // The workspace could not resolve the host. When its egress is
+    // unrestricted, give curl one worker-resolved address for the same HTTPS
+    // request. Anything short of an observed result keeps the original failure.
+    const resolutionFailure = observedCloudCurlFailure(sandbox, result);
+    let dnsFallback: AttachmentDownloadDnsFallback | undefined;
+    if (resolutionFailure && isNameResolutionFailure(resolutionFailure)) {
+      const fallback: AttachmentDownloadDnsFallback = {
+        decision: "unavailable",
+        retryResult: "not_attempted",
+      };
+      dnsFallback = fallback;
+      let dnsPin: string | null = null;
+      try {
+        dnsPin = await resolveCloudAttachmentDnsPin(
+          sandbox,
+          url,
+          signal,
+          (decision, networkReason) => {
+            fallback.decision = decision;
+            fallback.networkReason = networkReason;
+          },
+        );
+      } catch (error) {
+        throwIfAttachmentAborted(signal, error);
+      }
+      signal?.throwIfAborted();
+      if (dnsPin) {
+        console.info(
+          "[sandbox-download] retrying once with a worker-resolved address",
+        );
+        let pinned: SandboxCommandResult | undefined;
+        try {
+          pinned = await runSandboxCommand(
+            sandbox,
+            buildCurlCommand(dnsPin),
+            signal,
+            commandOptions,
+            1,
+          );
+        } catch (error) {
+          throwIfAttachmentAborted(signal, error);
+          fallback.retryResult = "threw";
+        }
+        if (pinned?.exitCode === 0) return;
+        if (pinned && observedCloudCurlFailure(sandbox, pinned)) {
+          result = pinned;
+          fallback.retryResult = "nonzero";
+        } else if (pinned) fallback.retryResult = "unobserved";
+      }
+    }
+
+    // Redact signed query params (e.g. S3 X-Amz-Signature) before logging.
+    let safeUrl = url;
+    try {
+      const parsed = new URL(url);
+      safeUrl = `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      safeUrl = url.split("?")[0];
+    }
+
+    const error = copyAttachmentCommandFailureContext(
+      result,
+      new Error(
+        `Failed to download file: ${result.stderr}\n` +
+          `  url: ${safeUrl}\n` +
+          `  path: ${localPath}\n` +
+          `  exitCode: ${result.exitCode}`,
+      ),
+    );
+    const observedFailure = observedCloudCurlFailure(sandbox, result);
+    if (observedFailure) {
+      recordAttachmentDownloadFailure(error, observedFailure);
+      if (dnsFallback) recordAttachmentDownloadDnsFallback(error, dnsFallback);
+    }
+    throw error;
+  } catch (error) {
+    recordAttachmentDownloadRoute(error, route);
+    throw error;
+  }
 };
 
 const copyLocalFileToSandbox = async (
@@ -907,6 +1184,7 @@ const copyLocalFileToSandbox = async (
   sourcePath: string,
   localPath: string,
   signal?: AbortSignal,
+  setupDeadlineAt?: number,
 ): Promise<void> => {
   signal?.throwIfAborted();
   if (!sandbox.files?.copyLocal) {
@@ -918,7 +1196,11 @@ const copyLocalFileToSandbox = async (
   await sandbox.files.copyLocal(
     sourcePath,
     localPath,
-    ...(signal ? [{ signal }] : []),
+    ...(setupDeadlineAt !== undefined
+      ? [{ ...(signal && { signal }), setupDeadlineAt }]
+      : signal
+        ? [{ signal }]
+        : []),
   );
   signal?.throwIfAborted();
 };
@@ -927,8 +1209,8 @@ const shellQuote = (value: string): string =>
   `'${value.replace(/'/g, "'\\''")}'`;
 
 const UPLOAD_PATH_FALLBACK_PREFIXES = [
-  "/tmp/hackerai-upload/",
-  "/home/user/upload/",
+  `${LOCAL_SANDBOX_UPLOAD_ROOT}/`,
+  `${CLOUD_SANDBOX_UPLOAD_ROOT}/`,
 ];
 
 const UPLOAD_PATH_FALLBACK_ERROR_PATTERN =
@@ -1000,12 +1282,19 @@ const stageSandboxFile = async (
   stagingAttempt: "initial" | "reconnect_retry",
 ): Promise<SandboxFilePathRewrite | null> => {
   const signal = options?.signal;
+  const setupDeadlineAt = options?.localCopySetupDeadlineAt;
   signal?.throwIfAborted();
   try {
     if (file.kind === "url") {
       await downloadFileToSandbox(sandbox, file.url, file.localPath, signal);
     } else {
-      await copyLocalFileToSandbox(sandbox, file.path, file.localPath, signal);
+      await copyLocalFileToSandbox(
+        sandbox,
+        file.path,
+        file.localPath,
+        signal,
+        setupDeadlineAt,
+      );
     }
     return null;
   } catch (error) {
@@ -1013,7 +1302,6 @@ const stageSandboxFile = async (
     if (!shouldTryUploadPathFallback(file.localPath, error)) {
       throw error;
     }
-
     const sandboxFields = getSandboxLogFields(sandbox);
     const diagnostics =
       sandboxFields.sandbox_provider === "e2b" && probeBudget.remaining-- > 0
@@ -1072,16 +1360,36 @@ const stageSandboxFile = async (
         diagnostics.write_probe_result === "disk_full" ||
         diagnostics.write_probe_result === "quota_exceeded");
     const transferError = diskFull
-      ? Object.assign(
-          new Error("No space left on device while staging attachment", {
-            cause: error,
-          }),
-          { exitCode: extractCommandExitCode(error) },
+      ? copyAttachmentCommandFailureContext(
+          error,
+          Object.assign(
+            new Error("No space left on device while staging attachment", {
+              cause: error,
+            }),
+            { exitCode: extractCommandExitCode(error) },
+          ),
         )
       : error;
+    // Cloud curl transfers reserve a private directory: a shared root left
+    // unwritable in a reused workspace must not disqualify every base. Native
+    // transfers keep their existing shared-root fallback.
+    const reserveFallbackPath =
+      file.kind === "url" &&
+      !sandbox.files?.downloadFromUrl &&
+      isE2BSandbox(sandbox)
+        ? reserveCloudUploadFallbackPath
+        : resolveWritableUploadFallbackPath;
+    // Reserving a fallback writes a directory; never start it past the budget.
+    if (
+      file.kind === "localPath" &&
+      setupDeadlineAt !== undefined &&
+      Date.now() >= setupDeadlineAt
+    )
+      throw new AttachmentLocalCopySetupDeadlineError();
+
     let fallbackPath: string | null;
     try {
-      fallbackPath = await resolveWritableUploadFallbackPath(
+      fallbackPath = await reserveFallbackPath(
         sandbox,
         file.localPath,
         signal,
@@ -1116,6 +1424,7 @@ const stageSandboxFile = async (
           fallbackFile.path,
           fallbackFile.localPath,
           signal,
+          setupDeadlineAt,
         );
       }
     } catch (fallbackError) {
@@ -1129,12 +1438,34 @@ const stageSandboxFile = async (
         fallbackError instanceof Error
           ? fallbackError.message
           : String(fallbackError);
-      throw Object.assign(
+      const combinedError = Object.assign(
         new Error(
           `${originalMessage}\nFallback upload path also failed: ${fallbackMessage}`,
         ),
         { exitCode: extractCommandExitCode(fallbackError) },
       );
+      copyAttachmentCommandFailureContext(fallbackError, combinedError);
+      copyAttachmentDownloadFailureContext(fallbackError, combinedError);
+      if (file.kind === "localPath") {
+        // Final attempt only: a thrown retry has no returned-copy context.
+        copyLocalCopyFailureContext(fallbackError, combinedError);
+        finalLocalCopyReasons.set(
+          combinedError,
+          classifyLocalCopyFailure(fallbackError),
+        );
+      } else {
+        // The combined message keeps both attempts, but the final diagnostic
+        // must not mistake an earlier path failure for the terminal cause.
+        finalUrlTransferReasons.set(
+          combinedError,
+          classifySandboxUploadFailureReason(
+            file,
+            fallbackError,
+            classifySandboxUploadReadinessFailure(fallbackError),
+          ),
+        );
+      }
+      throw combinedError;
     }
 
     recordOutcome("recovered");
@@ -1205,23 +1536,42 @@ const summarizeSandboxUploadFailure = (
     acquisitionError instanceof CloudAcquisitionTimeoutError
       ? parseCloudAcquisitionStage(acquisitionError.acquisitionStage)
       : undefined;
+  const commandFailureContext = getAttachmentCommandFailureContext(error);
+  const downloadFailureContext = getAttachmentDownloadFailureContext(error);
+  const localCopyFailureContext =
+    file.kind === "localPath" && phase === "transfer"
+      ? getLocalCopyFailureContext(error)
+      : undefined;
   const summary: SandboxUploadFailureDetail = {
     kind: file.kind,
     phase,
     error: redactSandboxUploadError(file, error),
-    exitCode: extractCommandExitCode(error),
+    // Native terminal errors use -1 rather than a process exit status. Retain
+    // that sentinel in diagnostics without changing command retry parsing.
+    exitCode:
+      extractCommandExitCode(error) ??
+      (/^[ \t]*exitCode:[ \t]*-1[ \t\r]*$/im.test(errorMessage(error))
+        ? -1
+        : null),
     reason: classifySandboxUploadFailureReason(
       file,
       error,
       sandboxReadinessReason,
     ),
+    ...(file.kind === "localPath" &&
+      phase === "transfer" && {
+        localCopyFailureReason: classifyLocalCopyFailure(error),
+      }),
     transientSandboxCommand: isTransientSandboxCommandError(error),
     sandboxReadinessReason,
     // Probe attribution is diagnostic only; acquisition and retry policy keep
     // their existing classification and budget.
     ...(phase === "readiness" && {
-      readinessProbeReason: classifySandboxUploadReadinessFailure(error),
+      readinessProbeReason: classifySandboxUploadReadinessProbeFailure(error),
     }),
+    ...(commandFailureContext && { commandFailureContext }),
+    ...(downloadFailureContext && { downloadFailureContext }),
+    ...(localCopyFailureContext && { localCopyFailureContext }),
     ...(sandboxFields?.sandbox_provider && {
       sandboxProvider: sandboxFields.sandbox_provider,
     }),
@@ -1344,6 +1694,14 @@ const uploadSandboxFilesOnce = async (
   );
   if (cleanupFailure?.status === "rejected") throw cleanupFailure.reason;
   options?.signal?.throwIfAborted();
+  // The caller's budget ends this admission; it is not a per-file failure to
+  // report, fall back from or retry after reconnecting.
+  const setupDeadline = results.find(
+    (result) =>
+      result.status === "rejected" &&
+      result.reason instanceof AttachmentLocalCopySetupDeadlineError,
+  );
+  if (setupDeadline?.status === "rejected") throw setupDeadline.reason;
 
   const failedIndices = results
     .map((r, i) => (r.status === "rejected" ? i : -1))
@@ -1389,7 +1747,12 @@ const uploadSandboxFilesOnce = async (
         failure_phase: readinessFailed ? "readiness" : "transfer",
         failure_reason: primaryFailure.reason,
         failure_exit_code: primaryFailure.exitCode,
+        local_copy_failure_reason:
+          primaryFailure.localCopyFailureReason ?? null,
         readiness_probe_reason: primaryFailure.readinessProbeReason ?? null,
+        ...primaryFailure.commandFailureContext,
+        ...primaryFailure.downloadFailureContext,
+        ...primaryFailure.localCopyFailureContext,
         ...(await sampleAttachmentFailureMetrics(sandbox)),
       },
       "warn",
@@ -1425,10 +1788,15 @@ const uploadSandboxFilesOnce = async (
           ? { source_path: "[redacted-local-path]" }
           : {}),
         failure_exit_code: primaryFailure.exitCode,
+        local_copy_failure_reason:
+          primaryFailure.localCopyFailureReason ?? null,
         transient_sandbox_command: primaryFailure.transientSandboxCommand,
         sandbox_readiness_reason: primaryFailure.sandboxReadinessReason,
         readiness_probe_reason: primaryFailure.readinessProbeReason ?? null,
         sandbox_provider: primaryFailure.sandboxProvider ?? null,
+        ...primaryFailure.commandFailureContext,
+        ...primaryFailure.downloadFailureContext,
+        ...primaryFailure.localCopyFailureContext,
         error_name: primaryFailure.errorName ?? null,
         error_code: primaryFailure.errorCode ?? null,
         error_http_status: primaryFailure.errorHttpStatus ?? null,
@@ -1462,11 +1830,16 @@ const uploadSandboxFilesOnce = async (
         failure_reason_counts: failureReasonCounts,
         failure_kind: primaryFailure.kind,
         failure_exit_code: primaryFailure.exitCode,
+        local_copy_failure_reason:
+          primaryFailure.localCopyFailureReason ?? null,
         transient_sandbox_command: primaryFailure.transientSandboxCommand,
         sandbox_readiness_reason: primaryFailure.sandboxReadinessReason,
         readiness_probe_reason: primaryFailure.readinessProbeReason ?? null,
         sandbox_provider: primaryFailure.sandboxProvider ?? null,
         sandbox_type: getSandboxLogFields(sandbox).sandbox_type,
+        ...primaryFailure.commandFailureContext,
+        ...primaryFailure.downloadFailureContext,
+        ...primaryFailure.localCopyFailureContext,
         error_name: primaryFailure.errorName ?? null,
         error_code: primaryFailure.errorCode ?? null,
         error_http_status: primaryFailure.errorHttpStatus ?? null,
@@ -1512,6 +1885,9 @@ export const getSandboxUploadFailureMetadata = (
       : undefined;
 
   return {
+    ...failure?.commandFailureContext,
+    ...failure?.downloadFailureContext,
+    ...failure?.localCopyFailureContext,
     ...(failure?.kind ? { upload_failure_kind: failure.kind } : {}),
     ...(failure?.phase ? { upload_failure_phase: failure.phase } : {}),
     ...(acquisitionStage
@@ -1521,6 +1897,9 @@ export const getSandboxUploadFailureMetadata = (
       ? { upload_failure_readiness_probe_reason: failure.readinessProbeReason }
       : {}),
     ...(failure?.reason ? { upload_failure_reason: failure.reason } : {}),
+    ...(failure?.localCopyFailureReason
+      ? { upload_failure_local_copy_reason: failure.localCopyFailureReason }
+      : {}),
     ...(cause ? { upload_failure_cause: cause } : {}),
     ...(failure?.transientSandboxCommand !== undefined
       ? {
@@ -1579,6 +1958,8 @@ export const getSandboxUploadUserMessage = (
       return "The selected computer disconnected while preparing the attachment. Reconnect it in Remote Control, then try again.";
     case "attachment_client_unavailable":
       return "The selected Windows computer needs curl or PowerShell to transfer attachments. Install one or restore it to PATH, then try again.";
+    case "attachment_client_not_executable":
+      return "The selected computer could not run the attachment transfer tool. Check its installation, execution permissions, and PATH, then try again.";
     case "attachment_resource_exhausted":
       return "The selected computer could not start the attachment download because system resources are unavailable. Stop unnecessary processes or free memory, then try again.";
     case "attachment_dns_failure":
@@ -1595,6 +1976,7 @@ export const getSandboxUploadUserMessage = (
         [
           "CloudAcquisitionTimeoutError",
           "CloudAcquisitionBudgetExhaustedError",
+          "E2BAcquisitionError",
         ].includes(result.failureDetails[0].errorName ?? "")
       ) {
         return "Cloud connection timed out before preparing your attachment. Your workspace is preserved. Try again shortly.";
@@ -1609,6 +1991,12 @@ export const getSandboxUploadUserMessage = (
     case "attachment_write_failed":
       return "The computer could not save the attachment. Check available disk space and filesystem permissions, then try again.";
     default: {
+      if (
+        result.failureDetails?.[0]?.phase === "acquisition" &&
+        result.failureDetails[0].sandboxReadinessReason === "connection_error"
+      ) {
+        return "Cloud connection failed before preparing your attachment. Your workspace is preserved. Try again shortly.";
+      }
       const noun = result.failedCount === 1 ? "attachment" : "attachments";
       return `Failed to upload ${result.failedCount} ${noun} to the computer. Please try again.`;
     }

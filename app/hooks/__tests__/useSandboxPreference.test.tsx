@@ -1,18 +1,32 @@
-import { StrictMode, type ReactNode } from "react";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { Component, StrictMode, Suspense, type ReactNode } from "react";
+import { act, render, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+import { DesktopFileBridgeError } from "@/lib/centrifugo/desktop-file-errors";
 
 const mockResolvedPreferences = new Map<string, string>();
+type ConvexAuthState = { isLoading: boolean; isAuthenticated: boolean };
+const signedInConvexAuth = (): ConvexAuthState => ({
+  isLoading: false,
+  isAuthenticated: true,
+});
+let mockConvexAuth = signedInConvexAuth;
 jest.mock("convex/react", () => ({
   useMutation: () => jest.fn(),
   useQuery: (_query: unknown, args: "skip" | { preference: string }) =>
     args === "skip" ? undefined : mockResolvedPreferences.get(args.preference),
+  useConvexAuth: () => mockConvexAuth(),
 }));
 
 const mockIsTauriEnvironment = jest.fn(() => true);
+const mockOpenInBrowser = jest
+  .fn<() => Promise<boolean>>()
+  .mockResolvedValue(true);
 
 jest.mock("@/app/hooks/useTauri", () => ({
   isTauriEnvironment: mockIsTauriEnvironment,
+  DESKTOP_UPDATE_URL:
+    "https://github.com/hackerai-tech/hackerai/releases/latest",
+  openInBrowser: mockOpenInBrowser,
 }));
 
 jest.mock("@/app/services/desktop-sandbox-bridge", () => ({
@@ -22,11 +36,13 @@ jest.mock("@/app/services/desktop-sandbox-bridge", () => ({
 const mockCaptureAuthenticatedEvent = jest.fn();
 jest.mock("@/lib/analytics/client", () => ({
   captureAuthenticatedEvent: mockCaptureAuthenticatedEvent,
+  subscribeAuthenticatedAnalytics: jest.fn(() => jest.fn()),
 }));
 
 jest.mock("sonner", () => ({
   toast: { error: jest.fn() },
 }));
+const { toast } = require("sonner") as typeof import("sonner");
 
 const { DesktopSandboxBridge } =
   require("@/app/services/desktop-sandbox-bridge") as typeof import("@/app/services/desktop-sandbox-bridge");
@@ -47,6 +63,8 @@ type BridgeConfig = {
     state: "connecting" | "connected",
     environmentId?: string,
   ) => void;
+  readNativeAuthFrontendState?: () => unknown;
+  readNativeAuthProviderState?: () => unknown;
 };
 
 describe("useSandboxPreference", () => {
@@ -55,6 +73,201 @@ describe("useSandboxPreference", () => {
     mockIsTauriEnvironment.mockReturnValue(true);
     window.localStorage.clear();
     mockResolvedPreferences.clear();
+    mockConvexAuth = signedInConvexAuth;
+  });
+
+  describe("native auth frontend state for bridge diagnostics", () => {
+    let configs: BridgeConfig[];
+    const readState = () => configs[0]?.readNativeAuthFrontendState?.();
+    const setConvexAuth = (isLoading: boolean, isAuthenticated: boolean) => {
+      mockConvexAuth = () => ({ isLoading, isAuthenticated });
+    };
+    const mountConsumer = (
+      wrapper?: (props: { children: ReactNode }) => ReactNode,
+    ) =>
+      renderHook(({ authenticated }) => useSandboxPreference(authenticated), {
+        initialProps: { authenticated: true },
+        wrapper,
+      });
+
+    beforeEach(() => {
+      configs = [];
+      (DesktopSandboxBridge as jest.Mock).mockImplementation(
+        (config: BridgeConfig) => {
+          configs.push(config);
+          return {
+            start: jest.fn().mockResolvedValue("connection"),
+            stop: jest.fn().mockResolvedValue(undefined),
+            getConnectionId: () => "connection",
+          };
+        },
+      );
+    });
+
+    it("reads the current committed state without restarting the bridge", async () => {
+      const view = mountConsumer(({ children }) => (
+        <StrictMode>{children}</StrictMode>
+      ));
+      try {
+        await waitFor(() =>
+          expect(view.result.current.desktopBridgeStatus).toBe("connected"),
+        );
+        expect(readState()).toBe("owner_present_convex_authenticated");
+        setConvexAuth(true, false);
+        view.rerender({ authenticated: true });
+        expect(readState()).toBe("owner_present_convex_loading");
+        setConvexAuth(false, false);
+        view.rerender({ authenticated: true });
+        expect(readState()).toBe("owner_present_convex_unauthenticated");
+        setConvexAuth(false, true);
+        view.rerender({ authenticated: true });
+        expect(readState()).toBe("owner_present_convex_authenticated");
+        expect(DesktopSandboxBridge).toHaveBeenCalledTimes(1);
+        expect(view.result.current.desktopBridgeStatus).toBe("connected");
+
+        await act(async () => view.rerender({ authenticated: false }));
+        expect(readState()).toBe("owner_absent");
+      } finally {
+        await act(async () => view.rerender({ authenticated: false }));
+        view.unmount();
+      }
+      expect(readState()).toBe("unavailable");
+    });
+
+    it("reads the remounted consumer, not the bridge creator", async () => {
+      const first = mountConsumer();
+      await waitFor(() =>
+        expect(first.result.current.desktopBridgeStatus).toBe("connected"),
+      );
+      first.unmount();
+      expect(readState()).toBe("unavailable");
+
+      setConvexAuth(true, false);
+      const second = mountConsumer();
+      try {
+        await waitFor(() =>
+          expect(second.result.current.desktopBridgeStatus).toBe("connected"),
+        );
+        expect(configs).toHaveLength(1);
+        expect(readState()).toBe("owner_present_convex_loading");
+      } finally {
+        await act(async () => second.rerender({ authenticated: false }));
+        second.unmount();
+      }
+    });
+
+    it("does not let an older consumer's cleanup clear a newer consumer", async () => {
+      const older = mountConsumer();
+      await waitFor(() =>
+        expect(older.result.current.desktopBridgeStatus).toBe("connected"),
+      );
+      setConvexAuth(false, false);
+      const newer = mountConsumer();
+      try {
+        expect(readState()).toBe("owner_present_convex_unauthenticated");
+        older.unmount();
+        expect(readState()).toBe("owner_present_convex_unauthenticated");
+      } finally {
+        await act(async () => newer.rerender({ authenticated: false }));
+        newer.unmount();
+        older.unmount();
+      }
+      expect(readState()).toBe("unavailable");
+    });
+
+    it.each(["suspended", "abandoned"])(
+      "does not publish a %s render",
+      async (interruption) => {
+        class Boundary extends Component<
+          { children: ReactNode },
+          { failed: boolean }
+        > {
+          state = { failed: false };
+          static getDerivedStateFromError() {
+            return { failed: true };
+          }
+          render() {
+            return this.state.failed ? null : this.props.children;
+          }
+        }
+        const never = new Promise<never>(() => {});
+        function Interrupted(): ReactNode {
+          useSandboxPreference(false);
+          if (interruption === "suspended") throw never;
+          throw new Error("render abandoned");
+        }
+        const error = jest.spyOn(console, "error").mockImplementation(() => {});
+        const committed = mountConsumer();
+        try {
+          await waitFor(() =>
+            expect(committed.result.current.desktopBridgeStatus).toBe(
+              "connected",
+            ),
+          );
+          setConvexAuth(false, false);
+          const interrupted = render(
+            <Boundary>
+              <Suspense fallback={null}>
+                <Interrupted />
+              </Suspense>
+            </Boundary>,
+          );
+          expect(readState()).toBe("owner_present_convex_authenticated");
+          expect(committed.result.current.desktopBridgeStatus).toBe(
+            "connected",
+          );
+          interrupted.unmount();
+          expect(readState()).toBe("owner_present_convex_authenticated");
+        } finally {
+          await act(async () => committed.rerender({ authenticated: false }));
+          committed.unmount();
+          error.mockRestore();
+        }
+      },
+    );
+
+    it("reads the committed Convex auth provider state", async () => {
+      const { useAuthFromAuthKit } =
+        require("@/lib/auth/use-auth-from-authkit") as typeof import("@/lib/auth/use-auth-from-authkit");
+      const { CrossTabMutex } =
+        require("@/lib/auth/cross-tab-mutex") as typeof import("@/lib/auth/cross-tab-mutex");
+      const readProviderState = () =>
+        configs[0]?.readNativeAuthProviderState?.();
+      let authKitLoading = true;
+      const deps = {
+        useAuth: () => ({
+          user: { id: "user-1" },
+          loading: authKitLoading,
+          refreshAuth: jest.fn(),
+        }),
+        useAccessToken: () => ({
+          accessToken: "token",
+          getAccessToken: jest.fn(),
+          refresh: jest.fn(),
+        }),
+        mutex: new CrossTabMutex(),
+        isCrossTabEnabled: () => false,
+      } as unknown as Parameters<typeof useAuthFromAuthKit>[0];
+      const consumer = mountConsumer();
+      try {
+        await waitFor(() =>
+          expect(consumer.result.current.desktopBridgeStatus).toBe("connected"),
+        );
+        expect(readProviderState()).toBe("unavailable");
+        // The bridge reads the provider committed after it was created.
+        const provider = renderHook(() => useAuthFromAuthKit(deps));
+        expect(readProviderState()).toBe("authkit_loading");
+        authKitLoading = false;
+        provider.rerender();
+        expect(readProviderState()).toBe("ready");
+        provider.unmount();
+        expect(readProviderState()).toBe("unavailable");
+        expect(DesktopSandboxBridge).toHaveBeenCalledTimes(1);
+      } finally {
+        await act(async () => consumer.rerender({ authenticated: false }));
+        consumer.unmount();
+      }
+    });
   });
 
   it("defaults Desktop to the local sandbox when no preference is saved", () => {
@@ -323,12 +536,12 @@ describe("useSandboxPreference", () => {
       expect(result.current.desktopBridgeStatus).toBe("connecting");
       expect(mockCaptureAuthenticatedEvent).toHaveBeenCalledWith(
         "desktop_bridge_recovery_scheduled",
-        {
+        expect.objectContaining({
           clientSurface: "desktop_bridge",
           reason: "startup_failed",
           attempt: 1,
           delayMs: 1_000,
-        },
+        }),
       );
 
       await act(async () => {
@@ -349,35 +562,159 @@ describe("useSandboxPreference", () => {
     }
   });
 
-  it.each(["manual retry", "fresh sign-in"])(
-    "stops unauthorized startup retries until %s",
+  it("pauses startup retries while offline and resumes once on network recovery", async () => {
+    const online = jest
+      .spyOn(navigator, "onLine", "get")
+      .mockReturnValue(false);
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(() => ({
+      start: jest.fn().mockResolvedValue("online-connection"),
+      stop: jest.fn().mockResolvedValue(undefined),
+      getConnectionId: jest.fn().mockReturnValue("online-connection"),
+    }));
+    jest.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      { initialProps: { authenticated: true } },
+    );
+    try {
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(120_000);
+      });
+      expect(DesktopSandboxBridge).not.toHaveBeenCalled();
+      expect(mockCaptureAuthenticatedEvent).not.toHaveBeenCalled();
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await jest.advanceTimersByTimeAsync(120_000);
+      });
+      expect(DesktopSandboxBridge).not.toHaveBeenCalled();
+      online.mockReturnValue(true);
+      await act(async () => {
+        window.dispatchEvent(new Event("online"));
+        window.dispatchEvent(new Event("online"));
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(DesktopSandboxBridge).toHaveBeenCalledTimes(1);
+      expect(result.current.desktopBridgeStatus).toBe("connected");
+    } finally {
+      act(() => rerender({ authenticated: false }));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      online.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  it("keeps exhausted retries stopped across remounts and rapid wake events", async () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const error = jest.spyOn(console, "error").mockImplementation(() => {});
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(() => ({
+      start: jest.fn().mockRejectedValue(new Error("relay unavailable")),
+      stop: jest.fn().mockResolvedValue(undefined),
+      getConnectionId: jest.fn().mockReturnValue(null),
+    }));
+    jest.useFakeTimers();
+    let view = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      { initialProps: { authenticated: true } },
+    );
+    try {
+      for (let attempt = 0; attempt < 7; attempt++) {
+        await act(async () => {
+          await jest.advanceTimersByTimeAsync(
+            attempt === 0
+              ? 0
+              : [1_000, 3_000, 8_000, 16_000, 30_000, 60_000][attempt - 1],
+          );
+        });
+      }
+      expect(view.result.current.desktopBridgeStatus).toBe("failed");
+      const starts = (DesktopSandboxBridge as jest.Mock).mock.calls.length;
+      expect(starts).toBe(7);
+      view.unmount();
+      view = renderHook(
+        ({ authenticated }) => useSandboxPreference(authenticated),
+        { initialProps: { authenticated: true } },
+      );
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        window.dispatchEvent(new Event("online"));
+        document.dispatchEvent(new Event("visibilitychange"));
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(DesktopSandboxBridge).toHaveBeenCalledTimes(starts);
+      expect(view.result.current.desktopBridgeStatus).toBe("failed");
+      await act(async () => {
+        view.result.current.retryDesktopBridge();
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(DesktopSandboxBridge).toHaveBeenCalledTimes(starts + 1);
+    } finally {
+      act(() => view.rerender({ authenticated: false }));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      jest.useRealTimers();
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("resumes an offline-paused bridge when remounted after the network returned", async () => {
+    const online = jest
+      .spyOn(navigator, "onLine", "get")
+      .mockReturnValue(false);
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(() => ({
+      start: jest.fn().mockResolvedValue("online-connection"),
+      stop: jest.fn().mockResolvedValue(undefined),
+      getConnectionId: jest.fn().mockReturnValue("online-connection"),
+    }));
+    jest.useFakeTimers();
+    let view = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      { initialProps: { authenticated: true } },
+    );
+    try {
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(DesktopSandboxBridge).not.toHaveBeenCalled();
+      view.unmount();
+      online.mockReturnValue(true);
+      view = renderHook(
+        ({ authenticated }) => useSandboxPreference(authenticated),
+        { initialProps: { authenticated: true } },
+      );
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(DesktopSandboxBridge).toHaveBeenCalledTimes(1);
+      expect(view.result.current.desktopBridgeStatus).toBe("connected");
+    } finally {
+      act(() => view.rerender({ authenticated: false }));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      online.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  it.each(["brief", "stable"])(
+    "only replenishes flapping retry budgets after stable recovery (%s)",
     async (recovery) => {
-      const instances: Array<{ start: jest.Mock; stop: jest.Mock }> = [];
-      const unauthorized = Object.assign(new Error("Registration rejected"), {
-        data: { code: "UNAUTHORIZED" },
-      });
-      (DesktopSandboxBridge as jest.Mock).mockImplementation(() => {
-        const index = instances.length;
-        const instance = {
-          start: jest
-            .fn()
-            .mockImplementation(() =>
-              index === 0
-                ? Promise.reject(unauthorized)
-                : Promise.resolve("new-connection"),
-            ),
-          stop: jest.fn().mockResolvedValue(undefined),
-          getConnectionId: jest
-            .fn()
-            .mockReturnValue(index === 0 ? null : "new-connection"),
-        };
-        instances.push(instance);
-        return instance;
-      });
-      const errorSpy = jest
-        .spyOn(console, "error")
-        .mockImplementation(() => {});
-      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const configs: BridgeConfig[] = [];
+      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      (DesktopSandboxBridge as jest.Mock).mockImplementation(
+        (config: BridgeConfig) => {
+          configs.push(config);
+          return {
+            start: jest.fn().mockResolvedValue("flapping-connection"),
+            stop: jest.fn().mockResolvedValue(undefined),
+            getConnectionId: jest.fn().mockReturnValue("flapping-connection"),
+          };
+        },
+      );
       jest.useFakeTimers();
       const { result, rerender } = renderHook(
         ({ authenticated }) => useSandboxPreference(authenticated),
@@ -387,53 +724,300 @@ describe("useSandboxPreference", () => {
         await act(async () => {
           await jest.advanceTimersByTimeAsync(0);
         });
-        expect(result.current.desktopBridgeStatus).toBe("failed");
-        expect(result.current.desktopBridgeActive).toBe(false);
-        expect(instances[0].stop).toHaveBeenCalledTimes(1);
-
-        await act(async () => {
-          await jest.advanceTimersByTimeAsync(120_000);
-          window.dispatchEvent(new Event("online"));
-          window.dispatchEvent(new Event("focus"));
-          document.dispatchEvent(new Event("visibilitychange"));
-          await jest.advanceTimersByTimeAsync(120_000);
-        });
-        expect(instances).toHaveLength(1);
-        expect(mockCaptureAuthenticatedEvent).not.toHaveBeenCalledWith(
-          "desktop_bridge_recovery_scheduled",
-          expect.anything(),
-        );
-        expect(result.current.desktopBridgeStatus).toBe("failed");
-
-        if (recovery === "manual retry") {
+        for (const delay of [1_000, 3_000, 8_000, 16_000, 30_000, 60_000]) {
+          act(() => configs.at(-1)?.onConnectionState?.("connected"));
           await act(async () => {
-            result.current.retryDesktopBridge();
+            await jest.advanceTimersByTimeAsync(75_000);
           });
-        } else {
-          act(() => rerender({ authenticated: false }));
+          act(() => configs.at(-1)?.onTerminated?.("transport_disconnected"));
           await act(async () => {
-            await jest.advanceTimersByTimeAsync(0);
+            await jest.advanceTimersByTimeAsync(delay);
           });
-          expect(result.current.desktopBridgeStatus).toBe("idle");
-          await act(async () => rerender({ authenticated: true }));
         }
+        if (recovery === "stable") {
+          act(() => configs.at(-1)?.onConnectionState?.("connected"));
+          await act(async () => {
+            await jest.advanceTimersByTimeAsync(5 * 60_000);
+          });
+        }
+        act(() => configs.at(-1)?.onTerminated?.("transport_disconnected"));
+        expect(result.current.desktopBridgeStatus).toBe(
+          recovery === "stable" ? "connecting" : "failed",
+        );
         await act(async () => {
-          await jest.advanceTimersByTimeAsync(0);
+          await jest.advanceTimersByTimeAsync(1_000);
         });
-        expect(instances).toHaveLength(2);
-        expect(result.current.desktopBridgeStatus).toBe("connected");
-        expect(result.current.desktopBridgeActive).toBe(true);
+        expect(DesktopSandboxBridge).toHaveBeenCalledTimes(
+          recovery === "stable" ? 8 : 7,
+        );
       } finally {
         act(() => rerender({ authenticated: false }));
         await act(async () => {
           await jest.advanceTimersByTimeAsync(0);
         });
         jest.useRealTimers();
-        errorSpy.mockRestore();
-        warnSpy.mockRestore();
+        warn.mockRestore();
       }
     },
   );
+
+  it.each([
+    ["unauthorized", "manual retry"],
+    ["unauthorized", "fresh sign-in"],
+    ["native ACL", "manual retry"],
+    ["native ACL", "fresh sign-in"],
+  ])("stops %s startup retries until %s", async (failure, recovery) => {
+    const instances: Array<{ start: jest.Mock; stop: jest.Mock }> = [];
+    const unauthorized =
+      failure === "native ACL"
+        ? new DesktopFileBridgeError(
+            "native_ipc_denied",
+            "Native file access denied",
+          )
+        : Object.assign(new Error("Registration rejected"), {
+            data: { code: "UNAUTHORIZED" },
+          });
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(() => {
+      const index = instances.length;
+      const instance = {
+        start: jest
+          .fn()
+          .mockImplementation(() =>
+            index === 0
+              ? Promise.reject(unauthorized)
+              : Promise.resolve("new-connection"),
+          ),
+        stop: jest.fn().mockResolvedValue(undefined),
+        getConnectionId: jest
+          .fn()
+          .mockReturnValue(index === 0 ? null : "new-connection"),
+      };
+      instances.push(instance);
+      return instance;
+    });
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    jest.useFakeTimers();
+    const { result, rerender } = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      { initialProps: { authenticated: true } },
+    );
+    try {
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(result.current.desktopBridgeStatus).toBe("failed");
+      expect(result.current.desktopBridgeActive).toBe(false);
+      expect(instances[0].stop).toHaveBeenCalledTimes(1);
+      if (failure === "native ACL") {
+        expect(toast.error).toHaveBeenCalledWith(
+          "HackerAI Desktop can't access files",
+          expect.objectContaining({
+            action: expect.objectContaining({ label: "Download update" }),
+          }),
+        );
+        const action = (toast.error as jest.Mock).mock.calls[0][1] as {
+          action: { onClick: () => void };
+        };
+        await act(async () => action.action.onClick());
+        expect(mockOpenInBrowser).toHaveBeenCalledWith(
+          "https://github.com/hackerai-tech/hackerai/releases/latest",
+        );
+      }
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(120_000);
+        window.dispatchEvent(new Event("online"));
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+        await jest.advanceTimersByTimeAsync(120_000);
+      });
+      expect(instances).toHaveLength(1);
+      expect(mockCaptureAuthenticatedEvent).not.toHaveBeenCalledWith(
+        "desktop_bridge_recovery_scheduled",
+        expect.anything(),
+      );
+      expect(result.current.desktopBridgeStatus).toBe("failed");
+
+      if (recovery === "manual retry") {
+        await act(async () => {
+          result.current.retryDesktopBridge();
+        });
+      } else {
+        act(() => rerender({ authenticated: false }));
+        await act(async () => {
+          await jest.advanceTimersByTimeAsync(0);
+        });
+        expect(result.current.desktopBridgeStatus).toBe("idle");
+        await act(async () => rerender({ authenticated: true }));
+      }
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(instances).toHaveLength(2);
+      expect(result.current.desktopBridgeStatus).toBe("connected");
+      expect(result.current.desktopBridgeActive).toBe(true);
+    } finally {
+      act(() => rerender({ authenticated: false }));
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      jest.useRealTimers();
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.each(["before outage", "during backoff", "during reconnect"])(
+    "recovers on the current mount after remounting %s",
+    async (timing) => {
+      const configs: BridgeConfig[] = [];
+      (DesktopSandboxBridge as jest.Mock).mockImplementation(
+        (config: BridgeConfig) => {
+          configs.push(config);
+          let connected = true;
+          const terminate = config.onTerminated;
+          config.onTerminated = (reason) => {
+            connected = false;
+            terminate?.(reason);
+          };
+          return {
+            start: jest.fn().mockResolvedValue("connection"),
+            stop: jest.fn().mockResolvedValue(undefined),
+            getConnectionId: () => (connected ? "connection" : null),
+            getEnvironmentId: () => "this-computer",
+          };
+        },
+      );
+      const first = renderHook(
+        ({ authenticated }) => useSandboxPreference(authenticated),
+        { initialProps: { authenticated: true } },
+      );
+      await waitFor(() =>
+        expect(first.result.current.desktopBridgeStatus).toBe("connected"),
+      );
+      jest.useFakeTimers();
+      let second:
+        | ReturnType<
+            typeof renderHook<
+              ReturnType<typeof useSandboxPreference>,
+              { authenticated: boolean }
+            >
+          >
+        | undefined;
+      try {
+        if (timing === "during backoff") {
+          act(() => configs[0].onTerminated?.("transport_disconnected"));
+        } else if (timing === "during reconnect") {
+          act(() => configs[0].onConnectionState?.("connecting"));
+        }
+        first.unmount();
+        second = renderHook(
+          ({ authenticated }) => useSandboxPreference(authenticated),
+          { initialProps: { authenticated: true } },
+        );
+        await act(async () => {
+          await jest.advanceTimersByTimeAsync(0);
+        });
+        if (timing !== "before outage") {
+          expect(second.result.current.desktopBridgeStatus).toBe("connecting");
+          expect(second.result.current.desktopBridgeActive).toBe(false);
+          expect(configs).toHaveLength(1);
+        }
+        if (timing !== "during backoff") {
+          act(() => configs[0].onTerminated?.("transport_disconnected"));
+        }
+        expect(second.result.current.desktopBridgeStatus).toBe("connecting");
+        await act(async () => {
+          await jest.advanceTimersByTimeAsync(1_000);
+        });
+        expect(configs).toHaveLength(2);
+        expect(second.result.current.desktopBridgeStatus).toBe("connected");
+        expect(second.result.current.desktopBridgeActive).toBe(true);
+      } finally {
+        second?.rerender({ authenticated: false });
+        second?.unmount();
+        first.unmount();
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps live reconnect callbacks valid when Retry is clicked", async () => {
+    let config!: BridgeConfig;
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(
+      (value: BridgeConfig) => {
+        config = value;
+        return {
+          start: jest.fn().mockResolvedValue("connection"),
+          stop: jest.fn().mockResolvedValue(undefined),
+          getConnectionId: () => "connection",
+        };
+      },
+    );
+    const mounted = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      {
+        initialProps: { authenticated: true },
+      },
+    );
+    try {
+      await waitFor(() =>
+        expect(mounted.result.current.desktopBridgeStatus).toBe("connected"),
+      );
+      act(() => config.onConnectionState?.("connecting"));
+      act(() => mounted.result.current.retryDesktopBridge());
+      act(() => config.onConnectionState?.("connected"));
+      expect(mounted.result.current.desktopBridgeStatus).toBe("connected");
+      expect(mounted.result.current.desktopBridgeActive).toBe(true);
+      expect(DesktopSandboxBridge).toHaveBeenCalledTimes(1);
+    } finally {
+      mounted.rerender({ authenticated: false });
+      mounted.unmount();
+    }
+  });
+
+  it("preserves a terminal failure across remounts until an explicit retry", async () => {
+    const configs: BridgeConfig[] = [];
+    (DesktopSandboxBridge as jest.Mock).mockImplementation(
+      (config: BridgeConfig) => {
+        configs.push(config);
+        return {
+          start: jest.fn().mockResolvedValue("connection"),
+          stop: jest.fn().mockResolvedValue(undefined),
+          getConnectionId: () => "connection",
+        };
+      },
+    );
+    const first = renderHook(() => useSandboxPreference(true));
+    await waitFor(() =>
+      expect(first.result.current.desktopBridgeStatus).toBe("connected"),
+    );
+    act(() => configs[0].onTerminated?.("session_replaced"));
+    first.unmount();
+    const second = renderHook(
+      ({ authenticated }) => useSandboxPreference(authenticated),
+      { initialProps: { authenticated: true } },
+    );
+    try {
+      await waitFor(() =>
+        expect(second.result.current.desktopBridgeStatus).toBe("failed"),
+      );
+      expect(configs).toHaveLength(1);
+      act(() => second.result.current.retryDesktopBridge());
+      await waitFor(() =>
+        expect(second.result.current.desktopBridgeStatus).toBe("connected"),
+      );
+      expect(configs).toHaveLength(2);
+      act(() => window.dispatchEvent(new Event("beforeunload")));
+      expect(
+        (DesktopSandboxBridge as jest.Mock).mock.results[1].value.stop,
+      ).toHaveBeenCalledTimes(1);
+    } finally {
+      second.rerender({ authenticated: false });
+      second.unmount();
+    }
+  });
 
   it("invalidates on auth loss and automatically recovers a stale connection", async () => {
     let resolveFirstStart: ((connectionId: string) => void) | undefined;
@@ -568,7 +1152,7 @@ describe("useSandboxPreference", () => {
 
       jest.useFakeTimers();
       try {
-        const delays = [1_000, 3_000, 8_000, 16_000, 16_000, 16_000];
+        const delays = [1_000, 3_000, 8_000, 16_000, 30_000, 60_000];
         for (const delay of delays) {
           act(() => {
             bridgeConfigs.at(-1)?.onTerminated?.("connection_inactive");
@@ -582,7 +1166,7 @@ describe("useSandboxPreference", () => {
         }
 
         expect(bridgeInstances).toHaveLength(7);
-        // A socket that drops before a full minute is not a stable recovery.
+        // A socket that drops before the stability window is not a recovery.
         // Its old reset timer must not replenish the finite retry budget.
         act(() => bridgeConfigs.at(-1)?.onConnectionState?.("connected"));
         await act(async () => {

@@ -1,13 +1,9 @@
+import { isInferenceCyberModel } from "@/lib/ai/inference";
 import {
   DEEPSEEK_1017_MODEL_KEY,
   DEEPSEEK_1017_SLUG,
   DEEPSEEK_1017_CANONICAL_SLUG,
 } from "@/lib/experiments/paid-deepseek-1017";
-import {
-  ABLITERATION_LARGE_V2_MODEL_KEY,
-  ABLITERATION_MODEL_KEY,
-  isAbliterationModel,
-} from "@/lib/ai/abliteration";
 /**
  * Chat Stream Helpers
  *
@@ -23,6 +19,7 @@ import type {
   SystemModelMessage,
 } from "ai";
 import { NoSuchModelError } from "ai";
+import { buildPromptCacheOptions } from "@/lib/ai/prompt-cache";
 import type {
   ChatMode,
   ExtraUsageConfig,
@@ -37,8 +34,10 @@ import {
   GLM_5_3_SLUG,
   GROK_4_5_SLUG,
   GROK_4_6_SLUG,
+  GROK_4_7_SLUG,
   getOpenRouterProviderRoutingForModel,
   isAnthropicModel,
+  isKimiModel,
   myProvider,
 } from "@/lib/ai/providers";
 import type { ModelName } from "@/lib/ai/providers";
@@ -51,6 +50,7 @@ import {
   findSummarizationInsertIndex,
 } from "@/lib/utils/stream-writer-utils";
 import { POINTS_PER_DOLLAR } from "@/lib/rate-limit/token-bucket";
+import { insertAgentSteerParts, type AgentSteer } from "@/lib/chat/agent-steer";
 import { countMessagesTokens, safeCountTokens } from "@/lib/token-utils";
 import {
   checkAndSummarizeIfNeeded,
@@ -60,6 +60,11 @@ import {
 import type { ProviderPromptPressure } from "@/lib/chat/summarization/provider-pressure";
 import { getNotes } from "@/lib/db/actions";
 import { generateNotesSection } from "@/lib/system-prompt/notes";
+import {
+  buildRelevantNotesSection,
+  recordRelevantRecallExposure,
+  type RelevantRecallScope,
+} from "@/lib/notes/recall";
 import { logger } from "@/lib/logger";
 import { UsageTracker } from "@/lib/usage-tracker";
 import { ChatSDKError } from "@/lib/errors";
@@ -78,6 +83,13 @@ import {
   extractErrorDetails,
   getProviderStatusCode,
 } from "@/lib/utils/error-utils";
+import { redactSensitiveErrorMessage } from "@/lib/utils/error-redaction";
+import {
+  CONTEXT_USAGE_PART_TYPE,
+  isContextUsagePart,
+  type ContextPressureSnapshot,
+} from "@/lib/chat/context-pressure";
+import { AGENT_LONG_HEARTBEAT_PART_TYPE } from "@/lib/chat/agent-long-heartbeat";
 
 /**
  * Check if messages contain file attachments
@@ -151,7 +163,6 @@ export function sendRateLimitWarnings(
     subscription: SubscriptionTier;
     mode: ChatMode;
     rateLimitInfo: {
-      freeDailyCost?: boolean;
       remaining: number;
       limit: number;
       resetTime: Date;
@@ -185,21 +196,6 @@ export function sendRateLimitWarnings(
     return;
   }
 
-  if (subscription === "free" && rateLimitInfo.freeDailyCost) {
-    const usedPercent =
-      100 * (1 - rateLimitInfo.remaining / rateLimitInfo.limit);
-    if (!rateLimitInfo.rateLimitSkipped && usedPercent >= 75) {
-      emitTokenBucketThresholdWarning(writer, {
-        bucketType: "daily",
-        usedPercent,
-        projectedUsedPoints: rateLimitInfo.limit - rateLimitInfo.remaining,
-        monthlyLimitPoints: rateLimitInfo.limit,
-        resetTime: rateLimitInfo.resetTime,
-        subscription,
-      });
-    }
-    return;
-  }
   if (subscription === "free") {
     // Warn when roughly 30% of daily limit remains (minimum threshold of 1)
     const warningThreshold = Math.max(1, Math.ceil(rateLimitInfo.limit * 0.3));
@@ -518,7 +514,9 @@ export async function runSummarizationStep(options: {
 
 /**
  * Tracks summarization state and handles inserting the summarization badge
- * into message parts at the correct position during save.
+ * into message parts at the correct position during save. It also carries the
+ * current provider attempt's display-only context snapshot to the response
+ * being saved.
  */
 export class SummarizationTracker {
   hasSummarized = false;
@@ -526,9 +524,47 @@ export class SummarizationTracker {
     part: UIMessagePart<any, any>;
     atStep: number;
   }> = [];
+  private contextPressure:
+    { id: string; data: ContextPressureSnapshot } | undefined;
+  private steers: Array<{
+    steer: AgentSteer;
+    afterToolCallId?: string;
+    /** The first saved response that showed it; a retry's new message skips it. */
+    messageId?: string;
+  }> = [];
+
+  /**
+   * @param onCompactionRecorded Called synchronously with this tracker's
+   * running count after each accepted compaction. Rejected summaries, which
+   * only reach `recordSummarizationUsage`, never call it.
+   */
+  constructor(
+    private readonly onCompactionRecorded?: (completedCount: number) => void,
+  ) {}
 
   get summarizationCount(): number {
     return this.records.length;
+  }
+
+  /** Each valid measurement replaces the last; only the latest is saved. */
+  recordContextPressure(snapshot: ContextPressureSnapshot, id: string): void {
+    this.contextPressure = { id, data: { ...snapshot } };
+  }
+
+  /**
+   * A new provider attempt saves a new response. It must not inherit the
+   * previous attempt's snapshot, which belongs to that response.
+   */
+  clearContextPressure(): void {
+    this.contextPressure = undefined;
+  }
+
+  /**
+   * Record a steer the run read before a step, after the tool call it followed.
+   * Saved responses show it there; retries keep it ahead of their output.
+   */
+  recordSteer(steer: AgentSteer, afterToolCallId?: string): void {
+    this.steers.push({ steer, afterToolCallId });
   }
 
   /**
@@ -551,6 +587,11 @@ export class SummarizationTracker {
     });
 
     this.recordSummarizationUsage(usage, usageTracker);
+    try {
+      this.onCompactionRecorded?.(this.records.length);
+    } catch {
+      // Display-only reporting must never change generation or billing.
+    }
   }
 
   /** Account for generated-summary usage, whether accepted or rejected. */
@@ -565,13 +606,63 @@ export class SummarizationTracker {
 
   /**
    * Insert summarization parts into an assistant message at the correct
-   * position (before the step-start for the step where summarization happened).
-   * Returns the original message unchanged if no summarization occurred.
+   * position (before the step-start for the step where summarization happened)
+   * and replace any streamed context snapshot with this attempt's latest one.
+   * Returns the original message unchanged when neither applies.
    */
-  processMessageForSave<T extends { role: string; parts: any[] }>(
+  processMessageForSave<T extends { id?: string; role: string; parts: any[] }>(
     message: T,
   ): T {
-    if (message.role !== "assistant" || this.records.length === 0) {
+    if (message.role !== "assistant") return message;
+    const response = withoutContextUsageParts(message);
+    const saved = this.withSteerParts(this.withSummarizationParts(response));
+    // A diagnostics snapshot never makes a response without its own content
+    // eligible for persistence.
+    return response.parts?.some(
+      (part) => part?.type !== AGENT_LONG_HEARTBEAT_PART_TYPE,
+    )
+      ? this.withContextPressure(saved)
+      : saved;
+  }
+
+  /**
+   * Place recorded steers in a saved response without other save processing,
+   * for checkpoint saves that keep their own parts. Each steer belongs to the
+   * first response saved after it was read.
+   */
+  withSteerParts<T extends { id?: string; role: string; parts: any[] }>(
+    message: T,
+  ): T {
+    if (message.role !== "assistant") return message;
+    const steers = this.steers.filter(
+      (record) =>
+        record.messageId === undefined || record.messageId === message.id,
+    );
+    for (const record of steers) record.messageId ??= message.id;
+    return insertAgentSteerParts(message, steers);
+  }
+
+  /** Appends exactly one tracked snapshot. */
+  private withContextPressure<T extends { role: string; parts: any[] }>(
+    message: T,
+  ): T {
+    if (!this.contextPressure) return message;
+    return {
+      ...message,
+      parts: [
+        ...message.parts,
+        {
+          type: CONTEXT_USAGE_PART_TYPE,
+          ...this.contextPressure,
+        },
+      ],
+    };
+  }
+
+  private withSummarizationParts<T extends { role: string; parts: any[] }>(
+    message: T,
+  ): T {
+    if (this.records.length === 0) {
       return message;
     }
     const parts = [...message.parts];
@@ -596,6 +687,85 @@ export class SummarizationTracker {
   }
 }
 
+/** Streamed snapshots are replaced by the tracker's value for this response. */
+const withoutContextUsageParts = <T extends { parts: any[] }>(message: T): T =>
+  message.parts?.some(isContextUsagePart)
+    ? {
+        ...message,
+        parts: message.parts.filter((part) => !isContextUsagePart(part)),
+      }
+    : message;
+
+export type AgentCompactionTallyOutcome =
+  "recorded" | "unchanged" | "stale" | "not_found" | "deleting";
+
+/**
+ * Persists one Agent run's completed-compaction count as absolute snapshots.
+ * Sends run one at a time and carry the latest count, so queued reports
+ * coalesce. `flush` resends the latest unconfirmed snapshot once, for example
+ * when the run's first report raced its chat association, and returns the
+ * queue so the caller can wait for it. Each send is bounded by `send` itself.
+ */
+export function createAgentCompactionReporter({
+  send,
+  registerBackgroundWork,
+  signal,
+  onError,
+}: {
+  send: (completedCount: number) => Promise<AgentCompactionTallyOutcome>;
+  registerBackgroundWork: (work: Promise<void>) => void;
+  signal: AbortSignal;
+  onError: (error: unknown) => void;
+}) {
+  let latest: number | undefined;
+  let confirmed = -1;
+  let closed = false;
+  let retryScheduled = false;
+  let queue: Promise<void> = Promise.resolve();
+
+  const deliver = async () => {
+    if (closed || latest === undefined || latest <= confirmed) return;
+    const completedCount = latest;
+    try {
+      const outcome = await send(completedCount);
+      if (outcome === "recorded" || outcome === "unchanged") {
+        confirmed = Math.max(confirmed, completedCount);
+      } else if (outcome === "not_found" || outcome === "deleting") {
+        closed = true;
+      }
+    } catch (error) {
+      try {
+        onError(error);
+      } catch {
+        // Display-only reporting must never fail the run, even while logging.
+      }
+    }
+  };
+  const enqueue = () => {
+    queue = queue.then(deliver);
+    registerBackgroundWork(queue);
+  };
+
+  return {
+    report(completedCount: number) {
+      // A compaction that finishes after the run was stopped is not counted.
+      if (signal.aborted) return;
+      latest = Math.max(latest ?? 0, completedCount);
+      enqueue();
+    },
+    flush(): Promise<void> {
+      // A later flush, such as final cleanup after the stream's own flush,
+      // waits for the retry already queued instead of resolving early.
+      if (retryScheduled) return queue;
+      if (closed || latest === undefined || latest <= confirmed)
+        return Promise.resolve();
+      retryScheduled = true;
+      enqueue();
+      return queue;
+    },
+  };
+}
+
 /**
  * OpenRouter `models` fallback chain, expressed in local registry keys.
  *
@@ -603,21 +773,14 @@ export class SummarizationTracker {
  * stream, OpenRouter rolls forward through this list and bills at the served
  * model's rate (response.modelId reflects what actually ran).
  *
- * Paid Standard uses GLM 5.3 Flash. Pro uses V4 Pro 0813 in Ask and
- * V4.1 Flash in Agent. Max uses GLM 5.3. Image turns use their existing multimodal routes. Both DeepSeek
- * Flash routes try GLM 5.3 Flash before the established recovery models.
- * Historical aliases remain recognized for in-flight requests and accounting.
+ * DeepSeek Flash routes try GLM 5.3 Flash before the established recovery
+ * models. V4 Pro 0813 remains only as a recovery model.
  *
  * Keys and values are registry names (see lib/ai/providers.ts) — the actual
  * OpenRouter slugs are resolved at request-build time so this stays in sync
  * with the registry.
  */
-const KIMI_K3_THEN_GROK_FALLBACK_CHAIN = [
-  "model-kimi-k3",
-  "model-grok-4.6",
-] as const satisfies readonly ModelName[];
-
-const GROK_4_6_FALLBACK_CHAIN = [
+const GROK_FALLBACK_CHAIN = [
   "model-glm-5.3",
   "model-kimi-k3",
 ] as const satisfies readonly ModelName[];
@@ -653,56 +816,42 @@ const DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN = [
   ...PRO_TEXT_FALLBACK_CHAIN,
 ] as const satisfies readonly ModelName[];
 
-// Preserve the historical Grok 4.6 Pro alias for in-flight requests. GLM 5.3
-// remains its first fallback, followed by Kimi K3.
-const HACKERAI_PRO_FALLBACK_CHAIN = [
-  "model-glm-5.3",
-  "model-kimi-k3",
-] as const satisfies readonly ModelName[];
-
 const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
   "ask-model-free": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "ask-model-free-glm": GLM_FLASH_AGENT_FALLBACK_CHAIN,
   "ask-model-free-deepseek-v41": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "agent-model-free": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-glm-5.3-flash-agent": GLM_FLASH_AGENT_FALLBACK_CHAIN,
-  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
-  "model-deepseek-v4-pro": PRO_TEXT_FALLBACK_CHAIN,
   "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN,
-  "ask-model": GROK_4_6_FALLBACK_CHAIN,
-  "agent-model": GROK_4_6_FALLBACK_CHAIN,
-  "model-grok-4.6": GROK_4_6_FALLBACK_CHAIN,
+  "model-grok-4.6": GROK_FALLBACK_CHAIN,
+  "model-grok-4.7": GROK_FALLBACK_CHAIN,
+  // Max Agent skips transparent fallbacks; Ask and recovery keep 1M routes.
+  "model-kimi-k3.1-pro": PRO_TEXT_FALLBACK_CHAIN,
   "model-grok-4.5": ["model-kimi-k3"],
   "model-grok-4.5-pro": ["model-kimi-k3"],
-  "model-grok-4.6-pro": HACKERAI_PRO_FALLBACK_CHAIN,
-  "model-opus-4.6": ["model-grok-4.6"],
-  "model-glm-5.2": KIMI_K3_THEN_GROK_FALLBACK_CHAIN,
   "model-glm-5.3": ["model-kimi-k3"],
   "model-glm-5.3-flash": GLM_FLASH_RECOVERY_FALLBACK_CHAIN,
   "model-glm-5.3-flash-pro": GLM_FLASH_RECOVERY_FALLBACK_CHAIN,
   "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   [DEEPSEEK_1017_MODEL_KEY]: DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
-  "fallback-agent-model": GROK_4_6_FALLBACK_CHAIN,
-  "fallback-ask-model": GROK_4_6_FALLBACK_CHAIN,
-  "model-kimi-k3": ["model-grok-4.6"],
+  "fallback-agent-model": GROK_FALLBACK_CHAIN,
+  "fallback-ask-model": GROK_FALLBACK_CHAIN,
+  "model-kimi-k3": ["model-grok-4.7"],
 };
 
 const AUTO_MODEL_KEYS = new Set<string>([
-  "ask-model",
   "ask-model-free",
   "ask-model-free-glm",
   "ask-model-free-deepseek-v41",
-  "agent-model",
   "agent-model-free",
 ]);
 const EXPLICIT_RETRY_MODEL_KEYS = new Set<string>([
   "model-glm-5.3",
   "model-grok-4.6",
-  "model-grok-4.6-pro",
+  "model-kimi-k3.1-pro",
 ]);
 const EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS = new Set<string>([
-  "model-deepseek-v4-pro",
   "model-deepseek-v4-pro-0813",
 ]);
 
@@ -716,6 +865,8 @@ export function isAutoModelSelectionForRetry({
   return (
     !selectedModelOverride ||
     selectedModelOverride === "auto" ||
+    (selectedModelOverride === "hackerai-max" &&
+      selectedModel === DEEPSEEK_1017_MODEL_KEY) ||
     AUTO_MODEL_KEYS.has(selectedModel) ||
     EXPLICIT_RETRY_MODEL_KEYS.has(selectedModel)
   );
@@ -743,14 +894,12 @@ const HIGH_REASONING_MODELS = [
   DEEPSEEK_1017_MODEL_KEY,
   "model-grok-4.5-pro",
   "model-grok-4.6",
-  "model-grok-4.6-pro",
-  "model-deepseek-v4-flash-0731",
+  "model-grok-4.7",
+  "model-kimi-k3.1-pro",
   "model-deepseek-v4-pro-0813",
-  "model-glm-5.2",
   "model-glm-5.3",
   "model-glm-5.3-flash-pro",
   "model-deepseek-v4-flash-vision-pro",
-  "model-opus-4.6",
 ] as const satisfies readonly ModelName[];
 
 const isHighReasoningModel = (modelName?: string): boolean =>
@@ -760,6 +909,8 @@ const isHighReasoningModel = (modelName?: string): boolean =>
 type FallbackOptions = {
   /** Max uses explicit recovery so each model gets its own reasoning policy. */
   selectedModelOverride?: SelectedModel;
+  /** Authenticated paid Agent request using Auto (including the default selector). */
+  isPaidAutoAgentRequest?: boolean;
   /** Preserve the authenticated free Ask policy across model retries. */
   isFreeAskRequest?: boolean;
   hasMultimodalToolResults?: boolean;
@@ -797,26 +948,25 @@ const getFallbackKeys = (
   return MODEL_FALLBACK_CHAIN[modelName as ModelName];
 };
 
-/** Returns the first app-side retry model for a failed provider route. */
+/**
+ * Returns the first app-side retry model for a failed provider route.
+ * `_media` is accepted for existing callers; it no longer changes any route.
+ */
 export function getRetryFallbackModel(
   modelName: ModelName,
   mode: ChatMode,
   selectedModelOverride?: SelectedModel,
+  _media: { hasImageInputs?: boolean } = {},
 ): ModelName {
-  if (mode === "agent" && selectedModelOverride === "hackerai-max") {
-    // Grok is admitted only by the context-aware final recovery decision.
+  // Every Max Agent route, including Grok text, recovers on DeepSeek 1017 with
+  // its own literal max reasoning rather than a lower-reasoning GLM attempt.
+  // Durable Agent runs first try Grok on Bedrock (getMaxAgentFirstRecoveryModel).
+  if (mode === "agent" && selectedModelOverride === "hackerai-max")
     return DEEPSEEK_1017_MODEL_KEY;
-  }
-  if (modelName === ABLITERATION_LARGE_V2_MODEL_KEY) {
-    return "model-deepseek-v4-pro-0813";
-  }
   if (
     modelName === "model-glm-5.3-flash-agent" ||
     modelName === "ask-model-free-glm"
   ) {
-    return "model-deepseek-v4-flash-vision";
-  }
-  if (modelName === ABLITERATION_MODEL_KEY) {
     return "model-deepseek-v4-flash-vision";
   }
   if (
@@ -824,7 +974,6 @@ export function getRetryFallbackModel(
     modelName === "ask-model-free" ||
     modelName === "ask-model-free-deepseek-v41" ||
     modelName === "agent-model-free" ||
-    modelName === "model-deepseek-v4-flash-0731" ||
     modelName === "model-deepseek-v4-flash-vision" ||
     modelName === "model-deepseek-v4-flash-vision-pro"
   ) {
@@ -833,22 +982,13 @@ export function getRetryFallbackModel(
   if (modelName === "model-deepseek-v4-pro-0813") {
     return "model-glm-5.3";
   }
-  if (modelName === "model-grok-4.6-pro") {
-    return "model-glm-5.3";
-  }
   if (modelName === "model-grok-4.5" || modelName === "model-grok-4.5-pro") {
     return "model-kimi-k3";
   }
-  if (modelName === "model-opus-4.6") {
-    return "model-grok-4.6";
-  }
-  if (modelName === "model-deepseek-v4-pro") {
-    return "model-glm-5.3";
-  }
   if (
-    modelName === "ask-model" ||
-    modelName === "agent-model" ||
     modelName === "model-grok-4.6" ||
+    modelName === "model-grok-4.7" ||
+    modelName === "model-kimi-k3.1-pro" ||
     modelName === "model-grok-4.5" ||
     modelName === "fallback-agent-model" ||
     modelName === "fallback-ask-model"
@@ -864,7 +1004,7 @@ export function getRetryFallbackModel(
   ) {
     return "model-deepseek-v4-pro-0813";
   }
-  return "model-grok-4.6";
+  return "model-grok-4.7";
 }
 
 /** Any failure of the active treatment route gets one baseline attempt. */
@@ -875,7 +1015,7 @@ export function shouldRetryAbliterationError(
 ): boolean {
   return (
     assignment?.variant === "test" &&
-    isAbliterationModel(failedModel) &&
+    isInferenceCyberModel(failedModel) &&
     !abortSignal.aborted
   );
 }
@@ -883,7 +1023,7 @@ export function shouldRetryAbliterationError(
 const CONTENT_FILTER_RETRY_CANDIDATES = [
   "model-glm-5.3",
   "model-kimi-k3",
-  "model-grok-4.6",
+  "model-grok-4.7",
 ] as const satisfies readonly ModelName[];
 
 /**
@@ -973,7 +1113,6 @@ export function getFallbackSlugs(
 }
 
 const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
-  "anthropic/claude-opus-4.6": "model-opus-4.6",
   [DEEPSEEK_1017_SLUG]: DEEPSEEK_1017_MODEL_KEY,
   [DEEPSEEK_1017_CANONICAL_SLUG]: DEEPSEEK_1017_MODEL_KEY,
   "deepseek/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
@@ -987,8 +1126,8 @@ const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "x-ai/grok-4.5": "model-grok-4.5",
   "x-ai/grok-4.5-20260708": "model-grok-4.5",
   "x-ai/grok-4.6": "model-grok-4.6",
-  "z-ai/glm-5.2": "model-glm-5.2",
-  "z-ai/glm-5.2-20260616": "model-glm-5.2",
+  "x-ai/grok-4.7": "model-grok-4.7",
+  "x-ai/grok-4.7-20260916": "model-grok-4.7",
   "z-ai/glm-5.3": "model-glm-5.3",
   "z-ai/glm-5.3-20260816": "model-glm-5.3",
   [GLM_5_3_FLASH_SLUG]: "model-glm-5.3-flash",
@@ -997,19 +1136,14 @@ const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "deepseek/deepseek-v4.1-flash-20260910": "model-deepseek-v4-flash-vision",
   "moonshotai/kimi-k3": "model-kimi-k3",
   "moonshotai/kimi-k3-20260715": "model-kimi-k3",
+  "moonshotai/kimi-k3.1-pro": "model-kimi-k3.1-pro",
+  "moonshotai/kimi-k3.1-pro-20261023": "model-kimi-k3.1-pro",
 };
 
 function resolveOpenRouterResponseModelCostKey(
   responseModel: string,
 ): string | undefined {
-  const exactKey = OPENROUTER_RESPONSE_MODEL_COST_KEYS[responseModel];
-  if (exactKey) return exactKey;
-  // Scope Opus response aliases to the priced generation rather than matching
-  // every Claude family or version.
-  if (/^anthropic\/claude-4\.6-opus-\d{8}$/.test(responseModel)) {
-    return "model-opus-4.6";
-  }
-  return undefined;
+  return OPENROUTER_RESPONSE_MODEL_COST_KEYS[responseModel];
 }
 
 function areEquivalentProviderModelIds(
@@ -1059,7 +1193,17 @@ export function buildProviderOptions(
   options: FallbackOptions = {},
 ) {
   // Direct provider: never send OpenRouter routing, plugins, or user IDs.
-  if (isAbliterationModel(modelName)) return {} as Record<string, never>;
+  if (isInferenceCyberModel(options.requestedModelSlug)) {
+    return {
+      inference: {
+        reasoningEffort:
+          options.selectedModelOverride === "hackerai-max" ||
+          options.selectedModelOverride === "hackerai-pro"
+            ? "max"
+            : "high",
+      },
+    } as Record<"inference", { reasoningEffort: "max" | "high" }>;
+  }
   const modelId =
     options.requestedModelSlug ??
     (modelName ? resolveSlug(modelName) : undefined);
@@ -1073,10 +1217,14 @@ export function buildProviderOptions(
       modelName === "ask-model-free-glm" ||
       modelName === "ask-model-free-deepseek-v41");
   const isGrok45 = modelId === GROK_4_5_SLUG;
-  const isGrok46 = modelId === GROK_4_6_SLUG;
-  // Agent routes use high for both DeepSeek V4 Flash and Pro. Keep this
-  // mode-scoped for any future route that does not also include Grok.
+  // Grok 4.7 shares Grok 4.6's mandatory high-reasoning policy.
+  const isGrok46 = modelId === GROK_4_6_SLUG || modelId === GROK_4_7_SLUG;
+  // Kimi has no native file input, so PDFs need OpenRouter's parser.
+  const isKimi = modelId !== undefined && isKimiModel(modelId);
+  // Agent DeepSeek routes default to high; paid Auto opts into max below.
   const isAgentDeepSeekV4 = mode === "agent" && isDeepSeekV4;
+  const usesMaxDeepSeekReasoning =
+    isAgentDeepSeekV4 && options.isPaidAutoAgentRequest === true;
   const fallbackSlugs = getFallbackSlugs(modelName, mode, options);
   const reasoningFallbackSlugs = options.excludedModelSlugs?.length
     ? getFallbackSlugs(modelName, mode, {
@@ -1098,26 +1246,42 @@ export function buildProviderOptions(
     isGrok46 ||
     reasoningFallbackSlugs.includes(GROK_4_5_SLUG) ||
     reasoningFallbackSlugs.includes(GROK_4_6_SLUG) ||
+    reasoningFallbackSlugs.includes(GROK_4_7_SLUG) ||
     reasoningFallbackSlugs.includes(GLM_5_3_SLUG);
+  // Only explicit tier requests on the snapshot use this policy. The legacy
+  // vision aliases also serve allowance rescue and retain their own defaults.
+  const isExplicitPaidFlashTier =
+    mode === "agent" &&
+    modelName === DEEPSEEK_1017_MODEL_KEY &&
+    (modelId === DEEPSEEK_1017_SLUG ||
+      modelId === DEEPSEEK_1017_CANONICAL_SLUG) &&
+    (options.selectedModelOverride === "hackerai-standard" ||
+      options.selectedModelOverride === "hackerai-pro");
   const baseProviderRouting = modelId
-    ? getOpenRouterProviderRoutingForModel(modelId)
+    ? getOpenRouterProviderRoutingForModel(modelId, modelName)
     : undefined;
   const providerRouting = options.ignoredProviderSlugs?.length
     ? {
         ...baseProviderRouting,
-        ignore: [
-          ...new Set([
-            ...(baseProviderRouting && "ignore" in baseProviderRouting
-              ? baseProviderRouting.ignore
-              : []),
-            ...options.ignoredProviderSlugs,
-          ]),
-        ],
+        ignore: [...new Set(options.ignoredProviderSlugs)],
       }
     : baseProviderRouting;
+  // Max uses the same high effort for native Grok text and vision, including
+  // continuation steps whose caller still carries an older reasoning override.
+  const usesFixedMaxGrokReasoning =
+    isGrok46 && options.selectedModelOverride === "hackerai-max";
+  // Max on Kimi keeps a high floor so a stale lower override cannot weaken it,
+  // while the paid Agent max-reasoning override can still raise it.
+  const usesMaxKimiReasoningFloor =
+    isKimi && options.selectedModelOverride === "hackerai-max";
   // GLM titles need mandatory reasoning, kept low for the small output budget.
-  const reasoning =
-    modelName === DEEPSEEK_1017_MODEL_KEY
+  const reasoning = isExplicitPaidFlashTier
+    ? {
+        enabled: true,
+        effort:
+          options.selectedModelOverride === "hackerai-pro" ? "max" : "high",
+      }
+    : modelName === DEEPSEEK_1017_MODEL_KEY
       ? {
           enabled: true,
           effort:
@@ -1138,31 +1302,40 @@ export function buildProviderOptions(
                 effort: "medium",
               }
             : routesThroughHighReasoningModel
-              ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
+              ? !usesFixedMaxGrokReasoning &&
+                isHighOrGreaterReasoningOverride(options.reasoningOverride)
                 ? options.reasoningOverride
                 : {
                     enabled: true,
                     effort: "high",
                   }
-              : (options.reasoningOverride ??
-                (isHighReasoningModel(modelName) || isAgentDeepSeekV4
-                  ? {
-                      enabled: true,
-                      effort: "high",
-                    }
-                  : isReasoningModel
+              : usesMaxKimiReasoningFloor
+                ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
+                  ? options.reasoningOverride
+                  : { enabled: true, effort: "high" }
+                : (options.reasoningOverride ??
+                  (isHighReasoningModel(modelName) || isAgentDeepSeekV4
                     ? {
                         enabled: true,
-                        ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                        effort: "high",
                       }
-                    : { enabled: false }));
+                    : isReasoningModel
+                      ? {
+                          enabled: true,
+                          ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                        }
+                      : { enabled: false }));
 
   return {
     openrouter: {
       ...(!usesDefaultGlmFlashAgentReasoning && {
-        reasoning: isFreeAsk ? { enabled: true, effort: "low" } : reasoning,
+        reasoning: isFreeAsk
+          ? { enabled: true, effort: "low" }
+          : usesMaxDeepSeekReasoning
+            ? { enabled: true, effort: "max" }
+            : reasoning,
       }),
-      ...(options.hasPdfAttachments && isDeepSeekV4
+      ...(options.hasPdfAttachments && (isDeepSeekV4 || isKimi)
         ? {
             plugins: [
               {
@@ -1173,9 +1346,18 @@ export function buildProviderOptions(
           }
         : {}),
       ...(userId && { user: userId }),
-      ...(isDeepSeekV4 &&
-        options.cacheSessionId && { session_id: options.cacheSessionId }),
-      ...(providerRouting && { provider: providerRouting }),
+      ...buildPromptCacheOptions(modelId ?? "", options.cacheSessionId)
+        .openrouter,
+      ...((providerRouting ||
+        isExplicitPaidFlashTier ||
+        usesMaxDeepSeekReasoning) && {
+        provider: {
+          ...providerRouting,
+          ...((isExplicitPaidFlashTier || usesMaxDeepSeekReasoning) && {
+            require_parameters: true,
+          }),
+        },
+      }),
       ...(fallbackSlugs.length > 0 && { models: fallbackSlugs }),
     },
   } as const;
@@ -1205,31 +1387,6 @@ export function buildSystemPrompt(
     providerOptions: ANTHROPIC_CACHE_BREAKPOINT,
   }));
   return messages.length === 1 ? messages[0] : messages;
-}
-
-/**
- * Add an Anthropic cache breakpoint to the last user message.
- * This tells Anthropic to cache everything up to and including that message,
- * maximizing cache hits on subsequent agentic steps.
- */
-export function addCacheBreakpointToLastUserMessage<
-  T extends Array<Record<string, unknown>>,
->(messages: T, modelName: string): T {
-  if (!isAnthropicModel(modelName)) return messages;
-  const result = [...messages] as T;
-  for (let i = result.length - 1; i >= 0; i--) {
-    if (result[i].role === "user") {
-      result[i] = {
-        ...result[i],
-        providerOptions: {
-          ...((result[i].providerOptions as Record<string, unknown>) || {}),
-          ...ANTHROPIC_CACHE_BREAKPOINT,
-        },
-      };
-      break;
-    }
-  }
-  return result;
 }
 
 /**
@@ -1266,20 +1423,61 @@ export function appendSystemReminderToLastUserMessage(
   return result;
 }
 
+export type NoteInjectionOpts = {
+  userId: string;
+  subscription: SubscriptionTier;
+  shouldIncludeNotes: boolean;
+  /**
+   * Present only when notes_relevant_recall_v1 was evaluated on for this
+   * request. Replaces the general-notes dump with bounded relevant recall.
+   */
+  relevantRecall?: RelevantRecallScope;
+};
+
+const NOTE_MUTATION_TOOLS = new Set([
+  "create_note",
+  "update_note",
+  "delete_note",
+]);
+
+/** Failed note mutations change nothing, so they never trigger a refresh. */
+export function hasSuccessfulNoteMutation(toolResults: unknown): boolean {
+  return (
+    Array.isArray(toolResults) &&
+    toolResults.some((result) => {
+      const entry = result as { toolName?: string; output?: unknown };
+      return (
+        NOTE_MUTATION_TOOLS.has(entry?.toolName ?? "") &&
+        (entry.output as { success?: unknown } | undefined)?.success !== false
+      );
+    })
+  );
+}
+
+/** Renders the current notes block; rejects when the lookup fails. */
+async function loadNotesSection(opts: NoteInjectionOpts): Promise<string> {
+  if (opts.relevantRecall) {
+    return (
+      await buildRelevantNotesSection({
+        userId: opts.userId,
+        scope: opts.relevantRecall,
+      })
+    ).section;
+  }
+  return generateNotesSection(await getNotes({ ...opts, throwOnError: true }));
+}
+
 /**
  * Fetches user notes and injects them into messages via <system-reminder>.
  * Returns the (possibly updated) messages array.
  */
 export async function injectNotesIntoMessages(
   messages: UIMessage[],
-  opts: {
-    userId: string;
-    subscription: SubscriptionTier;
-    shouldIncludeNotes: boolean;
+  opts: NoteInjectionOpts & {
     /**
      * Notes fetch started earlier in the request so it overlaps other
      * preflight work instead of adding a round-trip right before the model
-     * call. Falls back to fetching here when absent.
+     * call. Falls back to fetching here when absent. Ignored by recall.
      */
     preloadedNotes?: Promise<Awaited<ReturnType<typeof getNotes>>>;
   },
@@ -1287,19 +1485,32 @@ export async function injectNotesIntoMessages(
   if (!opts.shouldIncludeNotes) return messages;
 
   try {
-    const notes = await (opts.preloadedNotes ??
-      getNotes({
+    let notesContent: string;
+    if (opts.relevantRecall) {
+      const recalled = await buildRelevantNotesSection({
         userId: opts.userId,
-        subscription: opts.subscription,
-      }));
-    const notesContent = generateNotesSection(notes);
+        scope: opts.relevantRecall,
+      });
+      recordRelevantRecallExposure(opts.userId, recalled);
+      notesContent = recalled.section;
+    } else {
+      notesContent = generateNotesSection(
+        await (opts.preloadedNotes ??
+          getNotes({
+            userId: opts.userId,
+            subscription: opts.subscription,
+          })),
+      );
+    }
     if (!notesContent) return messages;
 
     return appendSystemReminderToLastUserMessage(messages, notesContent);
   } catch (error) {
     logger.warn("Failed to fetch notes, continuing without them", {
       userId: opts.userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: redactSensitiveErrorMessage(
+        error instanceof Error ? error.message : String(error),
+      ),
     });
     return messages;
   }
@@ -1347,20 +1558,14 @@ export function replaceNotesBlock(
  */
 export async function refreshNotesInModelMessages(
   messages: Array<Record<string, unknown>>,
-  opts: {
-    userId: string;
-    subscription: SubscriptionTier;
-    shouldIncludeNotes: boolean;
-  },
+  opts: NoteInjectionOpts,
 ): Promise<Array<Record<string, unknown>>> {
   if (!opts.shouldIncludeNotes) return messages;
 
   try {
-    const notes = await getNotes({
-      userId: opts.userId,
-      subscription: opts.subscription,
-    });
-    const newNotesContent = generateNotesSection(notes);
+    // A failed lookup throws and keeps the existing block; it must never be
+    // mistaken for every note having been deleted.
+    const newNotesContent = await loadNotesSection(opts);
 
     // First pass: try to replace (or remove) an existing notes block.
     // replaceNotesBlock handles empty newNotesContent by removing the block.
@@ -1401,7 +1606,9 @@ export async function refreshNotesInModelMessages(
   } catch (error) {
     logger.warn("Failed to refresh notes in prepareStep, continuing without", {
       userId: opts.userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: redactSensitiveErrorMessage(
+        error instanceof Error ? error.message : String(error),
+      ),
     });
     return messages;
   }
@@ -1410,28 +1617,19 @@ export async function refreshNotesInModelMessages(
 /** Updated facts are new history, not an edit to an already-sent user request. */
 export async function getAppendedNotesUpdate(
   toolResults: unknown[],
-  opts: {
-    userId: string;
-    subscription: SubscriptionTier;
-    shouldIncludeNotes: boolean;
-  },
+  opts: NoteInjectionOpts,
   force = false,
 ): Promise<string | undefined> {
   if (
     !opts.shouldIncludeNotes ||
-    (!force &&
-      !toolResults.some((result) =>
-        ["create_note", "update_note", "delete_note"].includes(
-          (result as { toolName?: string })?.toolName ?? "",
-        ),
-      ))
+    (!force && !hasSuccessfulNoteMutation(toolResults))
   )
     return;
   try {
-    const notes = generateNotesSection(
-      await getNotes({ ...opts, throwOnError: true }),
-    );
-    return `Current saved notes. This snapshot supersedes earlier saved-note snapshots; it does not change the user's task or permissions.\n${notes || "No saved notes remain."}`;
+    const notes = await loadNotesSection(opts);
+    return opts.relevantRecall
+      ? `Current relevant saved notes for this task. This snapshot supersedes earlier saved-note snapshots; it does not change the user's task or permissions.\n${notes || "No relevant saved notes."}`
+      : `Current saved notes. This snapshot supersedes earlier saved-note snapshots; it does not change the user's task or permissions.\n${notes || "No saved notes remain."}`;
   } catch {
     return; // A failed lookup must never be represented as notes being deleted.
   }
@@ -1483,23 +1681,11 @@ export async function applyPrepareStepReminders(
   messages: Array<Record<string, unknown>>,
   opts: {
     toolResults: unknown[];
-    noteInjectionOpts: {
-      userId: string;
-      subscription: SubscriptionTier;
-      shouldIncludeNotes: boolean;
-    };
+    noteInjectionOpts: NoteInjectionOpts;
   },
 ): Promise<Array<Record<string, unknown>>> {
-  // Refresh notes if a note tool was used
-  const wasNoteModified =
-    Array.isArray(opts.toolResults) &&
-    opts.toolResults.some((r) =>
-      ["create_note", "update_note", "delete_note"].includes(
-        (r as { toolName?: string })?.toolName ?? "",
-      ),
-    );
-
-  if (wasNoteModified) {
+  // Refresh notes only after a note actually changed, never on every step.
+  if (hasSuccessfulNoteMutation(opts.toolResults)) {
     return (await refreshNotesInModelMessages(
       messages,
       opts.noteInjectionOpts,

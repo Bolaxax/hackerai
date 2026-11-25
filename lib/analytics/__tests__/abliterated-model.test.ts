@@ -3,6 +3,9 @@ import { AbliteratedModelTelemetry } from "../abliterated-model";
 import { guardLanguageModelProviderResponse } from "@/lib/ai/provider-response-guard";
 import { PLATFORM_AUTHORIZATION_ANNOTATION } from "@/lib/chat/platform-authorization";
 import {
+  ABLITERATED_PRO_THREE_STEPS_KEY,
+  ABLITERATED_FREE_THREE_STEPS_KEY,
+  ABLITERATED_FREE_THREE_STEPS_DEFAULT_KEY,
   ABLITERATED_EXPERIMENT_KEY,
   ABLITERATED_PAID_FIRST_STEP_KEY,
   ABLITERATED_PAID_MODERATED_DEFAULT_KEY,
@@ -21,7 +24,7 @@ const finishPart = {
 function model(
   parts: unknown[],
   fails = false,
-  modelId = "abliterated-model",
+  modelId = "deepseek-v4.1-flash-1017-cyber",
 ): LanguageModel {
   return {
     specificationVersion: "v3",
@@ -73,14 +76,14 @@ async function consume(
 ) {
   return consumeModel(telemetry.wrap(source, stepIndex));
 }
-describe("Abliteration stream telemetry", () => {
+describe("treatment stream telemetry", () => {
   const capture = jest.fn();
   const create = () =>
     new AbliteratedModelTelemetry({ capture }, "user", {
       assignment: {
         key: ABLITERATED_EXPERIMENT_KEY,
         variant: "test",
-        modelKey: "model-abliterated",
+        modelKey: "model-inference-cyber",
         baselineModel: "model-deepseek-v4-flash-0731",
       },
       messageId: "message",
@@ -88,6 +91,150 @@ describe("Abliteration stream telemetry", () => {
       mode: "ask",
       subscription: "pro",
     });
+  it.each([
+    [ABLITERATED_FREE_THREE_STEPS_KEY, "control"],
+    [ABLITERATED_FREE_THREE_STEPS_KEY, "test"],
+    [ABLITERATED_FREE_THREE_STEPS_DEFAULT_KEY, "test"],
+  ] as const)(
+    "measures Free %s %s routing, retries and tools without exporting content",
+    async (key, variant) => {
+      capture.mockClear();
+      const telemetry = new AbliteratedModelTelemetry({ capture }, "free", {
+        assignment: {
+          key,
+          variant,
+          modelKey:
+            variant === "test" ? "model-inference-cyber" : "ask-model-free-glm",
+          baselineModel: "ask-model-free-glm",
+          generationStepLimit: 3,
+        },
+        messageId: "original",
+        chatId: "fixture",
+        mode: "ask",
+        subscription: "free",
+        release: "qa-commit",
+      });
+      expect(events("abliterated_model_eligible")).toHaveLength(1);
+      const eligible = events("abliterated_model_eligible")[0].properties;
+      expect(eligible.experiment_key).toBe(key);
+      if (key === ABLITERATED_FREE_THREE_STEPS_DEFAULT_KEY) {
+        expect(eligible.routing_policy).toBe(key);
+        expect(eligible).not.toHaveProperty(`$feature/${key}`);
+        expect(eligible).not.toHaveProperty(
+          `$feature/${ABLITERATED_FREE_THREE_STEPS_KEY}`,
+        );
+      }
+      expect(events("abliterated_model_exposed")).toHaveLength(0);
+      await expect(consume(telemetry, model([], true), 0)).rejects.toThrow();
+      await consume(
+        telemetry,
+        model(
+          [
+            { type: "text-delta", id: "t", delta: "private answer" },
+            finishPart,
+          ],
+          false,
+          "z-ai/glm-5.3-flash",
+        ),
+      );
+      const calls = [
+        { toolCallId: "secret-id" },
+        { toolCallId: "bad", invalid: true },
+        { toolCallId: "deny" },
+        { toolCallId: "missing" },
+        { toolCallId: "thrown" },
+      ];
+      const results = [
+        {
+          toolCallId: "secret-id",
+          output: { content: "private tool output", exitCode: 0 },
+        },
+        { toolCallId: "bad", output: { error: "private error" } },
+        { toolCallId: "deny", output: { approvalDenied: true } },
+        { toolCallId: "unmatched", output: "private unmatched" },
+      ];
+      telemetry.recordToolStep(calls, results, [{ toolCallId: "thrown" }]);
+      telemetry.recordToolStep(calls, results, [{ toolCallId: "thrown" }]);
+      telemetry.setMessageId("replacement");
+      expect(telemetry.getSummary()).toMatchObject({
+        experiment_release: "qa-commit",
+        free_three_steps_measurement_version: 1,
+        provider_attempt_count: 2,
+        provider_error_count: 1,
+        time_to_first_visible_content_ms: expect.any(Number),
+        experiment_duration_ms: expect.any(Number),
+        tool_call_unique_count: 5,
+        tool_call_invalid_count: 1,
+        tool_result_matched_count: 4,
+        tool_result_missing_count: 1,
+        tool_result_unmatched_count: 1,
+        tool_result_denied_count: 1,
+        tool_result_reported_error_count: 2,
+        tool_result_without_reported_error_count: 1,
+      });
+      const encoded = JSON.stringify({
+        events: capture.mock.calls,
+        summary: telemetry.getSummary(),
+      });
+      for (const value of [
+        "private answer",
+        "private tool output",
+        "private error",
+        "secret-id",
+        "private unmatched",
+      ])
+        expect(encoded).not.toContain(value);
+      expect(events("abliterated_model_exposed")[0].properties).toMatchObject({
+        experiment_variant: variant,
+        experiment_request_id: "original",
+      });
+    },
+  );
+  it.each(["control", "test"] as const)(
+    "keeps %s assignment and request linkage through failed attempts and fallback",
+    async (variant) => {
+      const telemetry = new AbliteratedModelTelemetry({ capture }, "user", {
+        assignment: {
+          key: ABLITERATED_PRO_THREE_STEPS_KEY,
+          variant,
+          modelKey:
+            variant === "test"
+              ? "model-inference-cyber"
+              : "model-deepseek-v4-flash-0731",
+          baselineModel: "model-deepseek-v4-flash-0731",
+          selectionSource: "paid_first_step",
+          generationStepLimit: 3,
+        },
+        messageId: "original",
+        chatId: "chat",
+        mode: "agent",
+        subscription: "pro",
+      });
+      expect(events("abliterated_model_eligible")).toHaveLength(1);
+      expect(events("abliterated_model_exposed")).toHaveLength(0);
+      await expect(consume(telemetry, model([], true))).rejects.toThrow();
+      telemetry.setMessageId("replacement");
+      await consume(
+        telemetry,
+        model(answer, false, "deepseek/deepseek-v4-flash-0731"),
+      );
+      expect(events("abliterated_model_exposed")[0].properties).toMatchObject({
+        experiment_variant: variant,
+        experiment_request_id: "original",
+        message_id: "replacement",
+        pro_three_steps_measurement_version: 1,
+        generation_step_limit: 3,
+        response_model: "deepseek/deepseek-v4-flash-0731",
+      });
+      expect(telemetry.getSummary()).toMatchObject({
+        provider_attempt_count: 2,
+        provider_error_count: 1,
+        provider_completed_count: 1,
+        provider_pending_count: 0,
+      });
+      expect(telemetry.getRoutingMarker(true).completed).toBe(false);
+    },
+  );
   beforeEach(() => capture.mockClear());
   const events = (name: string) =>
     capture.mock.calls.map(([event]) => event).filter((e) => e.event === name);
@@ -116,7 +263,7 @@ describe("Abliteration stream telemetry", () => {
     },
   );
 
-  it("separates a successful Abliteration step and planned baseline continuation from fallback", async () => {
+  it("separates a successful Inference step and planned baseline continuation from fallback", async () => {
     const telemetry = create();
     await consume(telemetry, model(answer));
     await consumeModel(
@@ -141,8 +288,8 @@ describe("Abliteration stream telemetry", () => {
     );
     expect(telemetry.getSummary()).toMatchObject({
       vision_route_attempt_count: 1,
-      provider_abliteration_attempt_count: 0,
-      abliterated_provider_error_count: 0,
+      provider_inference_attempt_count: 0,
+      inference_provider_error_count: 0,
       fallback_served: false,
     });
   });
@@ -151,7 +298,7 @@ describe("Abliteration stream telemetry", () => {
     const telemetry = create();
     await expect(consume(telemetry, model([], true))).rejects.toThrow();
     expect(telemetry.getSummary()).toMatchObject({
-      abliterated_provider_error_count: 1,
+      inference_provider_error_count: 1,
       provider_error_recovery_attempt_count: 0,
       fallback_served: false,
     });
@@ -177,7 +324,7 @@ describe("Abliteration stream telemetry", () => {
     await consume(telemetry, model(answer, false, "deepseek/baseline"));
     await consume(telemetry, model(answer, false, "deepseek/baseline"), 1);
     expect(telemetry.getSummary()).toMatchObject({
-      abliterated_provider_error_count: 1,
+      inference_provider_error_count: 1,
       baseline_provider_error_count: 0,
       provider_error_recovery_attempt_count: 1,
       provider_error_recovery_served: true,
@@ -186,7 +333,7 @@ describe("Abliteration stream telemetry", () => {
     });
   });
 
-  it("attributes a later same-model disconnect recovery to baseline, not Abliteration fallback", async () => {
+  it("attributes a later same-model disconnect recovery to baseline, not Inference fallback", async () => {
     const telemetry = create();
     await consume(telemetry, model(answer));
     await expect(
@@ -194,7 +341,7 @@ describe("Abliteration stream telemetry", () => {
     ).rejects.toThrow();
     await consume(telemetry, model(answer, false, "deepseek/baseline"), 33);
     expect(telemetry.getSummary()).toMatchObject({
-      abliterated_provider_error_count: 0,
+      inference_provider_error_count: 0,
       baseline_provider_error_count: 1,
       provider_error_recovery_served: true,
       provider_error_fallback_served: false,
@@ -209,7 +356,7 @@ describe("Abliteration stream telemetry", () => {
     expect(telemetry.getSummary()).toMatchObject({
       output_recovery_attempt_count: 1,
       output_recovery_fallback_served: true,
-      abliterated_provider_error_count: 0,
+      inference_provider_error_count: 0,
       provider_error_fallback_served: false,
       fallback_served: true,
     });
@@ -319,7 +466,7 @@ describe("Abliteration stream telemetry", () => {
           variant,
           modelKey:
             variant === "test"
-              ? "model-abliterated"
+              ? "model-inference-cyber"
               : "model-deepseek-v4-flash-0731",
           baselineModel: "model-deepseek-v4-flash-0731",
         },
@@ -337,12 +484,13 @@ describe("Abliteration stream telemetry", () => {
           parts,
           false,
           step === 0 && variant === "test"
-            ? "abliterated-model"
+            ? "deepseek-v4.1-flash-1017-cyber"
             : "deepseek/deepseek-v4-flash-0731",
         );
         expect(await consume(telemetry, source, step)).toEqual(parts);
       }
-      expect(capture).toHaveBeenCalledTimes(3); // eligibility, exposure, first outcome
+      // Eligibility, exposure and first outcome, plus one Inference request.
+      expect(capture).toHaveBeenCalledTimes(variant === "test" ? 4 : 3);
       expect(
         events("abliterated_model_provider_outcome")[0].properties,
       ).toMatchObject({
@@ -356,7 +504,7 @@ describe("Abliteration stream telemetry", () => {
         provider_completed_count: 500,
         provider_pending_count: 0,
         provider_continuation_completed_count: 499,
-        provider_abliteration_attempt_count: variant === "test" ? 1 : 0,
+        provider_inference_attempt_count: variant === "test" ? 1 : 0,
         provider_baseline_attempt_count: variant === "test" ? 499 : 500,
         provider_usage_reported_count: 500,
         provider_input_tokens: 5000,
@@ -576,7 +724,7 @@ describe("Abliteration stream telemetry", () => {
     expect(await consume(create(), model([finishPart]))).toEqual([finishPart]);
     capture.mockReset();
   });
-  it("persists actual successful Abliteration use after later baseline steps", async () => {
+  it("persists actual successful Inference use after later baseline steps", async () => {
     const telemetry = create();
     const parts = [{ type: "text-delta", id: "t", delta: "ok" }, finishPart];
     expect(telemetry.getRoutingMarker(true).completed).toBe(false);
@@ -618,7 +766,7 @@ describe("Abliteration stream telemetry", () => {
       assignment: {
         key: ABLITERATED_EXPERIMENT_KEY,
         variant: "test",
-        modelKey: "model-abliterated",
+        modelKey: "model-inference-cyber",
         baselineModel: "model-deepseek-v4-flash-0731",
         selectionSource: "history",
         independentHistoryCount: 2,
@@ -652,7 +800,7 @@ describe("Abliteration stream telemetry", () => {
           key: ABLITERATED_PAID_THREE_STEPS_KEY,
           variant,
           generationStepLimit,
-          modelKey: "model-abliterated",
+          modelKey: "model-inference-cyber",
           baselineModel: "model-grok-4.6",
           selectionSource: "moderation",
         },
@@ -694,7 +842,7 @@ describe("Abliteration stream telemetry", () => {
           generationStepLimit:
             key === ABLITERATED_PAID_MODERATED_THREE_STEPS_DEFAULT_KEY ? 3 : 1,
           variant: "test",
-          modelKey: "model-abliterated",
+          modelKey: "model-inference-cyber",
           baselineModel: "model-grok-4.6",
           selectionSource: "moderation",
           moderationEligible: true,
@@ -717,7 +865,7 @@ describe("Abliteration stream telemetry", () => {
         moderation_checked: true,
         moderation_eligible: true,
         generation_step: 1,
-        requested_model: "abliterated-model",
+        requested_model: "deepseek-v4.1-flash-1017-cyber",
       });
     },
   );
@@ -726,7 +874,7 @@ describe("Abliteration stream telemetry", () => {
       assignment: {
         key: ABLITERATED_PAID_FIRST_STEP_KEY,
         variant: "test",
-        modelKey: "model-abliterated",
+        modelKey: "model-inference-cyber",
         baselineModel: "model-deepseek-v4-flash-0731",
         selectionSource: "paid_first_step",
         moderationEligible: false,
@@ -748,8 +896,8 @@ describe("Abliteration stream telemetry", () => {
       moderation_eligible: false,
       moderation_checked: false,
       generation_step: 1,
-      requested_model: "abliterated-model",
-      response_model: "abliterated-model",
+      requested_model: "deepseek-v4.1-flash-1017-cyber",
+      response_model: "deepseek-v4.1-flash-1017-cyber",
     });
     expect(telemetry.getRoutingMarker(true)).toEqual({
       version: 1,

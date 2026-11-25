@@ -1,5 +1,6 @@
+import { CloudWorkspaceRegionChoice } from "./CloudWorkspaceRegionChoice";
 import { BlockedChatBillingRecovery } from "./BlockedChatBillingRecovery";
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useId, useMemo, useRef } from "react";
 import { useAction, useQuery } from "convex/react";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,6 +18,7 @@ import {
 } from "@/lib/errors";
 import { useGlobalState } from "@/app/contexts/GlobalState";
 import { redirectToPricing } from "@/app/hooks/usePricingDialog";
+import { useStartNewChat } from "@/app/hooks/useStartNewChat";
 import { openSettingsDialog } from "@/lib/utils/settings-dialog";
 import {
   captureAddCreditCtaClick,
@@ -34,6 +36,7 @@ import {
 import type { ChatMode } from "@/types";
 import type { LimitCapReason } from "@/lib/limit-pressure";
 import {
+  SPENDING_LIMIT_EXPLANATION,
   getPaidDailyFreeAllowanceCtaText,
   getExtraUsageLimitCta,
   getLimitTypeForCapReason,
@@ -74,6 +77,12 @@ const getCurrentReturnPath = (): string => {
 
 export const MessageErrorState = (props: MessageErrorStateProps) => {
   const error = deserializeChatSDKErrorFromStream(props.error) ?? props.error;
+  if (
+    error instanceof ChatSDKError &&
+    error.metadata?.cloud_workspace_region_selection_required === true
+  ) {
+    return <CloudWorkspaceRegionChoice onRetry={() => props.onRetry()} />;
+  }
   const isUsageBlock =
     error instanceof ChatSDKError &&
     error.type === "rate_limit" &&
@@ -93,8 +102,8 @@ const MessageErrorContent = ({
   onReconnect,
   mode,
 }: MessageErrorStateProps) => {
-  const { subscription, initializeNewChat, setSelectedModel } =
-    useGlobalState();
+  const { subscription, setSelectedModel } = useGlobalState();
+  const startNewChat = useStartNewChat();
   const structuredStreamError = useMemo(
     () => deserializeChatSDKErrorFromStream(error),
     [error],
@@ -107,6 +116,7 @@ const MessageErrorContent = ({
     displayError instanceof ChatSDKError ? displayError.metadata : undefined;
   const resetTimestamp = metadata?.resetTimestamp as number | undefined;
   const capReason = metadata?.capReason as LimitCapReason | undefined;
+  const reconnectHelpId = useId();
   const upgradeImpressionRef = useRef(false);
   const addCreditImpressionRef = useRef(false);
   const paidDailyFreeAllowanceImpressionRef = useRef(false);
@@ -161,6 +171,10 @@ const MessageErrorContent = ({
     isNetworkStreamError(displayError);
 
   const isPaidUser = subscription !== "free";
+  // The server message and resetTimestamp describe the subscription cycle,
+  // while the spending limit resets each calendar month.
+  const isSpendingLimitBlock =
+    isRateLimitError && isPaidUser && capReason === "extra_usage_cap";
   const canUpgrade = shouldShowUpgradeCta({ subscription, capReason });
   const extraUsageCta = getExtraUsageLimitCta({ subscription, capReason });
   const limitType = getLimitTypeForCapReason(capReason);
@@ -397,7 +411,12 @@ const MessageErrorContent = ({
             : "text-destructive text-sm mb-2"
         }
       >
-        {isRateLimitError ? (
+        {isSpendingLimitBlock ? (
+          <p>
+            You&apos;ve reached your monthly extra usage spending limit.{" "}
+            {SPENDING_LIMIT_EXPLANATION}
+          </p>
+        ) : isRateLimitError ? (
           <MemoizedMarkdown content={errorMessage} />
         ) : isProviderContentBlocked ? (
           <>
@@ -409,7 +428,20 @@ const MessageErrorContent = ({
         ) : (
           <p>{errorMessage}</p>
         )}
-        {isRateLimitError && timeRemaining > 0 && (
+        {canReconnect && !isSuspensionError && (
+          // Reconnect only reattaches to the stream; it neither starts work nor
+          // confirms what the run did while this page was disconnected.
+          <p
+            id={reconnectHelpId}
+            className="text-xs text-muted-foreground mt-1"
+          >
+            Reconnect returns to this stream.{" "}
+            {mode === "agent"
+              ? "Retry checks for an active Agent run, then continues saved work if that run ended."
+              : "Retry starts a new attempt."}
+          </p>
+        )}
+        {isRateLimitError && !isSpendingLimitBlock && timeRemaining > 0 && (
           <p className="text-xs text-muted-foreground mt-1">
             Resets in {formatCountdown(timeRemaining)}
           </p>
@@ -559,7 +591,7 @@ const MessageErrorContent = ({
             )}
           </>
         ) : isProviderContentBlocked ? (
-          <Button variant="outline" size="sm" onClick={initializeNewChat}>
+          <Button variant="outline" size="sm" onClick={() => startNewChat()}>
             New Task
           </Button>
         ) : (
@@ -581,7 +613,12 @@ const MessageErrorContent = ({
             ) : (
               <>
                 {canReconnect && (
-                  <Button variant="default" size="sm" onClick={onReconnect}>
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={onReconnect}
+                    aria-describedby={reconnectHelpId}
+                  >
                     Reconnect
                   </Button>
                 )}
@@ -589,6 +626,7 @@ const MessageErrorContent = ({
                   variant="destructive"
                   size="sm"
                   onClick={() => onRetry()}
+                  aria-describedby={canReconnect ? reconnectHelpId : undefined}
                 >
                   Retry
                 </Button>

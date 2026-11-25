@@ -27,6 +27,8 @@ describe("subagent profiles", () => {
         { objective: "Test a browser flow" },
       );
       expect(instructions).toContain("<agent_browser>");
+      // Image-specific capabilities arrive after the worker attaches its own workspace.
+      expect(instructions).not.toContain("agent-browser 0.39.3");
       expect(instructions).toContain("<target_request_limits>");
       expect(instructions).toContain("Tabs within one session share cookies");
       expect(instructions).toContain(
@@ -55,9 +57,12 @@ describe("subagent profiles", () => {
     }
     expect(profile.allowedToolNames).toEqual([
       "run_terminal_cmd",
+      "browser_handoff",
       "interact_terminal_session",
       "get_terminal_files",
       "file",
+      "file_edit",
+      "file_write",
       "todo_write",
       "web_search",
       "open_url",

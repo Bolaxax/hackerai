@@ -1,4 +1,4 @@
-import { createAbliterationMediaRecovery } from "../abliteration-media-recovery";
+import { withStreamErrorParts } from "@/lib/ai/stream-error-parts";
 import { WritableStream as NodeWritableStream } from "node:stream/web";
 import {
   createUIMessageStream,
@@ -7,7 +7,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
-import { createRecoverableProviderErrorFilter } from "../provider-error-stream";
+import { createProviderErrorDeferral } from "../provider-error-stream";
 import {
   PLATFORM_AUTHORIZATION_ANNOTATION,
   preparePlatformAuthorizationForModel,
@@ -74,19 +74,17 @@ async function runRecovery(
     },
   });
   let primaryError: unknown;
-  let retried = false;
+  const primaryErrors = createProviderErrorDeferral();
   const output = createUIMessageStream({
     execute: ({ writer }) => {
       const result = streamText({
-        model: createAbliterationMediaRecovery(
-          async (messages) => messages,
-          new AbortController().signal,
-        )(primary),
+        // The Inference adapter applies this wrapper to its registered model.
+        model: withStreamErrorParts(primary),
         maxRetries: 0,
         messages: preparePlatformAuthorizationForModel(
           userMessages,
           true,
-          "model-abliterated",
+          "model-inference-cyber",
         ),
         onError: ({ error }) => {
           primaryError = error;
@@ -97,8 +95,10 @@ async function runRecovery(
           .toUIMessageStream({
             onFinish: ({ isAborted }) => {
               expect(isAborted).toBe(false);
-              if (!primaryError) return;
-              retried = true;
+              if (!primaryError) {
+                primaryErrors.release();
+                return;
+              }
               const retry = streamText({
                 model: fallback,
                 maxRetries: 0,
@@ -114,9 +114,10 @@ async function runRecovery(
                   onError: () => fallbackError.message,
                 }),
               );
+              primaryErrors.discard();
             },
           })
-          .pipeThrough(createRecoverableProviderErrorFilter(() => !retried)),
+          .pipeThrough(primaryErrors.filter()),
       );
     },
   });
@@ -131,7 +132,7 @@ async function runRecovery(
   expect(JSON.stringify(primary.doStreamCalls[0].prompt)).not.toContain(
     PLATFORM_AUTHORIZATION_ANNOTATION,
   );
-  if (retried)
+  if (fallback.doStreamCalls.length > 0)
     expect(JSON.stringify(fallback.doStreamCalls[0].prompt)).toContain(
       PLATFORM_AUTHORIZATION_ANNOTATION,
     );
@@ -142,11 +143,11 @@ it.each([400, 401, 402, 403, 404, 413, 415, 429, 500, 503])(
   "hides HTTP %s and streams the baseline answer with legacy authorization",
   async (statusCode) => {
     const error = Object.assign(
-      new Error("Abliteration insufficient balance / provider error"),
+      new Error("Inference insufficient balance / provider error"),
       { statusCode },
     );
     const primary = new MockLanguageModelV3({
-      modelId: "abliterated-model",
+      modelId: "deepseek-v4.1-flash-1017-cyber",
       doStream: async () => {
         throw error;
       },
@@ -168,7 +169,7 @@ it.each(["in-band", "socket"])(
   async (kind) => {
     const error = new Error("Provider stream failed");
     const primary = new MockLanguageModelV3({
-      modelId: "abliterated-model",
+      modelId: "deepseek-v4.1-flash-1017-cyber",
       doStream: async () => {
         const parts: StreamPart[] = [
           { type: "text-start", id: "partial" },
@@ -201,7 +202,7 @@ it.each(["in-band", "socket"])(
 
 it("does not hide an OpenRouter failure or retry it again", async () => {
   const primary = new MockLanguageModelV3({
-    modelId: "abliterated-model",
+    modelId: "deepseek-v4.1-flash-1017-cyber",
     doStream: async () => {
       throw new Error("No balance");
     },
@@ -215,10 +216,186 @@ it("does not hide an OpenRouter failure or retry it again", async () => {
 
 it("leaves successful treatment streaming unchanged", async () => {
   const primary = new MockLanguageModelV3({
-    modelId: "abliterated-model",
+    modelId: "deepseek-v4.1-flash-1017-cyber",
     doStream: async () => response(successfulParts),
   });
   const { chunks, fallback } = await runRecovery(primary);
   expect(fallback.doStreamCalls).toHaveLength(0);
   expect(chunks.some((chunk) => chunk.type === "error")).toBe(false);
+});
+
+describe("attempt terminal deferral", () => {
+  const failed: UIMessageChunk[] = [
+    { type: "start", messageId: "attempt" },
+    { type: "text-start", id: "t" },
+    { type: "text-delta", id: "t", delta: "partial" },
+    { type: "error", errorText: "provider failed" },
+    { type: "finish-step" },
+    { type: "message-metadata", messageMetadata: { step: 1 } },
+    { type: "finish" },
+  ];
+  const succeeded: UIMessageChunk[] = [
+    { type: "start", messageId: "attempt" },
+    { type: "text-start", id: "t" },
+    { type: "text-delta", id: "t", delta: "answer" },
+    { type: "text-end", id: "t" },
+    { type: "finish-step" },
+    { type: "finish" },
+  ];
+  const isTerminal = (chunk: UIMessageChunk) =>
+    chunk.type === "error" || chunk.type === "finish";
+
+  /**
+   * Write the attempt while a reader drains, settle, then close. The filter's
+   * readable has no buffer, so each write completes only after the reader has
+   * taken every earlier published chunk: completed writes are the barrier for
+   * observing what was published before settlement.
+   */
+  async function settle(
+    attempt: UIMessageChunk[],
+    action: (deferral: ReturnType<typeof createProviderErrorDeferral>) => void,
+    trailing: UIMessageChunk[] = [],
+    options?: Parameters<typeof createProviderErrorDeferral>[0],
+  ) {
+    const deferral = createProviderErrorDeferral(options);
+    const filter = deferral.filter<UIMessageChunk>();
+    const writer = filter.writable.getWriter();
+    const reader = filter.readable.getReader();
+    const output: UIMessageChunk[] = [];
+    const read = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        output.push(value);
+      }
+    })();
+    for (const chunk of attempt) await writer.write(chunk);
+    const beforeSettlement = [...output];
+    action(deferral);
+    for (const chunk of trailing) await writer.write(chunk);
+    await writer.close();
+    await read;
+    return { beforeSettlement, output };
+  }
+
+  it("holds a failed attempt from its error until the owner settles", async () => {
+    const { beforeSettlement } = await settle(failed, () => {});
+    expect(beforeSettlement).toEqual(failed.slice(0, 3));
+  });
+
+  it("holds a successful attempt's finish until the owner settles", async () => {
+    const { beforeSettlement } = await settle(succeeded, () => {});
+    expect(beforeSettlement).toEqual(succeeded.slice(0, -1));
+  });
+
+  it.each([
+    ["failed", failed],
+    ["successful", succeeded],
+  ])(
+    "drops only the %s attempt's error and finish when recovery is scheduled",
+    async (_kind, attempt) => {
+      const { output } = await settle(attempt, (deferral) =>
+        deferral.discard(),
+      );
+      expect(output).toEqual(attempt.filter((chunk) => !isTerminal(chunk)));
+    },
+  );
+
+  it.each([
+    [
+      "release",
+      (deferral: ReturnType<typeof createProviderErrorDeferral>) =>
+        deferral.release(),
+    ],
+    ["stream end", () => {}],
+  ])(
+    "publishes everything unchanged on %s without a scheduled recovery",
+    async (_kind, action) => {
+      const { output } = await settle(failed, action);
+      expect(output).toEqual(failed);
+    },
+  );
+
+  it("settles once and treats later terminal chunks by that settlement", async () => {
+    const trailing: UIMessageChunk[] = [
+      { type: "message-metadata", messageMetadata: { late: true } },
+      { type: "error", errorText: "late failure" },
+      { type: "finish" },
+    ];
+    const discarded = await settle(
+      failed,
+      (deferral) => {
+        deferral.discard();
+        deferral.release();
+      },
+      trailing,
+    );
+    expect(discarded.output).toEqual(
+      [...failed, ...trailing].filter((chunk) => !isTerminal(chunk)),
+    );
+
+    const released = await settle(
+      failed,
+      (deferral) => {
+        deferral.release();
+        deferral.discard();
+      },
+      trailing,
+    );
+    expect(released.output).toEqual([...failed, ...trailing]);
+  });
+
+  it("refuses to share one deferral across attempt streams", () => {
+    const deferral = createProviderErrorDeferral();
+    deferral.filter();
+    expect(() => deferral.filter()).toThrow("owns one attempt stream");
+  });
+
+  // Once released, a trailing chunk passes straight through; its completed
+  // write proves every chunk before it was read before settlement.
+  const trailer: UIMessageChunk = {
+    type: "message-metadata",
+    messageMetadata: { barrier: true },
+  };
+
+  it("publishes an error named for immediate publication at once, unhideable", async () => {
+    const publishImmediately = jest.fn(() => true);
+    const { beforeSettlement, output } = await settle(
+      [...failed, trailer],
+      (deferral) => deferral.discard(),
+      [],
+      { publishImmediately },
+    );
+    expect(beforeSettlement.slice(0, failed.length)).toEqual(failed);
+    expect(output).toEqual([...failed, trailer]);
+    // Consulted only for the error itself, not for ordinary or finish chunks.
+    expect(publishImmediately).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an earlier held finish before an immediate error, in order", async () => {
+    const heldFinishThenError: UIMessageChunk[] = [
+      ...succeeded,
+      { type: "error", errorText: "local read failed" },
+    ];
+    const { beforeSettlement } = await settle(
+      [...heldFinishThenError, trailer],
+      () => {},
+      [],
+      { publishImmediately: () => true },
+    );
+    expect(beforeSettlement.slice(0, heldFinishThenError.length)).toEqual(
+      heldFinishThenError,
+    );
+  });
+
+  it("keeps deferring when the immediate-publication predicate declines", async () => {
+    const { beforeSettlement, output } = await settle(
+      failed,
+      (deferral) => deferral.discard(),
+      [],
+      { publishImmediately: () => false },
+    );
+    expect(beforeSettlement).toEqual(failed.slice(0, 3));
+    expect(output).toEqual(failed.filter((chunk) => !isTerminal(chunk)));
+  });
 });

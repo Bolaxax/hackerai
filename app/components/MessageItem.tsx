@@ -1,4 +1,5 @@
 import type { LimitRescueRequest } from "@/types/chat";
+import { GoalTargetIcon } from "@/components/icons/goal-target";
 import { memo, useMemo, useCallback, Fragment, useState } from "react";
 import { MessageActions } from "./MessageActions";
 import { MessagePartHandler } from "./MessagePartHandler";
@@ -19,7 +20,15 @@ import {
   WorkedForContent,
   WorkedForTrigger,
 } from "@/components/ai-elements/worked-for";
-import { ChevronDown, ChevronUp, FileSearch } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  FileSearch,
+  CircleCheck,
+  CircleStop,
+} from "lucide-react";
+import { requiresManualAgentResume } from "@/lib/chat/manual-agent-resume";
+import { CLIENT_SAVED_FINISH_REASON } from "@/lib/chat/stop-conditions";
 import {
   extractMessageText,
   hasTextContent,
@@ -66,6 +75,9 @@ interface MessageItemProps {
   feedbackInputMessageId: string | null;
   tempChatFileDetails?: Map<string, FileDetails[]>;
   finishReason?: string;
+  continueDisabledReason?: string;
+  /** The stopped run's own computer is connected again. */
+  stoppedComputerReconnected?: boolean;
   mode?: ChatMode;
   branchedFromChatId?: string;
   branchedFromChatTitle?: string;
@@ -116,6 +128,10 @@ function areMessageItemPropsEqual(
     return false;
   if (prev.lastUserMessageIndex !== next.lastUserMessageIndex) return false;
   if (prev.finishReason !== next.finishReason) return false;
+  if (prev.continueDisabledReason !== next.continueDisabledReason) return false;
+  if (prev.stoppedComputerReconnected !== next.stoppedComputerReconnected)
+    return false;
+  if (prev.onContinue !== next.onContinue) return false;
   if (prev.mode !== next.mode) return false;
   if (prev.agentRunSpendCapWarning !== next.agentRunSpendCapWarning)
     return false;
@@ -141,6 +157,9 @@ function areMessageItemPropsEqual(
     const prevLastPart = prev.message.parts[prev.message.parts.length - 1];
     const nextLastPart = next.message.parts[next.message.parts.length - 1];
     if (prevLastPart !== nextLastPart) return false;
+    // Persisted file metadata can arrive with unchanged parts; file cards and
+    // inline sandbox download links both depend on it.
+    if (prev.message.fileDetails !== next.message.fileDetails) return false;
     // generationTimeMs arrives in message-metadata after the last text-delta;
     // parts may be unchanged but metadata needs to trigger a re-render so the
     // "Worked for X" pill shows the duration.
@@ -159,6 +178,16 @@ function areMessageItemPropsEqual(
     if (
       prev.message.metadata?.feedbackType !==
       next.message.metadata?.feedbackType
+    )
+      return false;
+    if (
+      prev.message.metadata?.userStopped !== next.message.metadata?.userStopped
+    )
+      return false;
+    if (
+      prev.message.metadata?.goal?.sent !== next.message.metadata?.goal?.sent ||
+      prev.message.metadata?.goal?.achievedElapsedMs !==
+        next.message.metadata?.goal?.achievedElapsedMs
     )
       return false;
     if (prev.message.createdAt !== next.message.createdAt) return false;
@@ -182,6 +211,8 @@ export const MessageItem = memo(function MessageItem({
   feedbackInputMessageId,
   tempChatFileDetails,
   finishReason,
+  continueDisabledReason,
+  stoppedComputerReconnected,
   mode,
   branchedFromChatId,
   branchedFromChatTitle,
@@ -239,6 +270,8 @@ export const MessageItem = memo(function MessageItem({
     workParts,
     workPartIndexes,
     trailingTextParts,
+    trailingTextOffset,
+    savedResults,
   } = useMemo(() => splitWorkedForParts(message.parts), [message.parts]);
   const workProjection = useMemo(
     () =>
@@ -251,6 +284,11 @@ export const MessageItem = memo(function MessageItem({
     workPresentation === "timeline-shell" ? trailingTextParts : nonFileParts;
   const shouldRenderWorkedFor =
     message.metadata?.mode === "agent" && workPresentation === "inline";
+  // Saved hunt results and read reports are kept out of the work and shown
+  // once below the answer, so they stay visible when Worked for is collapsed.
+  // Other views render them in place with the rest of the message.
+  const showsSavedResults =
+    shouldRenderWorkedFor || workPresentation === "timeline-shell";
 
   const shouldCollapseUserMessage =
     isUser &&
@@ -316,6 +354,11 @@ export const MessageItem = memo(function MessageItem({
     if (isUser || !effectiveFileDetails) return [];
     return effectiveFileDetails.filter((f) => f.url || f.fileId || f.s3Key);
   }, [isUser, effectiveFileDetails]);
+  const showsFileParts = !isUser && hasFileContent && nonFileParts.length === 0;
+  const showsSavedFiles =
+    !isUser &&
+    savedFiles.length > 0 &&
+    !(status === "streaming" && isLastAssistantMessage);
 
   const renderAssistantPart = (
     part: ChatMessage["parts"][number],
@@ -351,6 +394,15 @@ export const MessageItem = memo(function MessageItem({
       )}
     </>
   );
+
+  const renderSavedResults = () =>
+    showsSavedResults && savedResults.length > 0 ? (
+      <div key="saved-results" className="space-y-3">
+        {savedResults.map(({ part, partIndex }) =>
+          renderAssistantPart(part, partIndex),
+        )}
+      </div>
+    ) : null;
 
   const shouldShowBranchIndicator = Boolean(
     branchedFromChatId &&
@@ -411,11 +463,20 @@ export const MessageItem = memo(function MessageItem({
     return null;
   }
 
+  const showsUserStop =
+    message.metadata?.userStopped === true &&
+    !(isLastMessage && (status === "streaming" || status === "submitted"));
+  // The divider explains a manual Stop; keep notices that need recovery.
+  const userStopOwnsFinishNotice =
+    showsUserStop &&
+    !requiresManualAgentResume(finishReason) &&
+    finishReason !== CLIENT_SAVED_FINISH_REASON;
+
   return (
     <Fragment>
       <div
         data-testid={isUser ? "user-message" : "assistant-message"}
-        className={`message-row flex flex-col ${isUser ? "items-end" : "items-start"}`}
+        className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
       >
@@ -452,7 +513,8 @@ export const MessageItem = memo(function MessageItem({
             )}
 
             {/* Render text and other parts */}
-            {renderedNonFileParts.length > 0 && (
+            {(renderedNonFileParts.length > 0 ||
+              (showsSavedResults && savedResults.length > 0)) && (
               <div
                 data-testid="message-content"
                 className={`${
@@ -506,18 +568,21 @@ export const MessageItem = memo(function MessageItem({
                     )}
                   </div>
                 ) : !shouldRenderWorkedFor ? (
-                  renderedNonFileParts.map((part, partIndex) => (
-                    <MessagePartHandler
-                      key={`${message.id}-${partIndex}`}
-                      message={message}
-                      part={part}
-                      partIndex={partIndex}
-                      status={effectiveStatus}
-                      isLastMessage={isLastMessage}
-                      terminalOutputByToolCallId={terminalOutputByToolCallId}
-                      sharedFileDetails={effectiveFileDetails}
-                    />
-                  ))
+                  <>
+                    {renderedNonFileParts.map((part, partIndex) => (
+                      <MessagePartHandler
+                        key={`${message.id}-${partIndex}`}
+                        message={message}
+                        part={part}
+                        partIndex={partIndex}
+                        status={effectiveStatus}
+                        isLastMessage={isLastMessage}
+                        terminalOutputByToolCallId={terminalOutputByToolCallId}
+                        sharedFileDetails={effectiveFileDetails}
+                      />
+                    ))}
+                    {renderSavedResults()}
+                  </>
                 ) : shouldShowWorkingTimer ? (
                   <>
                     {workParts.length > 0 && (
@@ -543,16 +608,20 @@ export const MessageItem = memo(function MessageItem({
                         {trailingTextParts.map((part, partIndex) =>
                           renderAssistantPart(
                             part,
-                            workParts.length + partIndex,
+                            trailingTextOffset + partIndex,
                           ),
                         )}
                       </div>
                     )}
+                    {renderSavedResults()}
                   </>
                 ) : trailingTextParts.length === 0 ? (
                   // If a run stops before producing final text, keep the work
                   // visible inline instead of leaving only a collapsed header.
-                  renderWorkParts()
+                  <>
+                    {renderWorkParts()}
+                    {renderSavedResults()}
+                  </>
                 ) : (
                   <>
                     {workParts.length > 0 && (
@@ -576,18 +645,19 @@ export const MessageItem = memo(function MessageItem({
                         {trailingTextParts.map((part, partIndex) =>
                           renderAssistantPart(
                             part,
-                            workParts.length + partIndex,
+                            trailingTextOffset + partIndex,
                           ),
                         )}
                       </div>
                     )}
+                    {renderSavedResults()}
                   </>
                 )}
               </div>
             )}
 
             {/* For assistant messages without the user-specific styling, render files mixed with content */}
-            {!isUser && fileParts.length > 0 && nonFileParts.length === 0 && (
+            {showsFileParts && (
               <div className="prose space-y-3 max-w-none dark:prose-invert min-w-0 overflow-hidden">
                 {message.parts.map((part, partIndex) => (
                   <MessagePartHandler
@@ -606,68 +676,66 @@ export const MessageItem = memo(function MessageItem({
         )}
 
         {/* Saved files from tools (hidden only on the actively streaming message - previous messages always show files) */}
-        {!isUser &&
-          savedFiles.length > 0 &&
-          !(status === "streaming" && isLastAssistantMessage) && (
-            <div className="mt-2 flex flex-wrap items-center gap-2 w-full animate-in fade-in-0 duration-200">
-              {savedFiles.length > 2 ? (
-                <>
-                  {/* Show only last file when more than 2 */}
-                  <FilePartRenderer
-                    key={`${message.id}-saved-file-${savedFiles.length - 1}`}
-                    part={{
-                      url: savedFiles[savedFiles.length - 1].url ?? undefined,
-                      fileId: savedFiles[savedFiles.length - 1].fileId,
-                      s3Key: savedFiles[savedFiles.length - 1].s3Key,
-                      name: savedFiles[savedFiles.length - 1].name,
-                      filename: savedFiles[savedFiles.length - 1].name,
-                      mediaType: savedFiles[savedFiles.length - 1].mediaType,
-                      sizeBytes: savedFiles[savedFiles.length - 1].sizeBytes,
-                    }}
-                    partIndex={savedFiles.length - 1}
-                    messageId={message.id}
-                    totalFileParts={savedFiles.length}
+        {showsSavedFiles && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 w-full animate-in fade-in-0 duration-200">
+            {savedFiles.length > 2 ? (
+              <>
+                {/* Show only last file when more than 2 */}
+                <FilePartRenderer
+                  key={`${message.id}-saved-file-${savedFiles.length - 1}`}
+                  part={{
+                    url: savedFiles[savedFiles.length - 1].url ?? undefined,
+                    fileId: savedFiles[savedFiles.length - 1].fileId,
+                    s3Key: savedFiles[savedFiles.length - 1].s3Key,
+                    name: savedFiles[savedFiles.length - 1].name,
+                    filename: savedFiles[savedFiles.length - 1].name,
+                    mediaType: savedFiles[savedFiles.length - 1].mediaType,
+                    sizeBytes: savedFiles[savedFiles.length - 1].sizeBytes,
+                  }}
+                  partIndex={savedFiles.length - 1}
+                  messageId={message.id}
+                  totalFileParts={savedFiles.length}
+                />
+                {/* View all files button */}
+                <button
+                  onClick={() =>
+                    onShowAllFiles(message, effectiveFileDetails || [])
+                  }
+                  className="h-[55px] ps-4 pe-1.5 w-full max-w-80 min-w-64 flex items-center gap-1.5 rounded-[12px] border-[0.5px] border-border bg-background hover:bg-secondary transition-colors"
+                  type="button"
+                  aria-label="View all files"
+                >
+                  <FileSearch
+                    className="w-4 h-4 text-muted-foreground"
+                    strokeWidth={2}
                   />
-                  {/* View all files button */}
-                  <button
-                    onClick={() =>
-                      onShowAllFiles(message, effectiveFileDetails || [])
-                    }
-                    className="h-[55px] ps-4 pe-1.5 w-full max-w-80 min-w-64 flex items-center gap-1.5 rounded-[12px] border-[0.5px] border-border bg-background hover:bg-secondary transition-colors"
-                    type="button"
-                    aria-label="View all files"
-                  >
-                    <FileSearch
-                      className="w-4 h-4 text-muted-foreground"
-                      strokeWidth={2}
-                    />
-                    <span className="text-sm text-muted-foreground">
-                      View all files in this task
-                    </span>
-                  </button>
-                </>
-              ) : (
-                /* Show all files when 2 or less */
-                savedFiles.map((file, fileIndex) => (
-                  <FilePartRenderer
-                    key={`${message.id}-saved-file-${fileIndex}`}
-                    part={{
-                      url: file.url ?? undefined,
-                      fileId: file.fileId,
-                      s3Key: file.s3Key,
-                      name: file.name,
-                      filename: file.name,
-                      mediaType: file.mediaType,
-                      sizeBytes: file.sizeBytes,
-                    }}
-                    partIndex={fileIndex}
-                    messageId={message.id}
-                    totalFileParts={savedFiles.length}
-                  />
-                ))
-              )}
-            </div>
-          )}
+                  <span className="text-sm text-muted-foreground">
+                    View all files in this task
+                  </span>
+                </button>
+              </>
+            ) : (
+              /* Show all files when 2 or less */
+              savedFiles.map((file, fileIndex) => (
+                <FilePartRenderer
+                  key={`${message.id}-saved-file-${fileIndex}`}
+                  part={{
+                    url: file.url ?? undefined,
+                    fileId: file.fileId,
+                    s3Key: file.s3Key,
+                    name: file.name,
+                    filename: file.name,
+                    mediaType: file.mediaType,
+                    sizeBytes: file.sizeBytes,
+                  }}
+                  partIndex={fileIndex}
+                  messageId={message.id}
+                  totalFileParts={savedFiles.length}
+                />
+              ))
+            )}
+          </div>
+        )}
 
         {/* Inline summarization status - only shown when last assistant message has content */}
         {isLastAssistantMessage &&
@@ -684,9 +752,22 @@ export const MessageItem = memo(function MessageItem({
         {/* Finish reason notice under last assistant message */}
         {isLastAssistantMessage &&
           index > (lastUserMessageIndex ?? -1) &&
-          status !== "streaming" && (
+          status !== "streaming" &&
+          !userStopOwnsFinishNotice && (
             <FinishReasonNotice
               finishReason={finishReason}
+              lastSavedStep={
+                messageText.trim() ||
+                showsFileParts ||
+                showsSavedFiles ||
+                workProjection.activities.length > 0 ||
+                message.parts.some((part) => part.type.startsWith("tool-"))
+                  ? "agent-progress"
+                  : "conversation"
+              }
+              continueDisabledReason={continueDisabledReason}
+              stoppedComputerReconnected={stoppedComputerReconnected}
+              status={status}
               mode={mode}
               agentRunSpendCapPremiumContinuationAllowed={
                 agentRunSpendCapWarning?.premiumContinuationAllowed
@@ -695,6 +776,28 @@ export const MessageItem = memo(function MessageItem({
             />
           )}
 
+        {message.metadata?.goal && (
+          <div
+            className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+            aria-label="Goal message status"
+          >
+            {isUser && message.metadata.goal.sent ? (
+              <>
+                <GoalTargetIcon className="size-3.5" aria-hidden="true" />
+                <span>Sent as goal</span>
+              </>
+            ) : !isUser &&
+              typeof message.metadata.goal.achievedElapsedMs === "number" ? (
+              <>
+                <CircleCheck className="size-3.5" aria-hidden="true" />
+                <span title="Time spent pursuing the goal">
+                  Goal achieved in{" "}
+                  {formatGoalDuration(message.metadata.goal.achievedElapsedMs)}
+                </span>
+              </>
+            ) : null}
+          </div>
+        )}
         <MessageActions
           messageText={messageText}
           isUser={isUser}
@@ -726,6 +829,34 @@ export const MessageItem = memo(function MessageItem({
         )}
       </div>
 
+      {showsUserStop && (
+        <div
+          data-testid="user-stop-divider"
+          className="mt-2 flex items-center gap-2 py-3 text-sm sm:gap-4"
+        >
+          <div
+            aria-hidden
+            className="h-px min-w-2 flex-1 bg-border sm:min-w-4"
+          />
+          <div className="flex min-w-0 flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5">
+            <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-medium text-foreground/80">
+              <CircleStop
+                aria-hidden
+                className="size-4 shrink-0 text-muted-foreground"
+              />
+              Run interrupted
+            </span>{" "}
+            <span className="whitespace-nowrap text-muted-foreground">
+              <span aria-hidden>· </span>Stopped by user
+            </span>
+          </div>
+          <div
+            aria-hidden
+            className="h-px min-w-2 flex-1 bg-border sm:min-w-4"
+          />
+        </div>
+      )}
+
       {/* Branch indicator - show after the branched message */}
       {shouldShowBranchIndicator && (
         <BranchIndicator
@@ -736,3 +867,10 @@ export const MessageItem = memo(function MessageItem({
     </Fragment>
   );
 }, areMessageItemPropsEqual);
+
+function formatGoalDuration(ms: number): string {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}

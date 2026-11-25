@@ -29,39 +29,51 @@ Read [references/privacy-policy.md](references/privacy-policy.md) and
    Record the production PostHog project, cohort selection timestamp, a SHA-256
    fingerprint of the selection query, and any known selection limitations. Do
    not place the raw query in the gateway payload or report.
-3. Resolve each cohort member to the internal user ID used by Convex. Exclude
-   internal/test/fraud accounts and deduplicate payer or organization
-   relationships before triggering analysis. For authenticated HackerAI users,
-   select PostHog `distinct_id` as the internal Convex/WorkOS user ID; do not
-   require a duplicate person property or infer identity from email. Stop unless
-   1-20 unique internal user IDs remain after filtering.
-   For comparisons, preserve membership in `comparisonGroups`; use 2-4 groups
-   with at least three users each, and assign every `userIds` entry exactly
-   once. Group labels may describe the selected model, rollout, or funnel
-   treatment, but must not identify a person or organization.
-   For event-based questions, also select the PostHog event timestamp for each
-   user. Use it as that user's evidence anchor; do not substitute one shared
-   timestamp for the cohort.
-4. Create a mode-600 temporary JSON request outside the repository using the
-   gateway payload below. Run
-   `node .agents/skills/hackerai-user-research/scripts/run-research.mjs --payload <path>`.
-   The runner first reads the machine's `~/.config/hackerai/pm-research.key`
-   (an owner-only file; mode 600 recommended), then falls back to
-   `HACKERAI_PM_USER_RESEARCH_KEY` only when that file is absent. Run the runner
-   before declaring credentials missing; an unset Codex environment variable
-   does not prove the key is unavailable. See the runbook for key discovery.
-   It always calls the production HackerAI gateway. Never print the key, put it
-   in the request or command arguments, or use Trigger dashboard access. Remove
-   the temporary request after the command reads it.
-5. Wait for the runner to return a completed result. Keep the returned
-   `analysisId`; it is the audit and lookup key for the restricted Convex
-   records. Do not substitute direct Trigger access if the gateway fails.
+3. Select PostHog `distinct_id` as the internal Convex/WorkOS user ID.
+   Prepare a protected cohort export as described in the runbook, and pass it to
+   the runner with `--cohort <path>`. The builder applies explicit internal/test/
+   fraud exclusions, deduplicates connected user/payer/organization identities,
+   retains ranked order and per-user event anchors, and fingerprints the query.
+   Supply explicit boolean classifications from the selection query; unknown
+   classifications are excluded. Missing payer mapping is reported as incomplete
+   deduplication unless strict mapping was requested. Keep comparison labels
+   non-identifying; conflicting shared-payer groups are excluded. Comparisons
+   require 2-4 groups with at least three independent users each.
+4. Run the protected gateway runner with a JSON payload on stdin:
+   `node .agents/skills/hackerai-user-research/scripts/run-research.mjs --payload - --handle <private-handle-path> --cohort <private-export-path>`.
+   Keep the payload's question, label and sampling window; the cohort builder
+   supplies membership and selection metadata. Explicit membership payloads remain
+   supported without `--cohort`. File input remains available with `--payload <path>`;
+   it must be an owner-only regular file and defaults to `<path>.run.json` for recovery.
+   The runner discovers the machine key first, then the environment fallback when
+   that file is absent. Run it before declaring access missing. It always uses the
+   production gateway; do not substitute Trigger dashboard access.
+5. Preserve the handle. It stores only a request fingerprint, stable retry key,
+   timestamp and accepted run ID. Use `--resume <handle-path>` to wait for that
+   existing run or `--status <handle-path>` to inspect it once. Once a run ID is
+   known, these commands only use GET. Before submission the runner durably saves
+   the exact compiled request in an owner-only `<handle-path>.request.json` sidecar.
+   If the start response is lost, `--resume` retries that saved request with the
+   same key within 23 hours; `--status` never resubmits. The sidecar is removed
+   after the accepted run ID is durably saved. Preserve it with the handle while
+   the outcome is unknown; expired unknown submissions are blocked. A deliberate
+   new analysis requires a new handle after the existing submission is resolved.
+   Remove temporary input payload/cohort files only after a run ID or matching
+   request sidecar is durably saved. Otherwise preserve the original inputs,
+   including for legacy unknown handles. Retain the handle and returned
+   `analysisId` for audit lookup.
 6. Present the returned internal Convex/WorkOS user IDs together
    with the aggregate answer, evidence coverage, supported user types, avatars,
    primary/secondary target, confidence, unknowns, and experiments. User IDs are
    ordinary cohort-selection output and must not be hidden or replaced with
    pseudonyms. Detailed profiles remain in restricted Convex records and are not
-   returned through Trigger.
+   returned through Trigger. List `excludedUsers` separately from the analyzed
+   users, each with its reason: `model_content_filter` means the analysis
+   model refused to read that user's conversations, `no_eligible_evidence`
+   means no usable chats were in the window, and `profile_failed` means the
+   profile task errored. Findings cover only the analyzed users. When
+   `blockedProfiles` is nonzero, keep the report's content-filter unknown next
+   to the findings, because refused users may differ from analyzed users.
 7. Update an optional Linear issue only when asked. Copy aggregate findings,
    cohort IDs, coverage, confidence, unknowns, and experiments. Never copy raw
    evidence, customer message content, secrets, or restricted profile records.
@@ -178,7 +190,10 @@ payload. `userIds` must be the internal Convex/WorkOS user IDs.
   explicit survey reasons or a controlled experiment before making causal
   claims.
 - Comparison synthesis fails closed if fewer than three readable profiles
-  remain in any group. Grok 4.6 receives only pseudonyms and sanitized group
+  remain in any group. A failed run may return a closed `reason`:
+  `no_analyzable_profiles`, `comparison_group_below_minimum` or
+  `synthesis_blocked_by_content_filter`. Report it as given; content-filter
+  exclusions count toward the group minimum. Grok 4.6 receives only pseudonyms and sanitized group
   labels, never the internal ID-to-group mapping.
 - Say `unknown` when the evidence does not establish context. Never infer a
   company or occupation from an email address.

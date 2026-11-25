@@ -22,6 +22,7 @@ import {
 import { SUBAGENT_PARENT_DELIVERY_CLAIM_TTL_MS } from "../lib/ai/subagents/parent-delivery";
 import { toSubagentHandle } from "../lib/ai/subagents/agent-handle";
 import { isUserDeletionFenced } from "./lib/userDeletionFence";
+import { isUserBlockedFromChatHistory } from "./lib/suspensionGuards";
 
 const statusValidator = v.union(
   v.literal("queued"),
@@ -139,7 +140,8 @@ async function isSubagentChatAvailable(
   return (
     chat !== null &&
     chat.user_id === userId &&
-    chat.deletion_started_at === undefined
+    chat.deletion_started_at === undefined &&
+    !(await isUserBlockedFromChatHistory(ctx, userId))
   );
 }
 
@@ -944,6 +946,19 @@ export const attachTriggerRunForBackend = mutation({
     if (row.trigger_run_id && row.trigger_run_id !== args.triggerRunId) {
       return "stale" as const;
     }
+    if (
+      isActiveStatus(row.status) &&
+      (await isUserBlockedFromChatHistory(ctx, row.user_id))
+    ) {
+      await ctx.db.patch(row._id, {
+        trigger_run_id: args.triggerRunId,
+        status: "canceled",
+        cancel_reason: "account_restricted",
+        completed_at: Date.now(),
+        updated_at: Date.now(),
+      });
+      return "terminal" as const;
+    }
     const terminal = !isActiveStatus(row.status);
     const now = Date.now();
     await ctx.db.patch(row._id, {
@@ -972,10 +987,12 @@ export const markFinalizingForBackend = mutation({
     serviceKey: v.string(),
     subagentId: v.string(),
     triggerRunId: v.string(),
+    modelHandoffNoteIds: v.optional(v.array(v.string())),
   },
   returns: v.union(
     v.literal("updated"),
     v.literal("pending_messages"),
+    v.literal("pending_browser_handoff"),
     v.literal("stale"),
   ),
   handler: async (ctx, args) => {
@@ -998,6 +1015,26 @@ export const markFinalizingForBackend = mutation({
       )
       .first();
     if (pendingMessage) return "pending_messages" as const;
+    // Serialize result acceptance with takeover. Once finalizing commits,
+    // browserHandoffs rejects new claims because the child is no longer running.
+    const handoff = await ctx.db
+      .query("browser_handoffs")
+      .withIndex("by_chat_and_agent", (q) =>
+        q.eq("chat_id", row.chat_id).eq("agent_id", row.subagent_id),
+      )
+      .order("desc")
+      .first();
+    if (
+      handoff?.user_id === row.user_id &&
+      handoff.run_id === args.triggerRunId &&
+      handoff.expires_at > Date.now() &&
+      (!["agent", "closed"].includes(handoff.state) ||
+        (args.modelHandoffNoteIds !== undefined &&
+          (handoff.exit_note_ids ?? []).some(
+            (id) => !args.modelHandoffNoteIds?.includes(id),
+          )))
+    )
+      return "pending_browser_handoff" as const;
     await ctx.db.patch(row._id, {
       status: "finalizing",
       updated_at: Date.now(),

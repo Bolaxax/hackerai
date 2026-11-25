@@ -1,6 +1,8 @@
 import type { LimitRescueRequest } from "@/types/chat";
+import { LOCAL_CONNECTION_LOST_FINISH_REASON } from "@/lib/chat/local-connection-stop";
+import { requiresManualAgentResume } from "@/lib/chat/manual-agent-resume";
+import { FinishReasonNotice } from "./FinishReasonNotice";
 import { TaskOutcomeFeedback } from "./TaskOutcomeFeedback";
-import { AcquisitionSurvey } from "./AcquisitionSurvey";
 import {
   useState,
   useEffect,
@@ -56,7 +58,6 @@ import {
   getChatTimelineRowType,
   stabilizeChatTimelineRows,
   type ChatTimelineRow,
-  type StableChatTimelineRowsState,
 } from "./message-timeline-rows";
 import { CHAT_TIMELINE_ANCHOR_OFFSET } from "../hooks/useMessageScroll";
 
@@ -197,8 +198,25 @@ const setElementRef = (ref: StickyElementRef, element: HTMLElement | null) => {
   }
 };
 
+/**
+ * A steer the running Agent has not read yet, shown where it will land: the
+ * end of the current turn. Once read, it renders inline as a saved part.
+ */
+const PendingSteerBubble = ({ text }: { text: string }) => (
+  <div
+    className="my-2 flex w-full justify-end"
+    data-testid="pending-agent-steer"
+  >
+    <div className="max-w-[80%] rounded-[18px] rounded-se-lg border border-dashed border-border bg-secondary/60 px-4 py-1.5 text-primary-foreground">
+      <div className="text-xs text-muted-foreground" role="status">
+        Steer · waiting to be read
+      </div>
+      <div className="whitespace-pre-wrap break-words opacity-80">{text}</div>
+    </div>
+  </div>
+);
+
 interface MessagesProps {
-  acquisitionSurvey?: { messageId: string; mode: "ask" | "agent" };
   chatId: string;
   messages: ChatMessage[];
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
@@ -225,6 +243,9 @@ interface MessagesProps {
   isMobile?: boolean;
   tempChatFileDetails?: Map<string, FileDetails[]>;
   finishReason?: string;
+  continueDisabledReason?: string;
+  /** The stopped run's own computer is connected again. */
+  stoppedComputerReconnected?: boolean;
   uploadStatus?: { message: string; isUploading: boolean } | null;
   summarizationStatus?: {
     status: "started" | "completed";
@@ -241,10 +262,13 @@ interface MessagesProps {
   branchedFromChatTitle?: string;
   anchorMessageId?: string | null;
   contentInsetEndAdjustment?: number;
+  /** Steers sent to the running Agent that it has not read yet. */
+  pendingSteers?: Array<{ id: string; text: string }>;
 }
 
+const EMPTY_PENDING_STEERS: Array<{ id: string; text: string }> = [];
+
 export const Messages = ({
-  acquisitionSurvey,
   chatId,
   messages,
   setMessages,
@@ -263,6 +287,8 @@ export const Messages = ({
   isMobile,
   tempChatFileDetails,
   finishReason,
+  continueDisabledReason,
+  stoppedComputerReconnected,
   uploadStatus,
   summarizationStatus,
   mode,
@@ -272,10 +298,12 @@ export const Messages = ({
   branchedFromChatTitle,
   anchorMessageId = null,
   contentInsetEndAdjustment = 0,
+  pendingSteers = EMPTY_PENDING_STEERS,
 }: MessagesProps) => {
   const { isAutoResuming } = useDataStreamState();
   // Prefetch and cache image URLs for better performance
-  const { getCachedUrl, setCachedUrl } = useFileUrlCache(messages);
+  const { getCachedUrl, setCachedUrl, loadImageUrl } =
+    useFileUrlCache(messages);
 
   // Filter out auto-continue messages for rendering
   const visibleMessages = useMemo(
@@ -291,10 +319,14 @@ export const Messages = ({
   const lastUserMessageIndex = useMemo(() => {
     return findLastUserMessageIndex(visibleMessages);
   }, [visibleMessages]);
-  const lastUserMessageId =
+  const lastUserMessage =
     lastUserMessageIndex === undefined
       ? undefined
-      : visibleMessages[lastUserMessageIndex]?.id;
+      : visibleMessages[lastUserMessageIndex];
+  // Goal objectives are updated in their sidebar, never by replaying a message.
+  const editableMessageId = lastUserMessage?.metadata?.goal?.sent
+    ? undefined
+    : lastUserMessage?.id;
 
   // Check if last assistant message has any content (text or files)
   const lastAssistantHasContent = useMemo(() => {
@@ -394,19 +426,22 @@ export const Messages = ({
     status,
     visibleMessages,
   ]);
-  const stableTimelineRowsRef = useRef<StableChatTimelineRowsState | null>(
-    null,
-  );
-  const stableTimelineRowsState = useMemo(
-    () =>
-      stabilizeChatTimelineRows(
-        rawTimelineRows,
-        stableTimelineRowsRef.current ?? createStableChatTimelineRowsState(),
-      ),
-    [rawTimelineRows],
-  );
+  const [stableRows, setStableRows] = useState(() => ({
+    source: rawTimelineRows,
+    state: stabilizeChatTimelineRows(
+      rawTimelineRows,
+      createStableChatTimelineRowsState(),
+    ),
+  }));
+  let stableTimelineRowsState = stableRows.state;
+  if (stableRows.source !== rawTimelineRows) {
+    stableTimelineRowsState = stabilizeChatTimelineRows(
+      rawTimelineRows,
+      stableRows.state,
+    );
+    setStableRows({ source: rawTimelineRows, state: stableTimelineRowsState });
+  }
   useLayoutEffect(() => {
-    stableTimelineRowsRef.current = stableTimelineRowsState;
     restoredAgentMessageStore.commit(
       chatId,
       stableTimelineRowsState.result,
@@ -450,27 +485,28 @@ export const Messages = ({
   // Memoized edit handlers to prevent unnecessary re-renders
   const handleStartEdit = useCallback(
     (messageId: string) => {
-      if (messageId === lastUserMessageId) {
+      if (messageId === editableMessageId) {
         setEditingMessageId(messageId);
       }
     },
-    [lastUserMessageId],
+    [editableMessageId],
   );
 
   const handleSaveEdit = useCallback(
     async (newContent: string, remainingFileIds: string[]) => {
-      if (editingMessageId && editingMessageId === lastUserMessageId) {
+      if (editingMessageId && editingMessageId === editableMessageId) {
         try {
           await onEditMessage(editingMessageId, newContent, remainingFileIds);
+          setEditingMessageId(null);
         } catch (error) {
           console.error("Failed to edit message:", error);
-          toast.error("Failed to edit message. Please try again.");
-        } finally {
-          setEditingMessageId(null);
+          toast.error(
+            "Could not save your edit. Your draft is kept; please try again.",
+          );
         }
       }
     },
-    [editingMessageId, lastUserMessageId, onEditMessage],
+    [editingMessageId, editableMessageId, onEditMessage],
   );
 
   const handleCancelEdit = useCallback(() => {
@@ -564,6 +600,8 @@ export const Messages = ({
         ":scope > .legend-list-content-container",
       ) ?? null;
 
+    // These DOM nodes exist only after LegendList commits; connect bottom-follow before paint.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setTimelineElements((current) =>
       current.scroll === scrollElement && current.content === contentElement
         ? current
@@ -724,8 +762,22 @@ export const Messages = ({
   const showPendingAgentReasoning =
     shouldShowLoadingDots && mode === "agent" && !isAutoResuming;
   const timelineExtraData = useMemo(
-    () => ({ editingMessageId, status }),
-    [editingMessageId, status],
+    () => ({
+      editingMessageId,
+      status,
+      finishReason,
+      continueDisabledReason,
+      stoppedComputerReconnected,
+      onContinue,
+    }),
+    [
+      editingMessageId,
+      status,
+      finishReason,
+      continueDisabledReason,
+      stoppedComputerReconnected,
+      onContinue,
+    ],
   );
   const renderTimelineRow = useCallback(
     ({ item: row }: { item: ChatTimelineRow }) => {
@@ -806,15 +858,17 @@ export const Messages = ({
               lastAssistantMessageIndex={lastAssistantMessageIndex}
               lastUserMessageIndex={lastUserMessageIndex}
               status={status}
-              canEdit={row.messageIndex === lastUserMessageIndex}
+              canEdit={row.message.id === editableMessageId}
               isEditing={
-                editingMessageId === lastUserMessageId &&
+                editingMessageId === editableMessageId &&
                 editingMessageId === row.message.id
               }
               isMobile={isMobile}
               feedbackInputMessageId={feedbackInputMessageId}
               tempChatFileDetails={tempChatFileDetails}
               finishReason={finishReason}
+              continueDisabledReason={continueDisabledReason}
+              stoppedComputerReconnected={stoppedComputerReconnected}
               mode={mode}
               agentRunSpendCapWarning={agentRunSpendCapWarning}
               branchedFromChatId={branchedFromChatId}
@@ -848,14 +902,6 @@ export const Messages = ({
                   messageId={row.message.id}
                 />
               )}
-            {acquisitionSurvey?.messageId === row.message.id &&
-              status === "ready" &&
-              !isAutoResuming && (
-                <AcquisitionSurvey
-                  key={`use-case:${row.message.id}`}
-                  activationMode={acquisitionSurvey.mode}
-                />
-              )}
           </>
         );
       }
@@ -873,7 +919,7 @@ export const Messages = ({
               : undefined
           }
           className={cn(
-            `mx-auto w-full max-w-full sm:max-w-[768px] sm:min-w-[390px] ${rowClassName}`,
+            `mx-auto w-full max-w-full sm:max-w-[768px] ${rowClassName}`,
             row.kind === "message" &&
               row.message.id === sourceMessageId &&
               "source-message-highlight",
@@ -893,7 +939,6 @@ export const Messages = ({
     },
     [
       sourceMessageId,
-      acquisitionSurvey,
       agentRunSpendCapWarning,
       branchBoundaryIndex,
       branchedFromChatId,
@@ -901,6 +946,8 @@ export const Messages = ({
       editingMessageId,
       feedbackInputMessageId,
       finishReason,
+      continueDisabledReason,
+      stoppedComputerReconnected,
       captureScrollPosition,
       getCachedUrl,
       handleBranchMessage,
@@ -916,7 +963,7 @@ export const Messages = ({
       isAutoResuming,
       chatId,
       lastAssistantMessageIndex,
-      lastUserMessageId,
+      editableMessageId,
       lastUserMessageIndex,
       mode,
       onBranchMessage,
@@ -937,15 +984,34 @@ export const Messages = ({
       </div>
     ) : null;
 
+  // A manual-resume stop before the turn saved an assistant message has no
+  // last-message notice to attach to, so its Resume notice renders here.
+  const showManualResumeWithoutAssistant =
+    requiresManualAgentResume(finishReason) &&
+    status !== "streaming" &&
+    (lastAssistantMessageIndex ?? -1) <= (lastUserMessageIndex ?? -1);
   const timelineFooter =
+    pendingSteers.length > 0 ||
+    showManualResumeWithoutAssistant ||
     showSummarizationSeparately ||
     uploadStatus?.isUploading ||
     shouldShowLoadingDots ||
     (error && finishReason !== "timeout") ? (
       <div
-        className="mx-auto flex min-h-20 w-full max-w-full flex-col items-start sm:max-w-[768px] sm:min-w-[390px]"
+        className="mx-auto flex min-h-20 w-full max-w-full flex-col items-start sm:max-w-[768px]"
         data-testid="messages-timeline-footer"
       >
+        {showManualResumeWithoutAssistant && (
+          <FinishReasonNotice
+            finishReason={finishReason}
+            lastSavedStep="request"
+            mode={mode}
+            status={status}
+            continueDisabledReason={continueDisabledReason}
+            stoppedComputerReconnected={stoppedComputerReconnected}
+            onContinue={onContinue}
+          />
+        )}
         {showSummarizationSeparately && (
           <SummarizationStatusDivider
             status={summarizationStatus?.status}
@@ -957,6 +1023,9 @@ export const Messages = ({
         {uploadStatus?.isUploading && (
           <Shimmer className="text-sm">{`${uploadStatus.message}...`}</Shimmer>
         )}
+        {pendingSteers.map((steer) => (
+          <PendingSteerBubble key={steer.id} text={steer.text} />
+        ))}
         {shouldShowLoadingDots ? (
           showPendingAgentReasoning ? (
             <PendingAgentReasoning />
@@ -969,7 +1038,26 @@ export const Messages = ({
         {error && finishReason !== "timeout" && (
           <MessageErrorState
             error={error}
-            onRetry={onRetry}
+            onRetry={
+              finishReason === LOCAL_CONNECTION_LOST_FINISH_REASON
+                ? async (options) => {
+                    if (continueDisabledReason) {
+                      toast.error(continueDisabledReason);
+                      return;
+                    }
+                    try {
+                      await onContinue?.(
+                        options?.selectedModel,
+                        options?.limitRescue,
+                      );
+                    } catch {
+                      toast.error(
+                        "Could not resume. Your saved progress is still available.",
+                      );
+                    }
+                  }
+                : onRetry
+            }
             onReconnect={onReconnect}
             mode={mode}
           />
@@ -983,6 +1071,7 @@ export const Messages = ({
     <FileUrlCacheProvider
       getCachedUrl={getCachedUrl}
       setCachedUrl={setCachedUrl}
+      loadImageUrl={loadImageUrl}
     >
       <div className="relative flex-1 min-h-0">
         <LegendList<ChatTimelineRow>
@@ -996,7 +1085,7 @@ export const Messages = ({
           estimatedItemSize={48}
           recycleItems={false}
           initialScrollAtEnd
-          {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
+          anchoredEndSpace={anchoredEndSpace}
           contentInsetEndAdjustment={contentInsetEndAdjustment}
           maintainVisibleContentPosition={{ data: true, size: true }}
           style={{ height: "100%", minHeight: 0 }}

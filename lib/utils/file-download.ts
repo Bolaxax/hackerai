@@ -3,16 +3,24 @@ import {
   isTauriEnvironment,
   revealFileInDir,
   saveFileToLocal,
+  saveBinaryFileToLocal,
 } from "@/app/hooks/useTauri";
 
 /**
  * Options for file download/save operations.
  */
+type DownloadContent = string | Uint8Array<ArrayBuffer>;
+
 interface DownloadFileOptions {
   /** The suggested filename for the save dialog */
   filename: string;
-  /** The file content as a string */
-  content: string;
+  /**
+   * UTF-8 text or exact binary bytes. Pass a loader when the content needs
+   * network work: the browser save picker requires the click's transient
+   * activation, so it opens first and the loader runs only after a
+   * destination is chosen. Loader errors reject the call; nothing is written.
+   */
+  content: DownloadContent | (() => Promise<DownloadContent>);
   /** MIME type for the blob fallback (default: "text/plain") */
   mimeType?: string;
 }
@@ -30,15 +38,42 @@ export type DownloadFileResult = {
   reason?: "unsupported_native";
 };
 
+/** Keep the object URL alive while the browser starts its asynchronous save. */
+export function startBlobDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  try {
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    throw error;
+  } finally {
+    link.remove();
+  }
+  // Revoking in the click's call stack can invalidate a pending download.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 export async function downloadFile({
   filename,
   content,
   mimeType = "text/plain",
 }: DownloadFileOptions): Promise<DownloadFileResult> {
+  const load = async () =>
+    typeof content === "function" ? content() : content;
+
   // Tauri: cancellation is a successful no-op, distinct from a failed write.
+  // The native dialog has no activation requirement, so load first.
   if (isTauriEnvironment()) {
+    const data = await load();
     try {
-      const filePath = await saveFileToLocal(filename, content);
+      const filePath =
+        typeof data === "string"
+          ? await saveFileToLocal(filename, data)
+          : await saveBinaryFileToLocal(filename, data);
       if (filePath) {
         toast.success("File saved successfully", {
           action: {
@@ -51,7 +86,9 @@ export async function downloadFile({
     } catch (error) {
       const unsupported =
         typeof error === "string" &&
-        /command.*save_file_with_dialog.*not found/i.test(error);
+        /(?:command.*save_(?:binary_)?file_with_dialog.*not found|(?:command )?save_(?:binary_)?file_with_dialog not allowed(?: by acl)?)/i.test(
+          error,
+        );
       toast.error(
         unsupported ? "Update Desktop to save reports" : "Failed to save file",
       );
@@ -63,9 +100,18 @@ export async function downloadFile({
   }
 
   // File System Access API (native save dialog)
-  try {
-    if ("showSaveFilePicker" in window) {
-      const fileHandle = await (
+  if ("showSaveFilePicker" in window) {
+    const failed = (err: unknown): DownloadFileResult => {
+      // User cancelled the save dialog — not an error
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return { outcome: "canceled" };
+      }
+      toast.error("Failed to save file");
+      return { outcome: "failed" };
+    };
+    let fileHandle: FileSystemFileHandle;
+    try {
+      fileHandle = await (
         window as Window & {
           showSaveFilePicker: (options: {
             suggestedName: string;
@@ -74,33 +120,26 @@ export async function downloadFile({
       ).showSaveFilePicker({
         suggestedName: filename,
       });
-
+    } catch (err) {
+      return failed(err);
+    }
+    const data = await load();
+    try {
       const writable = await fileHandle.createWritable();
-      await writable.write(content);
+      await writable.write(data);
       await writable.close();
       toast.success("File saved successfully");
       return { outcome: "success" };
+    } catch (err) {
+      return failed(err);
     }
-  } catch (err) {
-    // User cancelled the save dialog — not an error
-    if (err instanceof DOMException && err.name === "AbortError") {
-      return { outcome: "canceled" };
-    }
-    toast.error("Failed to save file");
-    return { outcome: "failed" };
   }
 
   // Blob download fallback
-  let url: string | undefined;
+  const data = await load();
   try {
-    const blob = new Blob([content], { type: mimeType });
-    url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const blob = new Blob([data], { type: mimeType });
+    startBlobDownload(blob, filename);
     toast.success("File downloaded successfully");
     return { outcome: "initiated" };
   } catch (error) {
@@ -112,10 +151,5 @@ export async function downloadFile({
         error instanceof Error ? error.message : "Unknown error occurred",
     });
     return { outcome: "failed" };
-  } finally {
-    // Always revoke the blob URL to prevent memory leaks
-    if (url) {
-      URL.revokeObjectURL(url);
-    }
   }
 }

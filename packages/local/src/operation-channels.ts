@@ -1,10 +1,65 @@
 import {
   CentrifugoPublishQueue,
   isCentrifugoPublishTimeout,
+  RelayOutputOverflowError,
 } from "./centrifugo-transport";
 
 type Message = Record<string, unknown>;
-type Operation = { kind: "command" | "file" | "pty"; id: string };
+export type Operation = { kind: "command" | "file" | "pty"; id: string };
+/** Client-side readiness step that rejected; never broker delivery or execution. */
+export type OperationReadinessPhase =
+  "subscription_ready" | "readiness_publish";
+/**
+ * Category of the rejection's own numeric `code` data property. Names follow the
+ * relay client's public codes; they do not establish the physical cause, the
+ * rejecting layer, delivery, non-execution or recovery.
+ */
+export type OperationReadinessRejectionCode =
+  | "timeout"
+  | "transport_closed"
+  | "client_disconnected"
+  | "client_closed"
+  | "subscription_unsubscribed"
+  | "transport_write_error"
+  | "connection_closed"
+  | "other_code"
+  | "unavailable";
+export type OperationReadinessFailure = Operation & {
+  phase: OperationReadinessPhase;
+  rejectionCode: OperationReadinessRejectionCode;
+};
+
+const REJECTION_CODES = new Map<number, OperationReadinessRejectionCode>([
+  [1, "timeout"],
+  [2, "transport_closed"],
+  [3, "client_disconnected"],
+  [4, "client_closed"],
+  [7, "subscription_unsubscribed"],
+  [10, "transport_write_error"],
+  [11, "connection_closed"],
+]);
+
+/** Never invokes accessors or reads any other part of the rejection. */
+function readinessRejectionCode(
+  error: unknown,
+): OperationReadinessRejectionCode {
+  try {
+    if (typeof error !== "object" || error === null) return "unavailable";
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+    const code = descriptor && "value" in descriptor ? descriptor.value : null;
+    if (
+      typeof code !== "number" ||
+      !Number.isInteger(code) ||
+      code < 0 ||
+      code > 65535
+    )
+      return "unavailable";
+    return REJECTION_CODES.get(code) ?? "other_code";
+  } catch {
+    // A proxy trap may throw; the original rejection is still rethrown.
+    return "unavailable";
+  }
+}
 
 export function sandboxOperationChannel(
   userId: string,
@@ -50,6 +105,8 @@ const START_TYPES = new Set([
 ]);
 const CONTROL_TYPES = new Set([
   "command_cancel",
+  "command_output_ack",
+  "command_output_resume",
   "pty_input",
   "pty_resize",
   "pty_kill",
@@ -72,6 +129,9 @@ interface ChannelSubscription {
   removeAllListeners(): unknown;
   ready(timeout: number): Promise<void>;
   publish(data: unknown): Promise<unknown>;
+  presence(): Promise<{
+    clients: Record<string, { user: string; connInfo?: unknown }>;
+  }>;
   on(event: "publication", handler: (ctx: { data: unknown }) => void): unknown;
   on(event: "error", handler: () => void): unknown;
 }
@@ -80,14 +140,32 @@ type Route<S extends ChannelSubscription> = {
   subscription: S;
   queue: CentrifugoPublishQueue;
   timer: ReturnType<typeof setTimeout>;
+  retainCommandOutput?: boolean;
+  retainFileResponse?: boolean;
+  fileResponse?: {
+    message: Message;
+    bytes: number;
+    attempts: number;
+    timer?: ReturnType<typeof setTimeout>;
+  };
+
+  failed?: boolean;
+};
+
+type LegacyRoute = {
+  timer: ReturnType<typeof setTimeout>;
+  queue?: CentrifugoPublishQueue;
+  publish?: (message: Message) => Promise<unknown>;
+  failed?: boolean;
 };
 
 /** Owns client subscriptions for opted-in operations. Legacy requests stay on the connection channel. */
 export class OperationChannelRouter<S extends ChannelSubscription> {
   private routes = new Map<string, Route<S>>();
   private closed = new Set<string>();
-  private legacy = new Map<string, ReturnType<typeof setTimeout>>();
+  private legacy = new Map<string, LegacyRoute>();
   private stopped = false;
+  private retainedFileBytes = 0;
 
   constructor(
     private client: {
@@ -96,6 +174,11 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
     },
     private userId: string,
     private connectionId: string,
+    private readonly stopOutput?: (operation: Operation) => void,
+    // Observation only: receives a code category, never the error, message or payload.
+    private readonly onReadinessFailure?: (
+      failure: OperationReadinessFailure,
+    ) => void,
   ) {}
 
   private key(op: Operation): string {
@@ -141,10 +224,14 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
           !this.routes.has(key) &&
           !this.closed.has(key)
         ) {
-          this.legacy.set(
-            key,
-            setTimeout(() => this.closeLegacy(key), this.deadline(message, op)),
-          );
+          if (this.routes.size + this.legacy.size >= 100)
+            throw new Error("Too many active relay operations");
+          this.legacy.set(key, {
+            timer: setTimeout(
+              () => this.closeLegacy(key),
+              this.deadline(message, op),
+            ),
+          });
         }
       }
       handle(message);
@@ -161,11 +248,14 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
     )
       return;
     const key = this.key(op);
-    if (this.routes.size >= 100)
+    if (this.routes.size + this.legacy.size >= 100)
       throw new Error("Too many active relay operations");
     const subscription = this.client.newSubscription(
       sandboxOperationChannel(this.userId, this.connectionId, op.kind, op.id),
     );
+    // The queue replaces a non-Error rejection, dropping its code, so the
+    // category of the last rejected readiness publish is recorded beforehand.
+    let publishRejection: OperationReadinessRejectionCode = "unavailable";
     const route: Route<S> = {
       subscription,
       queue: new CentrifugoPublishQueue(async (fragment) => {
@@ -178,18 +268,30 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
           await subscription.publish(fragment);
         } catch (error) {
           const type = (fragment as Message).type;
-          // These responses are idempotent by commandId. Never replay output
+          if (type === "operation_ready" && this.onReadinessFailure)
+            publishRejection = readinessRejectionCode(error);
+          // Readiness and terminal controls are idempotent by operation ID. Never replay output
           // chunks, fragments, or execution requests after uncertain delivery.
           if (
             !isCentrifugoPublishTimeout(error) ||
-            (type !== "exit" && type !== "command_cancel_result")
+            (type !== "exit" &&
+              type !== "command_cancel_result" &&
+              type !== "operation_ready")
           )
             throw error;
           if (this.stopped || this.routes.get(key) !== route) return;
-          await subscription.publish(fragment);
+          try {
+            await subscription.publish(fragment);
+          } catch (retryError) {
+            if (type === "operation_ready" && this.onReadinessFailure)
+              publishRejection = readinessRejectionCode(retryError);
+            throw retryError;
+          }
         }
       }),
       timer: setTimeout(() => this.close(key), this.deadline(message, op)),
+      retainFileResponse:
+        op.kind === "file" && message.fileResponseAck === true,
     };
     this.routes.set(key, route);
     let started = false;
@@ -199,6 +301,17 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
       // large response fragments echoed to the publishing subscriber.
       const control =
         data && typeof data === "object" ? (data as Message) : null;
+      if (
+        control?.type === "file_response_ack" &&
+        control.targetConnectionId === this.connectionId &&
+        control.requestId === op.id &&
+        op.kind === "file" &&
+        this.routes.get(key) === route &&
+        route.fileResponse
+      ) {
+        this.close(key);
+        return;
+      }
       if (
         !control ||
         control.targetConnectionId !== this.connectionId ||
@@ -211,7 +324,11 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
         this.key(target) === key &&
         this.routes.get(key) === route &&
         (op.kind === "command"
-          ? control.type === "command_cancel"
+          ? [
+              "command_cancel",
+              "command_output_ack",
+              "command_output_resume",
+            ].includes(String(control.type))
           : op.kind === "pty" && String(control.type).startsWith("pty_"))
       ) {
         if (started) handle(control);
@@ -222,14 +339,17 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
       /* readiness/publish failures propagate to the operation */
     });
     subscription.subscribe();
+    let phase: OperationReadinessPhase | undefined = "subscription_ready";
     try {
       await subscription.ready(5000);
       if (this.stopped || this.routes.get(key) !== route) return;
+      phase = "readiness_publish";
       await route.queue.publish({
         type: "operation_ready",
         [`${op.kind === "file" ? "request" : op.kind === "pty" ? "session" : "command"}Id`]:
           op.id,
       });
+      phase = undefined;
       if (!this.stopped && this.routes.get(key) === route) {
         handle(message);
         started = true;
@@ -240,9 +360,56 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
         pendingControls.length = 0;
       }
     } catch (error) {
+      // A rejection caused by stop() or route teardown is not a readiness failure.
+      if (phase && !this.stopped && this.routes.get(key) === route) {
+        try {
+          this.onReadinessFailure?.({
+            kind: op.kind,
+            id: op.id,
+            phase,
+            rejectionCode:
+              phase === "readiness_publish"
+                ? publishRejection
+                : readinessRejectionCode(error),
+          });
+        } catch {
+          // Diagnostics must not change cleanup or the rejected error.
+        }
+      }
       this.close(key);
       throw error;
     }
+  }
+
+  /** Desktop opts in only after recognizing the requested output protocol. */
+  retainCommandOutput(commandId: string): boolean {
+    const route = this.routes.get(this.key({ kind: "command", id: commandId }));
+    if (!route || this.stopped) return false;
+    route.retainCommandOutput = true;
+    return true;
+  }
+
+  closeCommand(commandId: string): void {
+    this.close(this.key({ kind: "command", id: commandId }));
+  }
+
+  /** Broker acceptance alone cannot deliver buffered output to an absent receiver. */
+  async hasCommandReceiver(commandId: string): Promise<boolean> {
+    const key = this.key({ kind: "command", id: commandId });
+    const route = this.routes.get(key);
+    // Legacy channels are shared by multiple operations, so their presence
+    // cannot establish whether this command's receiver is subscribed.
+    if (!route) return this.legacy.has(key);
+    const presence = await route.subscription.presence();
+    if (this.stopped || this.routes.get(key) !== route) return false;
+    return Object.values(presence.clients).some((client) => {
+      const info = client.connInfo;
+      const connectionId =
+        info && typeof info === "object" && "connectionId" in info
+          ? info.connectionId
+          : undefined;
+      return client.user === this.userId && connectionId !== this.connectionId;
+    });
   }
 
   /** Publish only for requests accepted by this connection; late/unknown output is discarded. */
@@ -255,17 +422,172 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
     if (!op) return;
     const key = this.key(op);
     const route = this.routes.get(key);
-    if (route) {
-      await route.queue.publish(message);
-      if (END_TYPES.has(String(message.type))) this.close(key);
-    } else if (this.legacy.has(key)) {
-      await publishLegacy(message);
-      if (END_TYPES.has(String(message.type))) this.closeLegacy(key);
+    const legacy = this.legacy.get(key);
+    if (route?.failed || legacy?.failed) return;
+    if (
+      route?.retainFileResponse &&
+      op.kind === "file" &&
+      END_TYPES.has(String(message.type))
+    ) {
+      // Freeze the first completed outcome. Publication failure must never turn
+      // a successful filesystem mutation into a different file_error response.
+      if (route.fileResponse) return;
+      const serialized = JSON.stringify(message);
+      const bytes = new TextEncoder().encode(serialized).byteLength;
+      if (bytes + this.retainedFileBytes > 4 * 1024 * 1024) {
+        this.failOutput(message, publishLegacy);
+        throw new RelayOutputOverflowError();
+      }
+      route.fileResponse = {
+        message: JSON.parse(serialized),
+        bytes,
+        attempts: 0,
+      };
+      this.retainedFileBytes += bytes;
+      await this.sendFileResponse(key, route);
+      return;
+    }
+    try {
+      if (route) {
+        await route.queue.publish(message);
+        if (END_TYPES.has(String(message.type)) && !route.retainCommandOutput)
+          this.close(key);
+      } else if (legacy) {
+        // Legacy operations share a channel, not a backlog: one noisy producer
+        // must not consume another operation's output or cancellation budget.
+        legacy.publish = publishLegacy;
+        legacy.queue ??= new CentrifugoPublishQueue(async (fragment) => {
+          if (this.stopped || this.legacy.get(key) !== legacy || legacy.failed)
+            return;
+          await publishLegacy(fragment as Message);
+        });
+        await legacy.queue.publish(message);
+        if (END_TYPES.has(String(message.type))) this.closeLegacy(key);
+      }
+    } catch (error) {
+      if (error instanceof RelayOutputOverflowError) {
+        this.failOutput(message, publishLegacy);
+      }
+      throw error;
     }
   }
 
+  private async sendFileResponse(key: string, route: Route<S>): Promise<void> {
+    if (this.stopped || this.routes.get(key) !== route || !route.fileResponse)
+      return;
+    const response = route.fileResponse;
+    try {
+      if (response.attempts++ > 0) {
+        const presence = await route.subscription.presence();
+        if (
+          !Object.values(presence.clients).some((client) => {
+            const info = client.connInfo;
+            return (
+              client.user === this.userId &&
+              !(
+                info &&
+                typeof info === "object" &&
+                "connectionId" in info &&
+                info.connectionId === this.connectionId
+              )
+            );
+          })
+        )
+          return;
+      }
+      if (
+        this.stopped ||
+        this.routes.get(key) !== route ||
+        route.fileResponse !== response
+      )
+        return;
+      await route.queue.publish(response.message);
+    } catch (error) {
+      if (error instanceof RelayOutputOverflowError) {
+        this.failOutput(response.message);
+        throw error;
+      }
+      // Retain the response through temporary disconnects or lost broker ACKs.
+      // The receiver deduplicates by requestId; the filesystem is never replayed.
+    } finally {
+      if (
+        !this.stopped &&
+        !route.failed &&
+        this.routes.get(key) === route &&
+        route.fileResponse
+      ) {
+        // Even a successful broker publish can miss a disconnected receiver. Retry
+        // until its explicit ACK or the original operation deadline releases state.
+        route.fileResponse.timer = setTimeout(
+          () => {
+            // Permanent failures are reported by failOutput; timer callers have
+            // no original publisher awaiting their rejection.
+            void this.sendFileResponse(key, route).catch(() => {});
+          },
+          Math.min(
+            5000,
+            1000 * 2 ** Math.min(route.fileResponse.attempts - 1, 3),
+          ),
+        );
+      }
+    }
+  }
+
+  /** Discard incomplete output and send one terminal failure outside the full queue. */
+  failOutput(
+    message: Message,
+    publishLegacy: (message: Message) => Promise<unknown> = async () => {},
+  ): void {
+    const op = operation(message);
+    if (!op || this.stopped) return;
+    const key = this.key(op);
+    const route = this.routes.get(key);
+    const legacy = this.legacy.get(key);
+    const target = route ?? legacy;
+    if (!target || target.failed) return;
+    target.failed = true;
+    const error = new RelayOutputOverflowError();
+    target.queue?.close(error);
+    // Stop producers independently of broker acknowledgement. The callback
+    // never waits for the output queue, and subsequent success exits are ignored.
+    try {
+      this.stopOutput?.(op);
+    } catch {
+      // Cleanup failure must not prevent reporting incomplete output.
+      console.error("Relay output overflow cleanup failed");
+    }
+    const failure = {
+      type:
+        op.kind === "pty"
+          ? "pty_error"
+          : op.kind === "file"
+            ? "file_error"
+            : "error",
+      [op.kind === "pty"
+        ? "sessionId"
+        : op.kind === "file"
+          ? "requestId"
+          : "commandId"]: op.id,
+      message: error.message,
+    };
+    const publish = route
+      ? (value: Message) => route.subscription.publish(value)
+      : (legacy?.publish ?? publishLegacy);
+    // An unavailable relay can also lose the failure notice; the receiver's
+    // existing disconnect/deadline handling remains authoritative in that case.
+    void Promise.resolve()
+      .then(() => publish(failure))
+      .catch(() => {})
+      .finally(() => {
+        if (route) this.close(key);
+        else this.closeLegacy(key);
+      });
+  }
+
   private closeLegacy(key: string): void {
-    clearTimeout(this.legacy.get(key));
+    const route = this.legacy.get(key);
+    clearTimeout(route?.timer);
+    route?.queue?.close();
     this.legacy.delete(key);
     this.rememberClosed(key);
   }
@@ -280,6 +602,12 @@ export class OperationChannelRouter<S extends ChannelSubscription> {
   private close(key: string): void {
     const route = this.routes.get(key);
     if (!route) return;
+    route.queue.close();
+    if (route.fileResponse) {
+      clearTimeout(route.fileResponse.timer);
+      this.retainedFileBytes -= route.fileResponse.bytes;
+      route.fileResponse = undefined;
+    }
     this.routes.delete(key);
     this.rememberClosed(key);
     clearTimeout(route.timer);

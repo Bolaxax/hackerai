@@ -32,7 +32,7 @@ provider-supplied error wording alone does not enable it.
 
 Image-description requests have a separate two-attempt budget: a 20-second
 initial deadline and one 35-second retry for a local timeout or transient
-provider failure. Cancellation prevents retries. Abliteration image preparation
+provider failure. Cancellation prevents retries. Inference image preparation
 also bounds the entire batch to 120 seconds and stops new calls/retries once
 reported vision spend reaches $0.25; already-running calls still settle and
 their reported charges count. Permanent input errors and content blocks are
@@ -47,17 +47,32 @@ identity. Timeout errors retain their cause and surface as
 `category=timeout origin=auxiliary_vision`, with image-specific retry guidance.
 
 A rejection delivered through `streamText.onError` before any output can use
-the existing fallback, including an active Abliteration experiment's baseline
-route. This does not enable replay of arbitrary output-bearing 400 failures.
+the existing fallback, including the selected baseline model after an
+Inference security route fails. The baseline request carries the usual platform
+authorization context. This does not enable replay of arbitrary output-bearing 400 failures.
 The recognized Fireworks image-format rejection uses the existing image-tool
 recovery path. Generic invalid-parameter errors are not assumed to be images.
 
-Storage compaction preserves step boundaries in retained history. For older
-Abliteration histories, request preparation splits assistant batches exceeding
+Storage compaction preserves step boundaries in retained history. For Inference
+requests, request preparation splits assistant batches exceeding
 128 calls only when every call has exactly one adjacent result. Calls, results,
 and their IDs are retained; incomplete or ambiguous batches are left unchanged
 and reported by shape diagnostics. Storage's hard byte limit can still remove
 old parts as before.
+
+Conversation compaction shares the `inference_cyber_v1` rollout control with
+eligible security generation. With the flag enabled and Inference configured,
+all plans use Inference for ordinary and expanded-context summaries, with
+DeepSeek V4.1 Flash through OpenRouter as the first recovery model, followed by
+GLM 5.3 Flash. The summary must
+finish normally and contain every required checkpoint section before it can
+replace history; discarded output usage is still accounted to its actual
+model. Cancellation stops the chain. Disabling the flag restores the previous
+compaction policy for new runs; an active run retains its initial assignment.
+
+Eligible Free three-step treatment uses the same Inference-first provider
+route. Before Inference, the same experiment keys also covered Abliteration.ai;
+compare outcomes by actual provider and release, not the experiment key alone.
 
 ## Diagnosing a failure
 
@@ -74,7 +89,11 @@ unmatched call/result counts, duplicate calls within a batch, and the number of
 oversized batches repaired in that request. Error extraction retains known
 schema parameter paths with numeric indices normalized, when supplied by the
 provider. No new diagnostic includes prompts, tool arguments/results, image
-contents, or signed URLs.
+contents, or signed URLs. URL image counts also classify recognized SigV4
+expiry hints at the diagnostic snapshot as elapsed, within five minutes, later,
+or unknown. These counts do not validate signatures, credentials or access;
+unsupported, malformed, duplicate or future-dated hints remain unknown. Input
+URLs are unchanged and no image fetch is added.
 
 Generic `invalid_request` responses still require an upstream request ID and
 these shape diagnostics to identify the rejected constraint. An image fetch

@@ -24,6 +24,7 @@ import { useMediaQuery } from "@/hooks/use-media-query";
 
 interface QueuedMessagesPanelProps {
   messages: QueuedMessage[];
+  agentSteeringEnabled?: boolean;
   onSendNow: (messageId: string) => void;
   onEdit: (messageId: string, text: string) => void;
   onEditingMessageChange: (messageId: string | null) => void;
@@ -36,6 +37,7 @@ interface QueuedMessagesPanelProps {
 interface QueuedMessageMenuProps {
   message: QueuedMessage;
   queueBehavior: QueueBehavior;
+  agentSteeringEnabled: boolean;
   onEdit: () => void;
   onQueueBehaviorChange?: (behavior: QueueBehavior) => void;
 }
@@ -45,6 +47,7 @@ interface QueuedMessageRowProps {
   isEditing: boolean;
   isStreaming: boolean;
   queueBehavior: QueueBehavior;
+  agentSteeringEnabled: boolean;
   onSendNow: (messageId: string) => void;
   onEdit: (messageId: string, text: string) => void;
   onStartEditing: (messageId: string) => void;
@@ -56,11 +59,17 @@ interface QueuedMessageRowProps {
 const QueuedMessageMenu = ({
   message,
   queueBehavior,
+  agentSteeringEnabled,
   onEdit,
   onQueueBehaviorChange,
 }: QueuedMessageMenuProps) => {
   const toggleQueueBehavior = () => {
-    const nextBehavior = queueBehavior === "queue" ? "stop-and-send" : "queue";
+    const nextBehavior =
+      queueBehavior !== "queue"
+        ? "queue"
+        : agentSteeringEnabled
+          ? "steer"
+          : "stop-and-send";
     onQueueBehaviorChange?.(nextBehavior);
   };
 
@@ -103,6 +112,7 @@ const QueuedMessageRow = ({
   isEditing,
   isStreaming,
   queueBehavior,
+  agentSteeringEnabled,
   onSendNow,
   onEdit,
   onStartEditing,
@@ -132,7 +142,10 @@ const QueuedMessageRow = ({
   };
 
   const handleEditKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
+      return;
     if (event.key === "Escape") {
+      event.preventDefault();
       cancelEditing();
     } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
@@ -203,6 +216,28 @@ const QueuedMessageRow = ({
                 {message.text}
               </div>
             )}
+            {message.dispatching && !message.deliveryStatus && (
+              <div
+                className="text-xs text-muted-foreground mt-0.5"
+                role="status"
+              >
+                Sending…
+              </div>
+            )}
+            {/* While a run works, the server sends queued messages after it. */}
+            {message.held &&
+              !isStreaming &&
+              !message.dispatching &&
+              !message.deliveryStatus && (
+                <div
+                  className="text-xs text-muted-foreground mt-0.5"
+                  role="status"
+                >
+                  {message.fromSteer
+                    ? "Unread by the Agent. Send it when you are ready."
+                    : "Queued earlier. Send it when you are ready."}
+                </div>
+              )}
             {message.deliveryStatus && (
               <div
                 className="text-xs text-muted-foreground mt-0.5"
@@ -225,7 +260,8 @@ const QueuedMessageRow = ({
         )}
       </div>
 
-      {!isEditing && (
+      {/* The server is sending it: it can no longer be changed here. */}
+      {!isEditing && !message.dispatching && (
         <div className="flex items-center gap-1 flex-shrink-0">
           <Button
             type="button"
@@ -238,7 +274,9 @@ const QueuedMessageRow = ({
               message.deliveryStatus && message.deliveryStatus !== "sending"
                 ? "Check for an active run before retrying this message"
                 : isStreaming
-                  ? "Stop the current response and steer with this message"
+                  ? agentSteeringEnabled && !message.files?.length
+                    ? "Send this message to the Agent before its next step"
+                    : "Stop the current response and steer with this message"
                   : "Send this queued message now"
             }
           >
@@ -263,6 +301,7 @@ const QueuedMessageRow = ({
           <QueuedMessageMenu
             message={message}
             queueBehavior={queueBehavior}
+            agentSteeringEnabled={agentSteeringEnabled}
             onEdit={startEditing}
             onQueueBehaviorChange={onQueueBehaviorChange}
           />
@@ -282,6 +321,7 @@ const QueuedMessageRow = ({
 
 export const QueuedMessagesPanel = ({
   messages,
+  agentSteeringEnabled = false,
   onSendNow,
   onEdit,
   onEditingMessageChange,
@@ -310,6 +350,7 @@ export const QueuedMessagesPanel = ({
       isEditing={editingMessageId === message.id}
       isStreaming={isStreaming}
       queueBehavior={queueBehavior}
+      agentSteeringEnabled={agentSteeringEnabled}
       onSendNow={onSendNow}
       onEdit={onEdit}
       onStartEditing={setEditingMessage}
@@ -320,7 +361,7 @@ export const QueuedMessagesPanel = ({
   );
 
   return (
-    <div className="mx-4 rounded-[22px_22px_0px_0px] border border-black/8 dark:border-border border-b-0 bg-input-chat">
+    <div className="mx-0 rounded-[22px_22px_0px_0px] border border-black/8 dark:border-border border-b-0 bg-input-chat md:mx-4">
       <div className="px-4 pt-3 pb-1 space-y-1 max-h-[240px] overflow-y-auto">
         {messages.map(renderMessage)}
       </div>

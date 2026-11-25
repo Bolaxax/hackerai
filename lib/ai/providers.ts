@@ -1,20 +1,32 @@
 import {
+  inference,
+  INFERENCE_CYBER_MODEL_KEY,
+  INFERENCE_CYBER_MODEL_ID,
+} from "./inference";
+import {
   DEEPSEEK_1017_MODEL_KEY,
   DEEPSEEK_1017_SLUG,
   DEEPSEEK_1017_CANONICAL_SLUG,
 } from "@/lib/experiments/paid-deepseek-1017";
 import { customProvider } from "ai";
+import { withOpenRouterStreamErrorContext } from "./openrouter-stream-error-context";
+import {
+  AMAZON_BEDROCK_ONLY_ROUTING,
+  GROK_4_6_BEDROCK_MODEL_KEY,
+  OPENROUTER_US_BASE_URL,
+} from "./grok-bedrock";
 import { createOpenRouterCompletionObserver } from "./openrouter-stream-completion";
 import {
-  abliteration,
-  ABLITERATION_LARGE_V2_MODEL_ID,
-  ABLITERATION_LARGE_V2_MODEL_KEY,
-  ABLITERATION_MODEL_ID,
-  ABLITERATION_MODEL_KEY,
-} from "@/lib/ai/abliteration";
+  recordOpenRouterBodyFailureContext,
+  type OpenRouterBodyFailurePhase,
+} from "@/lib/utils/openrouter-stream-error-context";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { SelectedModel } from "@/types/chat";
 import { openrouterAttributionHeaders } from "@/lib/ai/openrouter-attribution";
+import {
+  CLOUD_SANDBOX_UPLOAD_ROOT,
+  isCanonicalLocalStagedAttachmentPath,
+} from "@/lib/utils/sandbox-upload-paths";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -22,8 +34,11 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isXaiModelSlug = (value: unknown): boolean =>
   typeof value === "string" && value.toLowerCase().startsWith("x-ai/");
 
-const isGrok46ModelSlug = (value: unknown): boolean =>
-  typeof value === "string" && value.toLowerCase().startsWith("x-ai/grok-4.6");
+// Grok 4.6 and 4.7 both declare mandatory reasoning on OpenRouter.
+const isMandatoryReasoningGrokModelSlug = (value: unknown): boolean =>
+  typeof value === "string" &&
+  (value.toLowerCase().startsWith("x-ai/grok-4.6") ||
+    value.toLowerCase().startsWith("x-ai/grok-4.7"));
 
 const isKimiModelSlug = (value: unknown): boolean =>
   typeof value === "string" &&
@@ -277,6 +292,27 @@ export const sanitizeOpenRouterEncryptedReasoning = (
   };
 };
 
+/**
+ * Every OpenRouter generation may use only zero-data-retention endpoints. It is
+ * enforced at this shared transport so no caller's routing options can drop it.
+ */
+export const requireOpenRouterZeroDataRetention = (
+  body: unknown,
+): { body: unknown; changed: boolean } => {
+  if (
+    !isRecord(body) ||
+    (body.model === undefined && body.models === undefined)
+  ) {
+    return { body, changed: false };
+  }
+  const provider = isRecord(body.provider) ? body.provider : {};
+  if (provider.zdr === true) return { body, changed: false };
+  return {
+    body: { ...body, provider: { ...provider, zdr: true } },
+    changed: true,
+  };
+};
+
 export const makeOpenRouterToolChoiceCompatibleWithXaiReasoning = (
   body: unknown,
 ): { body: unknown; changed: boolean } => {
@@ -292,7 +328,7 @@ export const makeOpenRouterToolChoiceCompatibleWithXaiReasoning = (
     return { body, changed: false };
   }
 
-  if (!isGrok46ModelSlug(body.model)) {
+  if (!isMandatoryReasoningGrokModelSlug(body.model)) {
     return {
       body: {
         ...body,
@@ -309,7 +345,7 @@ export const makeOpenRouterToolChoiceCompatibleWithXaiReasoning = (
       )
     : [];
 
-  // Grok 4.6 requires reasoning, while xAI reasoning does not accept a forced
+  // Grok 4.6 and 4.7 require reasoning, while xAI reasoning does not accept a forced
   // tool choice. Preserve both behaviors by routing this single request to an
   // existing non-xAI fallback. When no compatible route exists, keep Grok's
   // mandatory reasoning and relax only the forced tool choice.
@@ -463,17 +499,49 @@ const getAttributeFromAttachmentTag = (
 ): string | undefined =>
   new RegExp(`\\b${attribute}="([^"]+)"`, "i").exec(tag)?.[1];
 
+/**
+ * Which provider file parts an attachment annotation may replace:
+ * - `pdf_parser`: PDF parts annotated with a cloud or local staged path.
+ * - `generic_parser`: any cloud-annotated file part, or local-annotated PDFs.
+ * - `request_size`: any cloud-annotated file part only.
+ */
+type SandboxFileRecoveryScope =
+  "pdf_parser" | "generic_parser" | "request_size";
+
+/** Cloud annotations may replace any file part; local ones only PDFs. */
+type StagedAttachmentSource = "cloud" | "local";
+
+// Keep the local extension on the stager's exact annotation shape. The
+// existing cloud matcher still recognizes its historical annotations.
+const LOCAL_ATTACHMENT_TAG =
+  /^<attachment filename="[^"]+" local_path="[^"]+" staging="(?:requested_this_run|not_requested_this_run)"(?: legacy_fallback_path="[^"]+" use_legacy_fallback_only_if_primary_missing="true")? \/>$/;
+
 const collectSandboxAttachmentFilenames = (
   messages: unknown[],
-): Set<string> => {
-  const filenames = new Set<string>();
-  const collectFromText = (text: string) => {
+  scope: SandboxFileRecoveryScope,
+): Map<string, StagedAttachmentSource> => {
+  const filenames = new Map<string, StagedAttachmentSource>();
+  const collectFromText = (text: string, role: unknown) => {
     for (const match of text.matchAll(/<attachment\b[^>]*>/gi)) {
       const tag = match[0];
       const localPath = getAttributeFromAttachmentTag(tag, "local_path");
       const filename = getAttributeFromAttachmentTag(tag, "filename");
-      if (localPath?.startsWith("/home/user/upload/") && filename) {
-        filenames.add(filename);
+      if (!localPath || !filename) continue;
+      if (localPath.startsWith(`${CLOUD_SANDBOX_UPLOAD_ROOT}/`)) {
+        filenames.set(filename, "cloud");
+        continue;
+      }
+      // The local stager writes only to user messages with a known staging
+      // role. Matching the exact path shape keeps legacy, rewritten, and
+      // arbitrary local paths out of provider-part removal.
+      if (
+        scope !== "request_size" &&
+        role === "user" &&
+        LOCAL_ATTACHMENT_TAG.test(tag) &&
+        isCanonicalLocalStagedAttachmentPath(localPath, filename) &&
+        !filenames.has(filename)
+      ) {
+        filenames.set(filename, "local");
       }
     }
   };
@@ -481,7 +549,7 @@ const collectSandboxAttachmentFilenames = (
   messages.forEach((message) => {
     if (!isRecord(message)) return;
     if (typeof message.content === "string") {
-      collectFromText(message.content);
+      collectFromText(message.content, message.role);
       return;
     }
     if (!Array.isArray(message.content)) return;
@@ -491,7 +559,7 @@ const collectSandboxAttachmentFilenames = (
         part.type === "text" &&
         typeof part.text === "string"
       ) {
-        collectFromText(part.text);
+        collectFromText(part.text, message.role);
       }
     });
   });
@@ -665,15 +733,28 @@ const createToolMediaRequestRecoveryBody = (
   };
 };
 
+type SandboxPdfRecoveryUnavailableReason =
+  | "unsupported_request_shape"
+  | "no_staged_attachments"
+  | "no_unique_matching_file"
+  | "no_user_message";
+
 const createSandboxPdfRecoveryBody = (
   body: unknown,
-  removeAllFileParts = false,
-): { body: unknown; changed: boolean } => {
+  scope: SandboxFileRecoveryScope,
+): { body: unknown } & (
+  | { changed: true }
+  | { changed: false; unavailableReason: SandboxPdfRecoveryUnavailableReason }
+) => {
   if (!isRecord(body) || !Array.isArray(body.messages)) {
-    return { body, changed: false };
+    return {
+      body,
+      changed: false,
+      unavailableReason: "unsupported_request_shape",
+    };
   }
-  if (collectSandboxAttachmentFilenames(body.messages).size === 0) {
-    return { body, changed: false };
+  if (collectSandboxAttachmentFilenames(body.messages, scope).size === 0) {
+    return { body, changed: false, unavailableReason: "no_staged_attachments" };
   }
 
   let removedFilePart = false;
@@ -685,9 +766,10 @@ const createSandboxPdfRecoveryBody = (
 
     // The provider file part does not retain a stable attachment ID. Limit a
     // filename match to the same message and reject duplicate names there.
-    const sandboxAttachmentFilenames = collectSandboxAttachmentFilenames([
-      message,
-    ]);
+    const sandboxAttachmentFilenames = collectSandboxAttachmentFilenames(
+      [message],
+      scope,
+    );
     const filePartFilenameCounts = new Map<string, number>();
     message.content.forEach((part) => {
       if (!isFileRequestPart(part)) return;
@@ -701,11 +783,17 @@ const createSandboxPdfRecoveryBody = (
 
     const content = message.content.filter((part) => {
       const filename = getFileRequestFilename(part);
+      const source =
+        filename === undefined
+          ? undefined
+          : sandboxAttachmentFilenames.get(filename);
       const shouldRemove =
         filename !== undefined &&
-        sandboxAttachmentFilenames.has(filename) &&
+        source !== undefined &&
         filePartFilenameCounts.get(filename) === 1 &&
-        (removeAllFileParts ? isFileRequestPart(part) : isPdfRequestPart(part));
+        (scope !== "pdf_parser" && source === "cloud"
+          ? isFileRequestPart(part)
+          : isPdfRequestPart(part));
       removedFilePart ||= shouldRemove;
       return !shouldRemove;
     });
@@ -714,17 +802,25 @@ const createSandboxPdfRecoveryBody = (
       : { ...message, content };
   });
 
-  if (!removedFilePart || lastUserMessageIndex < 0) {
-    return { body, changed: false };
+  if (!removedFilePart) {
+    return {
+      body,
+      changed: false,
+      unavailableReason: "no_unique_matching_file",
+    };
+  }
+  if (lastUserMessageIndex < 0) {
+    return { body, changed: false, unavailableReason: "no_user_message" };
   }
 
   const lastUserMessage = messages[lastUserMessageIndex];
   if (!isRecord(lastUserMessage)) {
-    return { body, changed: false };
+    return { body, changed: false, unavailableReason: "no_user_message" };
   }
-  const recoveryInstruction = removeAllFileParts
-    ? GENERIC_SANDBOX_ATTACHMENT_RECOVERY_INSTRUCTION
-    : SANDBOX_PDF_RECOVERY_INSTRUCTION;
+  const recoveryInstruction =
+    scope === "pdf_parser"
+      ? SANDBOX_PDF_RECOVERY_INSTRUCTION
+      : GENERIC_SANDBOX_ATTACHMENT_RECOVERY_INSTRUCTION;
   const existingContent = lastUserMessage.content;
   const content = Array.isArray(existingContent)
     ? [...existingContent, { type: "text", text: recoveryInstruction }]
@@ -766,12 +862,15 @@ const logPdfParserRecovery = (
   fromEngine: "mistral-ocr" | "cloudflare-ai" | "unknown",
   toEngine: "cloudflare-ai" | "sandbox",
   reason: PdfParserFailure,
+  unavailableReason?: SandboxPdfRecoveryUnavailableReason,
 ) => {
   console.warn(
     JSON.stringify({
       timestamp: new Date().toISOString(),
       level: "warn",
-      event: "openrouter_pdf_parser_recovery",
+      event: unavailableReason
+        ? "openrouter_pdf_parser_recovery_unavailable"
+        : "openrouter_pdf_parser_recovery",
       service: "openrouter",
       environment:
         process.env.TRIGGER_ENV ??
@@ -781,6 +880,7 @@ const logPdfParserRecovery = (
       from_engine: fromEngine,
       to_engine: toEngine,
       reason,
+      ...(unavailableReason && { unavailable_reason: unavailableReason }),
     }),
   );
 };
@@ -908,7 +1008,10 @@ const enforceOpenRouterRequestSizeLimit = (
     requestContext = getOpenRouterRequestLogContext(parsedBody);
     diagnostics = getOpenRouterRequestSizeDiagnostics(parsedBody);
 
-    const sandboxFallback = createSandboxPdfRecoveryBody(parsedBody, true);
+    const sandboxFallback = createSandboxPdfRecoveryBody(
+      parsedBody,
+      "request_size",
+    );
     let recoveryBody = sandboxFallback.changed
       ? sandboxFallback.body
       : parsedBody;
@@ -1028,23 +1131,41 @@ export const attachOpenRouterStreamErrorMetadata = (
   let cancelled = false;
   const reader = response.body.getReader();
   const responseHeaders = Object.fromEntries(response.headers.entries());
+  const responseStatus = response.status;
+  const responseIdentity = {};
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
+      let phase: OpenRouterBodyFailurePhase = "read_body";
       try {
         const chunk = await reader.read();
         if (cancelled) return;
         if (chunk.done) {
+          phase = "finish_stream";
           options.signal?.throwIfAborted();
           observer?.finish();
           controller.close();
           return;
         }
+        phase = "observe_chunk";
         observer?.feed(chunk.value);
+        phase = "forward_chunk";
         controller.enqueue(chunk.value);
       } catch (error) {
         observer?.reset();
-        if (!cancelled)
-          controller.error(enrichOpenRouterStreamError(error, responseHeaders));
+        if (!cancelled) {
+          const enriched = enrichOpenRouterStreamError(error, responseHeaders);
+          try {
+            recordOpenRouterBodyFailureContext(
+              enriched,
+              responseIdentity,
+              responseStatus,
+              phase,
+            );
+          } catch {
+            // Optional diagnostics must not replace the original stream failure.
+          }
+          controller.error(enriched);
+        }
       }
     },
     cancel(reason) {
@@ -1055,7 +1176,7 @@ export const attachOpenRouterStreamErrorMetadata = (
   });
 
   return new Response(body, {
-    status: response.status,
+    status: responseStatus,
     statusText: response.statusText,
     headers: response.headers,
   });
@@ -1097,16 +1218,21 @@ export const createOpenRouterPatchFetch =
           makeOpenRouterToolChoiceCompatibleWithXaiReasoning(
             reasoningPatched.body,
           );
-        parsedRequestBody = xaiCompatible.body;
+        // Recovery retries rebuild their bodies from this parsed request.
+        const zdrRequired = requireOpenRouterZeroDataRetention(
+          xaiCompatible.body,
+        );
+        parsedRequestBody = zdrRequired.body;
         if (
           kimiNormalized.changed ||
           kimiPatched.changed ||
           reasoningPatched.changed ||
-          xaiCompatible.changed
+          xaiCompatible.changed ||
+          zdrRequired.changed
         ) {
           nextInit = {
             ...nextInit,
-            body: JSON.stringify(xaiCompatible.body),
+            body: JSON.stringify(zdrRequired.body),
           };
         }
       } catch {
@@ -1147,9 +1273,15 @@ export const createOpenRouterPatchFetch =
     ) {
       const sandboxBody = createSandboxPdfRecoveryBody(
         parsedRequestBody,
-        parserFailure === "generic_parse",
+        parserFailure === "generic_parse" ? "generic_parser" : "pdf_parser",
       );
       if (!sandboxBody.changed) {
+        logPdfParserRecovery(
+          "unknown",
+          "sandbox",
+          parserFailure,
+          sandboxBody.unavailableReason,
+        );
         return wrapResponse(initialResponse);
       }
 
@@ -1168,8 +1300,17 @@ export const createOpenRouterPatchFetch =
     }
 
     if (requestUsesPdfParserEngine(parsedRequestBody, "cloudflare-ai")) {
-      const sandboxBody = createSandboxPdfRecoveryBody(parsedRequestBody);
+      const sandboxBody = createSandboxPdfRecoveryBody(
+        parsedRequestBody,
+        "pdf_parser",
+      );
       if (!sandboxBody.changed) {
+        logPdfParserRecovery(
+          "cloudflare-ai",
+          "sandbox",
+          parserFailure,
+          sandboxBody.unavailableReason,
+        );
         return wrapResponse(initialResponse);
       }
 
@@ -1213,8 +1354,17 @@ export const createOpenRouterPatchFetch =
       );
     }
 
-    const sandboxBody = createSandboxPdfRecoveryBody(cloudflareBody.body);
+    const sandboxBody = createSandboxPdfRecoveryBody(
+      cloudflareBody.body,
+      "pdf_parser",
+    );
     if (!sandboxBody.changed) {
+      logPdfParserRecovery(
+        "cloudflare-ai",
+        "sandbox",
+        cloudflareFailure,
+        sandboxBody.unavailableReason,
+      );
       return wrapResponse(cloudflareResponse);
     }
 
@@ -1239,14 +1389,23 @@ const openrouter = createOpenRouter({
   headers: openrouterAttributionHeaders,
 });
 
+const openrouterUs = createOpenRouter({
+  baseURL: OPENROUTER_US_BASE_URL,
+  fetch: openrouterPatchFetch,
+  headers: openrouterAttributionHeaders,
+});
+
 type OpenRouterInstance = typeof openrouter;
 
 export const KIMI_K3_SLUG = "moonshotai/kimi-k3";
-export const GLM_5_2_SLUG = "z-ai/glm-5.2";
+// Max Agent tier. Accepts text and images; PDFs go through the file parser.
+export const KIMI_K3_1_PRO_SLUG = "moonshotai/kimi-k3.1-pro";
 export const GLM_5_3_SLUG = "z-ai/glm-5.3";
 export const GLM_5_3_FLASH_SLUG = "z-ai/glm-5.3-flash";
 export const GROK_4_5_SLUG = "x-ai/grok-4.5";
 export const GROK_4_6_SLUG = "x-ai/grok-4.6";
+// Ask/Agent fallback and summarization retry. Same xAI rates as Grok 4.6.
+export const GROK_4_7_SLUG = "x-ai/grok-4.7";
 // Preserve persisted route keys while pinning every Flash route to this snapshot.
 export const DEEPSEEK_V4_FLASH_VISION_SLUG = DEEPSEEK_1017_SLUG;
 export const MINIMAX_M3_SLUG = "minimax/minimax-m3";
@@ -1254,18 +1413,17 @@ export const MINIMAX_M3_SLUG = "minimax/minimax-m3";
 // image turns route the original pixels through GLM Flash and then DeepSeek
 // Vision, so the lossy description hop is paid only when both direct routes fail.
 export const AUXILIARY_VISION_SLUG = MINIMAX_M3_SLUG;
-export const DEEPSEEK_V4_PRO_SLUG = "deepseek/deepseek-v4-pro";
 export const DEEPSEEK_V4_PRO_0813_SLUG = "deepseek/deepseek-v4-pro-0813";
-export const DEEPSEEK_V4_FLASH_PREVIOUS_SLUG = "deepseek/deepseek-v4-flash";
 
 export const getOpenRouterProviderRoutingForModel = (
   modelSlug: string,
+  modelName?: string,
 ):
-  | { ignore: string[] }
   | { sort: "latency"; data_collection: "deny" }
+  | typeof AMAZON_BEDROCK_ONLY_ROUTING
   | undefined => {
-  if (modelSlug === DEEPSEEK_V4_FLASH_PREVIOUS_SLUG) {
-    return { ignore: ["novita"] };
+  if (modelName === GROK_4_6_BEDROCK_MODEL_KEY) {
+    return AMAZON_BEDROCK_ONLY_ROUTING;
   }
   if (modelSlug === GLM_5_3_FLASH_SLUG) {
     return { sort: "latency", data_collection: "deny" };
@@ -1274,34 +1432,27 @@ export const getOpenRouterProviderRoutingForModel = (
 };
 
 const buildProviderMap = (
-  or: OpenRouterInstance,
+  provider: OpenRouterInstance,
   // Preserve the DeepSeek alias used by paid daily free allowance rescue.
   // Regular free Ask uses ask-model-free-glm with low reasoning per request.
   freeAskModelSlug = DEEPSEEK_V4_FLASH_VISION_SLUG,
   freeAgentModelSlug = DEEPSEEK_V4_FLASH_VISION_SLUG,
-) =>
-  ({
+) => {
+  const or = (id: Parameters<OpenRouterInstance>[0]) =>
+    withOpenRouterStreamErrorContext(provider(id));
+  return {
     [DEEPSEEK_1017_MODEL_KEY]: or(DEEPSEEK_1017_SLUG),
-    "ask-model": or(GROK_4_6_SLUG),
     "ask-model-free": or(freeAskModelSlug),
     "ask-model-free-glm": or(GLM_5_3_FLASH_SLUG),
     "ask-model-free-deepseek-v41": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
-    "agent-model": or(GROK_4_6_SLUG),
     "agent-model-free": or(freeAgentModelSlug),
     "model-grok-4.6": or(GROK_4_6_SLUG),
+    "model-grok-4.7": or(GROK_4_7_SLUG),
     // Separate internal keys use the same Grok 4.5 provider model while
     // provider reasoning options distinguish Standard from Pro vision.
     "model-grok-4.5": or(GROK_4_5_SLUG),
     "model-grok-4.5-pro": or(GROK_4_5_SLUG),
-    "model-grok-4.6-pro": or(GROK_4_6_SLUG),
-    // Redirect persisted legacy selections; never send new requests to 0731.
-    "model-deepseek-v4-flash-0731": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
-    "model-deepseek-v4-pro": or(DEEPSEEK_V4_PRO_SLUG),
     "model-deepseek-v4-pro-0813": or(DEEPSEEK_V4_PRO_0813_SLUG),
-    // Keep the persisted Max compatibility key while routing new requests to
-    // Kimi K3. Renaming the key would invalidate existing stored selections.
-    "model-opus-4.6": or(KIMI_K3_SLUG),
-    "model-glm-5.2": or(GLM_5_2_SLUG),
     "model-glm-5.3": or(GLM_5_3_SLUG),
     "model-glm-5.3-flash": or(GLM_5_3_FLASH_SLUG),
     "model-glm-5.3-flash-pro": or(GLM_5_3_FLASH_SLUG),
@@ -1309,20 +1460,23 @@ const buildProviderMap = (
     "model-deepseek-v4-flash-vision": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
     "model-deepseek-v4-flash-vision-pro": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
     "model-kimi-k3": or(KIMI_K3_SLUG),
-    "fallback-agent-model": or(GROK_4_6_SLUG),
-    "fallback-ask-model": or(GROK_4_6_SLUG),
+    "model-kimi-k3.1-pro": or(KIMI_K3_1_PRO_SLUG),
+    "fallback-agent-model": or(GROK_4_7_SLUG),
+    "fallback-ask-model": or(GROK_4_7_SLUG),
     // GLM supports the title schema and requires reasoning to stay enabled.
     "title-generator-model": or(GLM_5_3_FLASH_SLUG),
     // Image understanding for text-only routes. The resulting description is
     // injected as untrusted text; this model never becomes the active agent.
     "auxiliary-vision-model": or(AUXILIARY_VISION_SLUG),
-  }) as Record<string, any>;
+  } as Record<string, any>;
+};
 
-const baseProviders: ReturnType<typeof buildProviderMap> = {
+const baseProviders: ReturnType<typeof buildProviderMap> &
+  Record<typeof INFERENCE_CYBER_MODEL_KEY, ReturnType<typeof inference>> = {
+  [INFERENCE_CYBER_MODEL_KEY]: inference(INFERENCE_CYBER_MODEL_ID),
   ...buildProviderMap(openrouter),
-  [ABLITERATION_MODEL_KEY]: abliteration(ABLITERATION_MODEL_ID),
-  [ABLITERATION_LARGE_V2_MODEL_KEY]: abliteration(
-    ABLITERATION_LARGE_V2_MODEL_ID,
+  [GROK_4_6_BEDROCK_MODEL_KEY]: withOpenRouterStreamErrorContext(
+    openrouterUs(GROK_4_6_SLUG),
   ),
 };
 
@@ -1330,15 +1484,9 @@ export type ModelName = keyof typeof baseProviders;
 
 export const modelCutoffDates: Partial<Record<ModelName, string>> &
   Record<string, string | undefined> = {
-  "ask-model": "August 2026",
-  "agent-model": "August 2026",
   "model-grok-4.6": "August 2026",
-  "model-grok-4.6-pro": "August 2026",
-  "model-deepseek-v4-flash-0731": "August 2026",
-  "model-deepseek-v4-pro": "May 2025",
+  [GROK_4_6_BEDROCK_MODEL_KEY]: "August 2026",
   "model-deepseek-v4-pro-0813": "August 2026",
-  "model-opus-4.6": "July 2026",
-  "model-glm-5.2": "June 2026",
   "model-glm-5.3-flash": "August 2026",
   "model-glm-5.3-flash-pro": "August 2026",
   "model-glm-5.3-flash-agent": "August 2026",
@@ -1352,24 +1500,18 @@ export const modelCutoffDates: Partial<Record<ModelName, string>> &
 
 export const modelDisplayNames: Record<ModelName, string> &
   Record<string, string> = {
-  [ABLITERATION_MODEL_KEY]: "Abliteration abliterated-model",
-  [ABLITERATION_LARGE_V2_MODEL_KEY]: "Abliteration abliterated-model-large-v2",
-  "ask-model": "Auto, an intelligent model router built by HackerAI",
+  [INFERENCE_CYBER_MODEL_KEY]: "Inference DeepSeek V4.1 Flash 1017 Cyber",
   "ask-model-free": "Auto, an intelligent model router built by HackerAI",
   "ask-model-free-glm": "Auto, an intelligent model router built by HackerAI",
   "ask-model-free-deepseek-v41":
     "Auto, an intelligent model router built by HackerAI",
-  "agent-model": "Auto, an intelligent model router built by HackerAI",
   "agent-model-free": "Auto, an intelligent model router built by HackerAI",
   "model-grok-4.6": "xAI Grok 4.6",
+  "model-grok-4.7": "xAI Grok 4.7",
+  [GROK_4_6_BEDROCK_MODEL_KEY]: "xAI Grok 4.6",
   "model-grok-4.5": "xAI Grok 4.5",
   "model-grok-4.5-pro": "xAI Grok 4.5",
-  "model-grok-4.6-pro": "xAI Grok 4.6",
-  "model-deepseek-v4-flash-0731": "DeepSeek V4.1 Flash",
-  "model-deepseek-v4-pro": "DeepSeek V4 Pro",
   "model-deepseek-v4-pro-0813": "DeepSeek V4 Pro 0813",
-  "model-opus-4.6": "Moonshot Kimi K3",
-  "model-glm-5.2": "Z.ai GLM 5.2",
   "model-glm-5.3": "Z.ai GLM 5.3",
   "model-glm-5.3-flash": "Z.ai GLM 5.3 Flash",
   "model-glm-5.3-flash-pro": "Z.ai GLM 5.3 Flash",
@@ -1378,6 +1520,7 @@ export const modelDisplayNames: Record<ModelName, string> &
   "model-deepseek-v4-flash-vision-pro": "DeepSeek V4.1 Flash",
   [DEEPSEEK_1017_MODEL_KEY]: "DeepSeek V4.1 Flash 1017",
   "model-kimi-k3": "Moonshot Kimi K3",
+  "model-kimi-k3.1-pro": "Moonshot Kimi K3.1 Pro",
   "fallback-agent-model": "Auto, an intelligent model router built by HackerAI",
   "fallback-ask-model": "Auto, an intelligent model router built by HackerAI",
   "title-generator-model": "GLM 5.3 Flash",
@@ -1406,10 +1549,8 @@ export function isDeepSeekModel(modelName: string): boolean {
     modelName === "ask-model-free" ||
     modelName === "ask-model-free-deepseek-v41" ||
     modelName === "agent-model-free" ||
-    modelName === "model-deepseek-v4-flash-0731" ||
     modelName === "model-deepseek-v4-flash-vision" ||
     modelName === "model-deepseek-v4-flash-vision-pro" ||
-    modelName === "model-deepseek-v4-pro" ||
     modelName === "model-deepseek-v4-pro-0813"
   );
 }
@@ -1418,7 +1559,7 @@ export function isKimiModel(modelName: string): boolean {
   const normalized = modelName.toLowerCase();
   return (
     normalized === "model-kimi-k3" ||
-    normalized === "model-opus-4.6" ||
+    normalized === "model-kimi-k3.1-pro" ||
     normalized.includes("moonshotai/kimi")
   );
 }
@@ -1426,17 +1567,17 @@ export function isKimiModel(modelName: string): boolean {
 function isGrokModel(modelName: string): boolean {
   const normalized = modelName.toLowerCase();
   return (
-    normalized === "agent-model" ||
-    normalized === "ask-model" ||
     normalized === "fallback-agent-model" ||
     normalized === "fallback-ask-model" ||
     normalized === "model-grok-4.6" ||
+    normalized === "model-grok-4.7" ||
+    normalized === GROK_4_6_BEDROCK_MODEL_KEY ||
     normalized === "model-grok-4.5" ||
     normalized === "model-grok-4.5-pro" ||
-    normalized === "model-grok-4.6-pro" ||
     normalized.includes("x-ai/") ||
     normalized === "grok-4.5" ||
-    normalized === "grok-4.6"
+    normalized === "grok-4.6" ||
+    normalized === "grok-4.7"
   );
 }
 
@@ -1452,7 +1593,6 @@ export function supportsMultimodalToolResults(modelName?: string): boolean {
     normalized === "model-glm-5.3-flash" ||
     normalized === "ask-model-free-glm" ||
     normalized === "ask-model-free" ||
-    normalized === "model-deepseek-v4-flash-0731" ||
     normalized === "ask-model-free-deepseek-v41" ||
     normalized === "model-glm-5.3-flash-pro" ||
     normalized === "model-glm-5.3-flash-agent" ||
@@ -1490,11 +1630,11 @@ export function resolveAgentTierToProviderKey(
     case "auto":
       return null;
     case "hackerai-standard":
-      return "model-glm-5.3-flash-agent";
+      return DEEPSEEK_1017_MODEL_KEY;
     case "hackerai-pro":
-      return "model-deepseek-v4-flash-vision-pro";
+      return DEEPSEEK_1017_MODEL_KEY;
     case "hackerai-max":
-      return "model-glm-5.3";
+      return "model-kimi-k3.1-pro";
   }
 }
 

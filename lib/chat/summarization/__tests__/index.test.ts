@@ -116,6 +116,8 @@ const createMockWriter = (): UIMessageStreamWriter =>
 const mockLanguageModel = { modelId: "test-model" } as unknown as LanguageModel;
 
 describe("default compaction policy pipeline", () => {
+  const DEEPSEEK_1017 = "model-deepseek-v4.1-flash-1017-pro";
+  const STARTUP_FALLBACK = "model-deepseek-v4-flash-vision-pro";
   const summary =
     AGENT_SUMMARIZATION_PROMPT.match(/^## .+$/gm)!.join("\n(none)\n");
   const onDiscardedUsage = jest.fn();
@@ -152,13 +154,13 @@ describe("default compaction policy pipeline", () => {
     finish.mockClear();
     onDiscardedUsage.mockClear();
     resolve.mockResolvedValue({
-      model: "model-abliterated",
-      fallbackModel: "model-glm-5.3-flash",
+      model: "model-glm-5.3-flash",
       policy: "abliteration_glm53_fallback_v1",
+      flagEnabled: false,
     });
   });
   it.each(["free", "pro"] as const)(
-    "uses Abliteration for %s compaction and retains source user scope",
+    "uses GLM for %s compaction and retains source user scope",
     async (subscription) => {
       mockGenerateText.mockResolvedValueOnce({
         text: summary,
@@ -169,25 +171,167 @@ describe("default compaction policy pipeline", () => {
       expect(result.needsSummarization).toBe(true);
       expect(mockGenerateText).toHaveBeenCalledTimes(1);
       expect(mockGenerateText.mock.calls[0][0]).toMatchObject({
-        model: { modelId: "model-abliterated" },
+        model: { modelId: "model-glm-5.3-flash" },
         maxRetries: 0,
-        timeout: 120000,
+        timeout: 60000,
         maxOutputTokens: 8192,
-        providerOptions: { abliteration: { reasoningEffort: "low" } },
       });
+      expect(mockGenerateText.mock.calls[0][0].providerOptions).toHaveProperty(
+        "openrouter",
+      );
       expect(result.summaryText).toContain("<preserved_user_message>");
-      expect(finish).toHaveBeenCalledWith("completed", "model-abliterated");
+      expect(finish).toHaveBeenCalledWith("completed", "model-glm-5.3-flash");
     },
   );
+  it.each([false, true])(
+    "uses Inference without invoking fallback, expanded=%s",
+    async (expanded) => {
+      resolve.mockResolvedValue({
+        model: "model-inference-cyber",
+        fallbackModel: DEEPSEEK_1017,
+        expandedAgentContext: expanded,
+        flagEnabled: true,
+        policy: "inference_abliteration_fallback_v1",
+      });
+      mockGenerateText.mockResolvedValueOnce({
+        text: summary,
+        finishReason: "stop",
+        response: { modelId: "deepseek-v4.1-flash-1017-cyber" },
+        usage: {
+          inputTokens: 500,
+          outputTokens: 30,
+          inputTokenDetails: { cacheReadTokens: 100 },
+        },
+      });
+      const result = await compact();
+      expect(result.needsSummarization).toBe(true);
+      expect(result.summarizationUsage).toMatchObject({
+        model: "deepseek-v4.1-flash-1017-cyber",
+        cacheReadTokens: 100,
+      });
+      expect(mockGenerateText).toHaveBeenCalledTimes(1);
+      const args = mockGenerateText.mock.calls[0][0];
+      expect(args).toMatchObject({
+        model: { modelId: "model-inference-cyber" },
+        providerOptions: { inference: { reasoningEffort: "low" } },
+        timeout: 120000,
+        maxRetries: 0,
+        maxOutputTokens: 8192,
+      });
+      expect(args.providerOptions).not.toHaveProperty("openrouter");
+      if (expanded)
+        expect(estimateSummaryInputTokens(args.messages)).toBeGreaterThan(
+          64000,
+        );
+      expect(finish).toHaveBeenCalledWith("completed", "model-inference-cyber");
+    },
+  );
+  it.each(["provider", "truncated", "invalid", "empty"])(
+    "recovers Inference %s with a validated DeepSeek checkpoint",
+    async (failure) => {
+      resolve.mockResolvedValue({
+        model: "model-inference-cyber",
+        fallbackModel: DEEPSEEK_1017,
+        flagEnabled: true,
+      });
+      if (failure === "provider")
+        mockGenerateText.mockRejectedValueOnce(
+          Object.assign(new Error("rejected"), { statusCode: 400 }),
+        );
+      else
+        mockGenerateText.mockResolvedValueOnce({
+          text:
+            failure === "empty"
+              ? ""
+              : failure === "invalid"
+                ? "Missing checkpoint sections"
+                : summary,
+          finishReason: failure === "truncated" ? "length" : "stop",
+          response: { modelId: "deepseek-v4.1-flash-1017-cyber" },
+          usage: {
+            inputTokens: 90,
+            outputTokens: 20,
+            inputTokenDetails: { cacheReadTokens: 40 },
+          },
+        });
+      mockGenerateText.mockResolvedValueOnce({
+        text: summary,
+        finishReason: "stop",
+        usage: { inputTokens: 90, outputTokens: 30 },
+      });
+      expect((await compact()).needsSummarization).toBe(true);
+      expect(
+        mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
+      ).toEqual(["model-inference-cyber", DEEPSEEK_1017]);
+      const recoveryOptions = mockGenerateText.mock.calls[1][0].providerOptions;
+      expect(recoveryOptions).toHaveProperty("openrouter");
+      expect(recoveryOptions).not.toHaveProperty("inference");
+      if (failure !== "provider") {
+        expect(onDiscardedUsage).toHaveBeenCalledTimes(1);
+        expect(onDiscardedUsage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: "deepseek-v4.1-flash-1017-cyber",
+            inputTokens: 90,
+            outputTokens: 20,
+            cacheReadTokens: 40,
+          }),
+        );
+      }
+    },
+  );
+  it.each([false, true])(
+    "tries DeepSeek then GLM after Inference rejections, expanded=%s",
+    async (expanded) => {
+      resolve.mockResolvedValue({
+        model: "model-inference-cyber",
+        fallbackModel: DEEPSEEK_1017,
+        expandedAgentContext: expanded,
+        flagEnabled: true,
+      });
+      mockGenerateText.mockRejectedValue(
+        Object.assign(new Error("rejected"), { statusCode: 400 }),
+      );
+      expect((await compact()).needsSummarization).toBe(false);
+      expect(
+        mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
+      ).toEqual([
+        "model-inference-cyber",
+        DEEPSEEK_1017,
+        "model-glm-5.3-flash",
+      ]);
+      if (expanded)
+        for (const [args] of mockGenerateText.mock.calls)
+          expect(estimateSummaryInputTokens(args.messages)).toBeGreaterThan(
+            64000,
+          );
+    },
+  );
+  it("does not call DeepSeek after cancellation during Inference", async () => {
+    resolve.mockResolvedValue({
+      model: "model-inference-cyber",
+      fallbackModel: DEEPSEEK_1017,
+      flagEnabled: true,
+    });
+    const controller = new AbortController();
+    mockGenerateText.mockImplementationOnce(async () => {
+      controller.abort();
+      throw new DOMException("canceled", "AbortError");
+    });
+    await expect(compact(controller.signal)).rejects.toThrow();
+    expect(mockGenerateText).toHaveBeenCalledTimes(1);
+    expect(finish).toHaveBeenCalledWith("aborted", undefined);
+  });
   it("keeps more than 64K source tokens for Max checkpoints and only retries a large-context model", async () => {
     resolve.mockResolvedValue({
-      model: "model-abliterated-large-v2",
-      fallbackModel: "model-glm-5.3-flash",
+      model: "model-glm-5.3-flash",
       expandedAgentContext: true,
+      flagEnabled: false,
       policy: "max_large_v2_context_v1",
     });
     mockGenerateText
-      .mockRejectedValueOnce(new Error("Provider unavailable"))
+      .mockRejectedValueOnce(
+        Object.assign(new Error("Provider unavailable"), { statusCode: 503 }),
+      )
       .mockResolvedValueOnce({
         text: JSON.stringify(
           Object.fromEntries(
@@ -203,13 +347,7 @@ describe("default compaction policy pipeline", () => {
     expect((await compact()).needsSummarization).toBe(true);
     expect(
       mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual([
-      "model-abliterated-large-v2",
-      "model-deepseek-v4.1-flash-1017-pro",
-    ]);
-    expect(mockGenerateText.mock.calls[0][0].providerOptions).toEqual({
-      abliteration: { reasoningEffort: "low" },
-    });
+    ).toEqual(["model-glm-5.3-flash", DEEPSEEK_1017]);
     for (const [args] of mockGenerateText.mock.calls) {
       const tokens = estimateSummaryInputTokens(args.messages);
       expect(tokens).toBeGreaterThan(64_000);
@@ -218,9 +356,9 @@ describe("default compaction policy pipeline", () => {
   });
   it("keeps expanded input through the bounded large-context recovery chain", async () => {
     resolve.mockResolvedValue({
-      model: "model-abliterated-large-v2",
-      fallbackModel: "model-glm-5.3-flash",
+      model: "model-glm-5.3-flash",
       expandedAgentContext: true,
+      flagEnabled: false,
       policy: "max_large_v2_context_v1",
     });
     mockGenerateText.mockRejectedValue(
@@ -229,13 +367,9 @@ describe("default compaction policy pipeline", () => {
     expect((await compact()).needsSummarization).toBe(false);
     expect(
       mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual([
-      "model-abliterated-large-v2",
-      "model-deepseek-v4.1-flash-1017-pro",
-      "model-glm-5.3-flash",
-    ]);
-    expect(mockGenerateText.mock.calls[2][0].messages).toEqual(
-      mockGenerateText.mock.calls[1][0].messages,
+    ).toEqual(["model-glm-5.3-flash", DEEPSEEK_1017]);
+    expect(mockGenerateText.mock.calls[1][0].messages).toEqual(
+      mockGenerateText.mock.calls[0][0].messages,
     );
   });
   it.each([
@@ -245,13 +379,14 @@ describe("default compaction policy pipeline", () => {
       Object.assign(new Error("provider rejected"), { statusCode: 400 }),
     ],
   ])(
-    "recovers a Large v2 rejection and DeepSeek %s through an intact GLM checkpoint",
+    "recovers an Inference rejection and DeepSeek %s through an intact GLM checkpoint",
     async (_reason, deepSeekError) => {
       resolve.mockResolvedValue({
-        model: "model-abliterated-large-v2",
-        fallbackModel: "model-glm-5.3-flash",
+        model: "model-inference-cyber",
+        fallbackModel: DEEPSEEK_1017,
         expandedAgentContext: true,
-        policy: "max_large_v2_context_v1",
+        flagEnabled: true,
+        policy: "max_inference_context_v1",
       });
       mockGenerateText
         .mockRejectedValueOnce(
@@ -292,10 +427,11 @@ describe("default compaction policy pipeline", () => {
   );
   it("does not start GLM after cancellation during DeepSeek fallback", async () => {
     resolve.mockResolvedValue({
-      model: "model-abliterated-large-v2",
-      fallbackModel: "model-glm-5.3-flash",
+      model: "model-inference-cyber",
+      fallbackModel: DEEPSEEK_1017,
       expandedAgentContext: true,
-      policy: "max_large_v2_context_v1",
+      flagEnabled: true,
+      policy: "max_inference_context_v1",
     });
     const controller = new AbortController();
     mockGenerateText
@@ -307,93 +443,6 @@ describe("default compaction policy pipeline", () => {
     await expect(compact(controller.signal)).rejects.toThrow();
     expect(mockGenerateText).toHaveBeenCalledTimes(2);
     expect(finish).toHaveBeenCalledWith("aborted", undefined);
-  });
-  it("repairs oversized Abliteration summary batches without dropping or executing tool history", async () => {
-    const calls = Array.from({ length: 369 }, (_, i) => ({
-      type: "tool-call" as const,
-      toolCallId: `c${i}`,
-      toolName: "fixture",
-      input: { i },
-    }));
-    const results = calls.map((c) => ({
-      type: "tool-result" as const,
-      toolCallId: c.toolCallId,
-      toolName: c.toolName,
-      output: { type: "text" as const, value: `completed ${c.toolCallId}` },
-    }));
-    const messages: ModelMessage[] = [
-      { role: "user", content: "Continue pending work" },
-      { role: "assistant", content: calls },
-      { role: "tool", content: results },
-    ];
-    const original = JSON.parse(JSON.stringify(messages));
-    mockGenerateText.mockResolvedValueOnce({
-      text: summary,
-      finishReason: "stop",
-      usage: { inputTokens: 100, outputTokens: 20 },
-    });
-    await generateSummaryText(
-      [],
-      { modelId: "abliterated-model-large-v2" } as unknown as LanguageModel,
-      "agent",
-      "",
-      false,
-      undefined,
-      undefined,
-      undefined,
-      messages,
-      484000,
-    );
-    const sent = mockGenerateText.mock.calls[0][0].messages as ModelMessage[];
-    const assistantBatches = sent.filter((m) => m.role === "assistant");
-    expect(
-      assistantBatches.map((m) =>
-        Array.isArray(m.content) ? m.content.length : 0,
-      ),
-    ).toEqual([128, 128, 113]);
-    expect(
-      sent.filter((m) => m.role === "tool").flatMap((m) => m.content),
-    ).toEqual(results);
-    expect(assistantBatches.flatMap((m) => m.content)).toEqual(calls);
-    expect(messages).toEqual(original);
-  });
-  it("rejects refusal output, accounts for discarded usage, and falls back to GLM", async () => {
-    mockGenerateText
-      .mockResolvedValueOnce({
-        text: "I cannot summarize this pentest",
-        finishReason: "stop",
-        usage: { inputTokens: 100, outputTokens: 10 },
-      })
-      .mockResolvedValueOnce({
-        text: summary,
-        finishReason: "stop",
-        usage: { inputTokens: 50, outputTokens: 20 },
-      });
-    const result = await compact();
-    expect(result.needsSummarization).toBe(true);
-    expect(
-      mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual(["model-abliterated", "model-glm-5.3-flash"]);
-    expect(onDiscardedUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ inputTokens: 100, outputTokens: 10 }),
-    );
-    expect(attempt.mock.calls.map((call) => call[1])).toEqual([
-      "error",
-      "completed",
-    ]);
-  });
-  it("falls back to GLM on an Abliteration provider error", async () => {
-    mockGenerateText
-      .mockRejectedValueOnce(new Error("Provider unavailable"))
-      .mockResolvedValueOnce({
-        text: summary,
-        finishReason: "stop",
-        usage: { inputTokens: 50, outputTokens: 20 },
-      });
-    await compact();
-    expect(
-      mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual(["model-abliterated", "model-glm-5.3-flash"]);
   });
   it("does not retry a canceled primary", async () => {
     const controller = new AbortController();
@@ -425,20 +474,14 @@ describe("default compaction policy pipeline", () => {
       maxTokens: 100000,
       compactionIndex: 2,
       hasExistingSummary: true,
-      cacheAlignedSummary: {
-        languageModel: mockLanguageModel,
-        tools: {},
-        system: "Frozen",
-        providerOptions: {},
-      },
       compactionPolicy: experiment,
     });
     expect(result).not.toBeNull();
     expect(mockGenerateText.mock.calls[0][0].model.modelId).toBe(
-      "model-abliterated",
+      "model-glm-5.3-flash",
     );
     expect(start).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "model-abliterated" }),
+      expect.objectContaining({ model: "model-glm-5.3-flash" }),
       "run_scoped",
     );
   });
@@ -461,13 +504,8 @@ describe("default compaction policy pipeline", () => {
     ["missing sections", "## Current State\nPending authorized check", "stop"],
     ["truncated", summary, "length"],
   ])(
-    "retries %s GLM output with Abliteration and retains both usage records",
+    "retries %s GLM output with the startup fallback and retains both usage records",
     async (_label, text, finishReason) => {
-      resolve.mockResolvedValue({
-        model: "model-glm-5.3-flash",
-        fallbackModel: "model-abliterated",
-        policy: "moderation_glm53_abliteration_recovery_v2",
-      });
       mockGenerateText
         .mockResolvedValueOnce({
           text,
@@ -483,7 +521,7 @@ describe("default compaction policy pipeline", () => {
       expect(result.needsSummarization).toBe(true);
       expect(
         mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-      ).toEqual(["model-glm-5.3-flash", "model-abliterated"]);
+      ).toEqual(["model-glm-5.3-flash", STARTUP_FALLBACK]);
       expect(onDiscardedUsage).toHaveBeenCalledWith(
         expect.objectContaining({ inputTokens: 100, outputTokens: 10 }),
       );
@@ -492,15 +530,10 @@ describe("default compaction policy pipeline", () => {
         outputTokens: 20,
       });
       expect(mockSaveChatSummary).toHaveBeenCalledTimes(1);
-      expect(finish).toHaveBeenCalledWith("completed", "model-abliterated");
+      expect(finish).toHaveBeenCalledWith("completed", STARTUP_FALLBACK);
     },
   );
   it("preserves original history and never persists when every selective attempt refuses", async () => {
-    resolve.mockResolvedValue({
-      model: "model-glm-5.3-flash",
-      fallbackModel: "model-abliterated",
-      policy: "moderation_glm53_abliteration_recovery_v2",
-    });
     const original = JSON.stringify(fourMessagesAboveThreshold);
     mockGenerateText.mockResolvedValue({
       text: "Sorry, I cannot help summarize this conversation.",
@@ -511,19 +544,14 @@ describe("default compaction policy pipeline", () => {
     expect(result.needsSummarization).toBe(false);
     expect(JSON.stringify(fourMessagesAboveThreshold)).toBe(original);
     expect(mockSaveChatSummary).not.toHaveBeenCalled();
-    expect(mockGenerateText).toHaveBeenCalledTimes(4);
-    expect(onDiscardedUsage).toHaveBeenCalledTimes(4);
+    expect(mockGenerateText).toHaveBeenCalledTimes(3);
+    expect(onDiscardedUsage).toHaveBeenCalledTimes(3);
     expect(attempt.mock.calls.map((call) => call[4])).toEqual(
-      Array(4).fill("missing_sections"),
+      Array(3).fill("missing_sections"),
     );
     expect(finish).toHaveBeenLastCalledWith("error", undefined);
   });
-  it("retries a transient GLM failure but does not retry a canceled treatment", async () => {
-    resolve.mockResolvedValue({
-      model: "model-glm-5.3-flash",
-      fallbackModel: "model-abliterated",
-      policy: "moderation_glm53_abliteration_recovery_v2",
-    });
+  it("retries a transient GLM failure but does not retry a canceled attempt", async () => {
     mockGenerateText
       .mockRejectedValueOnce({ statusCode: 503 })
       .mockResolvedValueOnce({
@@ -534,7 +562,7 @@ describe("default compaction policy pipeline", () => {
     expect((await compact()).needsSummarization).toBe(true);
     expect(
       mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual(["model-glm-5.3-flash", "model-abliterated"]);
+    ).toEqual(["model-glm-5.3-flash", STARTUP_FALLBACK]);
     mockGenerateText.mockClear();
     const controller = new AbortController();
     mockGenerateText.mockImplementationOnce(async () => {
@@ -545,12 +573,7 @@ describe("default compaction policy pipeline", () => {
     expect(mockGenerateText).toHaveBeenCalledTimes(1);
     expect(finish).toHaveBeenLastCalledWith("aborted", undefined);
   });
-  it("uses GLM then Abliteration for rolling treatment compaction", async () => {
-    resolve.mockResolvedValue({
-      model: "model-glm-5.3-flash",
-      fallbackModel: "model-abliterated",
-      policy: "moderation_glm53_abliteration_recovery_v2",
-    });
+  it("uses GLM then the startup fallback for rolling compaction", async () => {
     mockGenerateText
       .mockResolvedValueOnce({
         text: "I cannot summarize",
@@ -581,7 +604,7 @@ describe("default compaction policy pipeline", () => {
     expect(result).not.toBeNull();
     expect(
       mockGenerateText.mock.calls.map(([args]) => args.model.modelId),
-    ).toEqual(["model-glm-5.3-flash", "model-abliterated"]);
+    ).toEqual(["model-glm-5.3-flash", STARTUP_FALLBACK]);
     expect(mockSaveChatSummary).not.toHaveBeenCalled();
     expect(start).toHaveBeenCalledWith(
       expect.objectContaining({ model: "model-glm-5.3-flash" }),
@@ -619,6 +642,41 @@ describe("summary usage coverage", () => {
       expect(result.usage.cacheReadTokens).toBe(reported ? 0 : undefined);
       expect(result.usage.cacheWriteTokens).toBe(reported ? 0 : undefined);
       expect(result.usage.cost).toBe(reported ? 0 : undefined);
+    },
+  );
+
+  it.each([-5, 1.5])(
+    "reports malformed token count %p as absent while keeping provider cost",
+    async (malformed) => {
+      mockGenerateText.mockReset();
+      mockGenerateText.mockResolvedValueOnce({
+        text: "Synthetic summary",
+        finishReason: "stop",
+        usage: {
+          inputTokens: malformed,
+          outputTokens: malformed,
+          inputTokenDetails: {
+            cacheReadTokens: malformed,
+            cacheWriteTokens: malformed,
+          },
+          raw: { cost: 0.0125 },
+        },
+      });
+      const result = await generateSummaryText(
+        [],
+        mockLanguageModel,
+        "ask",
+        "system",
+        false,
+      );
+      expect(result.usage).toMatchObject({
+        inputTokens: 0,
+        inputTokensReported: false,
+        outputTokens: 0,
+        cost: 0.0125,
+      });
+      expect(result.usage.cacheReadTokens).toBeUndefined();
+      expect(result.usage.cacheWriteTokens).toBeUndefined();
     },
   );
 });
@@ -796,127 +854,6 @@ describe("checkAndSummarizeIfNeeded", () => {
   afterEach(() => {
     jest.restoreAllMocks();
   });
-
-  it.each([true, false])(
-    "uses the warm prefix only when its full request fits (fits=%s)",
-    async (fits) => {
-      const { jsonSchema } = jest.requireActual<typeof import("ai")>("ai");
-      const warmModel = {
-        modelId: "deepseek/deepseek-v4.1-flash-1017",
-      } as LanguageModel;
-      const onUsed = jest.fn();
-      const messages: ModelMessage[] = [
-        { role: "user", content: "Original evidence" },
-      ];
-      const tools = {
-        lookup: {
-          description: "stable",
-          inputSchema: jsonSchema({ type: "object", properties: {} }),
-        },
-      };
-      mockGenerateText.mockResolvedValue({
-        text: "Complete checkpoint",
-        finishReason: "stop",
-      });
-      const result = await compactModelMessagesInRun({
-        modelMessages: messages,
-        subscription: "pro",
-        mode: "agent",
-        writer: mockWriter,
-        chatId: null,
-        maxTokens: fits ? 128_000 : 1000,
-        compactionIndex: 1,
-        hasExistingSummary: false,
-        cacheAlignedSummary: {
-          languageModel: warmModel,
-          system: "Frozen prompt",
-          tools,
-          providerOptions: { openrouter: { session_id: "test-session" } },
-          onUsed,
-        },
-      });
-      expect(result?.summaryText).toContain("Complete checkpoint");
-      const call = mockGenerateText.mock.calls[0][0] as any;
-      if (fits) {
-        expect(call.model).toBe(warmModel);
-        expect(call.messages.slice(0, messages.length)).toEqual(messages);
-        expect(call.system).toBe("Frozen prompt");
-        expect(call.tools.lookup.inputSchema).toBe(tools.lookup.inputSchema);
-        expect(call.maxOutputTokens).toBe(8192);
-        expect(onUsed).toHaveBeenCalledTimes(1);
-      } else {
-        expect(call.model).not.toBe(warmModel);
-        expect(onUsed).not.toHaveBeenCalled();
-      }
-    },
-  );
-
-  it.each(["provider", "truncated", "cancelled"])(
-    "recovers warm summary %s failures unless cancelled",
-    async (failure) => {
-      const controller = new AbortController();
-      const onDiscardedUsage = jest.fn();
-      const warmModel = {
-        modelId: "deepseek/deepseek-v4.1-flash-1017",
-      } as LanguageModel;
-      mockGenerateText
-        .mockImplementationOnce(async () => {
-          if (failure === "truncated")
-            return {
-              text: "Partial",
-              finishReason: "length",
-              usage: { inputTokens: 100, outputTokens: 10 },
-            };
-          if (failure === "cancelled") controller.abort(new Error("stopped"));
-          throw new Error(failure);
-        })
-        .mockResolvedValue({
-          text: "Bounded checkpoint",
-          finishReason: "stop",
-        });
-      const result = compactModelMessagesInRun({
-        modelMessages: [{ role: "user", content: "History" }],
-        subscription: "pro",
-        mode: "agent",
-        writer: mockWriter,
-        chatId: null,
-        maxTokens: 128_000,
-        compactionIndex: 1,
-        hasExistingSummary: false,
-        abortSignal: controller.signal,
-        cacheAlignedSummary: {
-          languageModel: warmModel,
-          system: "Frozen prompt",
-          tools: {},
-          providerOptions: {},
-          onDiscardedUsage,
-        },
-      });
-      if (failure === "cancelled") {
-        await expect(result).rejects.toThrow("cancelled");
-        expect(mockGenerateText).toHaveBeenCalledTimes(1);
-      } else {
-        expect((await result)?.summaryText).toContain("Bounded checkpoint");
-        expect(mockGenerateText).toHaveBeenCalledTimes(2);
-        expect((mockGenerateText.mock.calls[0][0] as any).model).toBe(
-          warmModel,
-        );
-        expect((mockGenerateText.mock.calls[1][0] as any).model).not.toBe(
-          warmModel,
-        );
-        if (failure === "truncated") {
-          expect(onDiscardedUsage).toHaveBeenCalledTimes(1);
-          expect(onDiscardedUsage).toHaveBeenCalledWith(
-            expect.objectContaining({
-              inputTokens: 100,
-              outputTokens: 10,
-              model: "deepseek/deepseek-v4.1-flash-1017",
-            }),
-          );
-        } else expect(onDiscardedUsage).not.toHaveBeenCalled();
-      }
-    },
-  );
 
   it("persists source runtime records and shares the retained-tail budget", async () => {
     const source: UIMessage[] = [

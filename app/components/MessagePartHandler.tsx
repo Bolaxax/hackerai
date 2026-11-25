@@ -1,6 +1,16 @@
-import { memo } from "react";
+import { memo, useMemo } from "react";
+import {
+  AGENT_STEER_PART_TYPE,
+  isAgentSteerPart,
+} from "@/lib/chat/agent-steer";
 import { UIMessage } from "@ai-sdk/react";
 import { MemoizedMarkdown } from "./MemoizedMarkdown";
+import { SandboxAttachmentContext } from "./SandboxAttachmentLink";
+import {
+  mayContainSandboxAttachmentLink,
+  resolveSandboxAttachments,
+  sandboxDeliveryReceiptSignature,
+} from "@/lib/chat/sandbox-attachment-links";
 import { FileToolsHandler } from "./tools/FileToolsHandler";
 import { FileHandler } from "./tools/FileHandler";
 import { TerminalToolHandler } from "./tools/TerminalToolHandler";
@@ -10,6 +20,14 @@ import { TodoToolHandler } from "./tools/TodoToolHandler";
 import { NotesToolHandler } from "./tools/NotesToolHandler";
 import { ReportToolHandler } from "./tools/ReportToolHandler";
 import { FindingToolHandler } from "./tools/FindingToolHandler";
+import {
+  FindingRetestToolHandler,
+  type FindingRetestToolName,
+} from "./tools/FindingRetestToolHandler";
+import {
+  FindingHuntToolHandler,
+  type FindingHuntToolName,
+} from "./tools/FindingHuntToolHandler";
 import { ToolValidationErrorHandler } from "./tools/ToolErrorHandler";
 import { FindingCard } from "./findings/FindingCard";
 import { ProxyToolHandler } from "./tools/ProxyToolHandler";
@@ -21,6 +39,7 @@ import { ReasoningHandler } from "./ReasoningHandler";
 import { isToolInputValidationError } from "@/lib/chat/tool-error-display";
 import { SubagentToolHandler } from "./tools/SubagentToolHandler";
 import { SubagentSkillToolHandler } from "./tools/SubagentSkillToolHandler";
+import { WaitForUserToolHandler } from "./tools/WaitForUserToolHandler";
 
 interface MessagePartHandlerProps {
   message: UIMessage;
@@ -75,6 +94,40 @@ const subagentLifecycleSignature = (
 const UserTextPart = memo(function UserTextPart({ text }: { text: string }) {
   return <div className="whitespace-pre-wrap">{text}</div>;
 });
+
+function AssistantTextPart({
+  message,
+  text,
+  isAnimating,
+  sharedFileDetails,
+}: {
+  message: UIMessage;
+  text: string;
+  isAnimating: boolean;
+  sharedFileDetails?: FileDetails[];
+}) {
+  const hasSandboxLinkCandidate = mayContainSandboxAttachmentLink(text);
+  const sandboxAttachments = useMemo(
+    () =>
+      hasSandboxLinkCandidate
+        ? resolveSandboxAttachments(message.parts, sharedFileDetails)
+        : null,
+    [hasSandboxLinkCandidate, message.parts, sharedFileDetails],
+  );
+
+  // Always render the provider so a link appearing mid-stream does not change
+  // the tree shape and remount the streamed Markdown blocks.
+  return (
+    <div
+      data-performance-message-id={message.id}
+      data-performance-text-length={text.length}
+    >
+      <SandboxAttachmentContext.Provider value={sandboxAttachments}>
+        <MemoizedMarkdown content={text} isAnimating={isAnimating} />
+      </SandboxAttachmentContext.Provider>
+    </div>
+  );
+}
 
 // Deep equality check for tool inputs — avoids JSON.stringify overhead while
 // correctly handling nested objects/arrays (e.g. tool-file edits, todo_write todos).
@@ -141,6 +194,19 @@ export function areMessagePartHandlerPropsEqual(
   )
     return false;
 
+  // A sandbox link can become downloadable after its text finished streaming:
+  // delivery receipts and file metadata arrive separately from the text part.
+  if (
+    prevProps.part?.type === "text" &&
+    prevProps.message.role !== "user" &&
+    mayContainSandboxAttachmentLink(nextProps.part?.text) &&
+    (prevProps.sharedFileDetails !== nextProps.sharedFileDetails ||
+      (prevProps.message !== nextProps.message &&
+        sandboxDeliveryReceiptSignature(prevProps.message.parts) !==
+          sandboxDeliveryReceiptSignature(nextProps.message.parts)))
+  )
+    return false;
+
   if (SUBAGENT_TOOL_PART_TYPES.has(prevProps.part?.type)) {
     const previousLifecycle = subagentLifecycleSignature(
       prevProps.message,
@@ -170,6 +236,10 @@ export function areMessagePartHandlerPropsEqual(
     nextProps.terminalOutputByToolCallId
   )
     return false;
+
+  if (prevProps.part?.type === AGENT_STEER_PART_TYPE) {
+    return deepEqual(prevProps.part.data, nextProps.part?.data);
+  }
 
   if (prevProps.part?.type === "data-shared-finding") {
     return deepEqual(prevProps.part.data, nextProps.part.data);
@@ -256,15 +326,12 @@ export const MessagePartHandler = memo(function MessagePartHandler({
 
       // For assistant messages, use memoized markdown rendering
       return (
-        <div
-          data-performance-message-id={message.id}
-          data-performance-text-length={text.length}
-        >
-          <MemoizedMarkdown
-            content={text}
-            isAnimating={status === "streaming" && isLastMessage === true}
-          />
-        </div>
+        <AssistantTextPart
+          message={message}
+          text={text}
+          isAnimating={status === "streaming" && isLastMessage === true}
+          sharedFileDetails={sharedFileDetails}
+        />
       );
     }
 
@@ -299,7 +366,16 @@ export const MessagePartHandler = memo(function MessagePartHandler({
       return <FileToolsHandler message={message} part={part} status={status} />;
 
     case "tool-file":
-      return <FileHandler message={message} part={part} status={status} />;
+    case "tool-file_edit":
+    case "tool-file_write":
+      return (
+        <FileHandler
+          message={message}
+          part={part}
+          status={status}
+          canRequestApproval={isLastMessage === true && status !== "ready"}
+        />
+      );
 
     case "tool-web_search":
     case "tool-open_url":
@@ -317,6 +393,7 @@ export const MessagePartHandler = memo(function MessagePartHandler({
         : undefined;
       return (
         <TerminalToolHandler
+          canRequestApproval={isLastMessage === true && status !== "ready"}
           message={message}
           part={part}
           status={status}
@@ -342,6 +419,9 @@ export const MessagePartHandler = memo(function MessagePartHandler({
 
     case "tool-todo_write":
       return <TodoToolHandler message={message} part={part} status={status} />;
+
+    case "tool-wait_for_user":
+      return <WaitForUserToolHandler part={part} status={status} />;
 
     case "tool-delegate_task":
     case "tool-create_agent":
@@ -392,6 +472,11 @@ export const MessagePartHandler = memo(function MessagePartHandler({
         <NotesToolHandler part={part} status={status} toolName="delete_note" />
       );
 
+    case "tool-get_note":
+      return (
+        <NotesToolHandler part={part} status={status} toolName="get_note" />
+      );
+
     case "tool-list_reports":
       return (
         <ReportToolHandler
@@ -414,6 +499,43 @@ export const MessagePartHandler = memo(function MessagePartHandler({
       );
     case "tool-create_vulnerability_report":
       return <FindingToolHandler part={part} status={status} />;
+    case "tool-get_finding_retests":
+    case "tool-start_finding_retest":
+    case "tool-complete_finding_retest":
+      return (
+        <FindingRetestToolHandler
+          part={part}
+          status={status}
+          toolName={part.type.slice("tool-".length) as FindingRetestToolName}
+        />
+      );
+    case "tool-get_finding_hunts":
+    case "tool-start_finding_hunt":
+    case "tool-record_finding_hunt_candidate":
+    case "tool-complete_finding_hunt":
+      return (
+        <FindingHuntToolHandler
+          part={part}
+          status={status}
+          toolName={part.type.slice("tool-".length) as FindingHuntToolName}
+        />
+      );
+
+    case AGENT_STEER_PART_TYPE:
+      // A follow-up the Agent read mid-run, shown where it read it.
+      return isAgentSteerPart(part) ? (
+        <div
+          className="my-2 flex w-full justify-end"
+          data-testid="agent-steer-message"
+        >
+          <div className="max-w-[80%] rounded-[18px] rounded-se-lg border border-border bg-secondary px-4 py-1.5 text-primary-foreground">
+            <div className="text-xs text-muted-foreground">Steer</div>
+            <div className="whitespace-pre-wrap break-words">
+              {part.data.text}
+            </div>
+          </div>
+        </div>
+      ) : null;
 
     case "data-shared-finding":
       return part.data ? (

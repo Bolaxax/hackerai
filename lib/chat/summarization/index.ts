@@ -5,10 +5,11 @@ import { getCompactionResponseFormat } from "./structured-summary";
 
 import {
   CompactionModelPolicy,
+  COMPACTION_FALLBACK_MODEL,
   MAX_CONTEXT_SUMMARY_INPUT_TOKENS,
   hasStructuredCompactionSummary,
 } from "@/lib/chat/summarization/compaction-policy";
-import { isAbliterationModel } from "@/lib/ai/abliteration";
+import { isInferenceCyberModel } from "@/lib/ai/inference";
 
 import {
   UIMessage,
@@ -582,20 +583,25 @@ const generateSummaryTextWithRetry = async ({
     abortSignal?.throwIfAborted();
     if (assignment && compactionPolicy) {
       const telemetry = compactionPolicy.start(assignment, persistence);
-      const deepSeekFirst =
-        assignment.expandedAgentContext &&
-        isAbliterationModel(assignment.model);
+      const inferencePrimary = isInferenceCyberModel(assignment.model);
+      // Inference recovers on the exact 1M-context DeepSeek V4.1 Flash route
+      // before GLM, retaining the 484K projection for expanded histories.
+      const deepSeekFirst = inferencePrimary;
       const models = [
-        assignment.model,
-        // Expanded recovery tries the exact 1M-context DeepSeek route before
-        // GLM, retaining the 484K projection and independent summary fallbacks.
-        ...(deepSeekFirst ? [DEEPSEEK_1017_MODEL_KEY] : []),
-        ...(assignment.fallbackModel ? [assignment.fallbackModel] : []),
-        ...(deepSeekFirst
-          ? []
-          : assignment.expandedAgentContext
-            ? [DEEPSEEK_1017_MODEL_KEY]
-            : STARTUP_COMPACTION_FALLBACK_MODELS),
+        ...new Set([
+          assignment.model,
+          ...(deepSeekFirst ? [DEEPSEEK_1017_MODEL_KEY] : []),
+          ...(inferencePrimary
+            ? [COMPACTION_FALLBACK_MODEL]
+            : assignment.fallbackModel
+              ? [assignment.fallbackModel]
+              : []),
+          ...(deepSeekFirst
+            ? []
+            : assignment.expandedAgentContext
+              ? [DEEPSEEK_1017_MODEL_KEY]
+              : STARTUP_COMPACTION_FALLBACK_MODELS),
+        ]),
       ];
       let servedModel: string | undefined;
       try {
@@ -607,7 +613,7 @@ const generateSummaryTextWithRetry = async ({
           // even when the separate moderation compaction experiment is paused.
           const isStructuredRecovery =
             (assignment.expandedAgentContext === true &&
-              !isAbliterationModel(modelName)) ||
+              !isInferenceCyberModel(modelName)) ||
             (assignment.flagEnabled === true &&
               modelName === "model-glm-5.3-flash");
           let discardedUsage: SummarizationUsage | undefined;
@@ -623,12 +629,8 @@ const generateSummaryTextWithRetry = async ({
               chatSystemPrompt,
               hasExistingSummary,
               undefined,
-              isAbliterationModel(modelName)
-                ? {
-                    abliteration: {
-                      reasoningEffort: "low",
-                    },
-                  }
+              isInferenceCyberModel(modelName)
+                ? { inference: { reasoningEffort: "low" } }
                 : buildStartupCompactionProviderOptions(
                     providerOptions,
                     isStructuredRecovery ? mode : undefined,
@@ -641,9 +643,9 @@ const generateSummaryTextWithRetry = async ({
                 : summaryInputMaxTokens,
               {
                 maxRetries: 0,
-                // Abliteration must finish the full checkpoint before returning.
-                // Give it two minutes while retaining bounded recovery and cancellation.
-                timeout: isAbliterationModel(modelName)
+                // Direct providers must finish the full checkpoint before
+                // returning; retain bounded recovery and cancellation.
+                timeout: isInferenceCyberModel(modelName)
                   ? 120_000
                   : isStructuredRecovery
                     ? 75_000
@@ -697,15 +699,10 @@ const generateSummaryTextWithRetry = async ({
               abortSignal?.aborted ||
               index === models.length - 1 ||
               !(
-                isAbliterationModel(modelName) ||
-                // Expanded DeepSeek recovery may also reject the provider
-                // request outright. Give the assigned GLM one final attempt.
+                isInferenceCyberModel(modelName) ||
+                // DeepSeek recovery may also reject the provider request
+                // outright. Give the assigned GLM one final attempt.
                 (deepSeekFirst && modelName === DEEPSEEK_1017_MODEL_KEY) ||
-                // A cheaper primary can reject a request with a non-retryable
-                // provider error (for example HTTP 400). Still try the assigned
-                // Abliteration fallback once; never retry caller cancellation.
-                (index === 0 &&
-                  isAbliterationModel(assignment.fallbackModel)) ||
                 error instanceof InvalidCompactionSummaryError ||
                 isMalformedProviderJsonError(error) ||
                 isRecoverableStartupCompactionError(error)
@@ -931,15 +928,6 @@ export interface CompactModelMessagesInRunOptions {
   providerPromptPressure?: ProviderPromptPressure | null;
   compactionIndex: number;
   hasExistingSummary: boolean;
-  /** Only in-run warm calls; startup and provider-recovery paths keep their existing policy. */
-  cacheAlignedSummary?: {
-    languageModel: LanguageModel;
-    tools: ToolSet;
-    system: string;
-    providerOptions: Record<string, Record<string, unknown>>;
-    onUsed?: () => void;
-    onDiscardedUsage?: (usage: SummarizationUsage) => void;
-  };
   onPhaseDuration?: ContextCompactionPhaseReporter;
   registerBackgroundWork?: BackgroundWorkRegistrar;
 }
@@ -979,7 +967,6 @@ export const compactModelMessagesInRun = async ({
   providerPromptPressure,
   compactionIndex,
   hasExistingSummary,
-  cacheAlignedSummary,
   onPhaseDuration,
   registerBackgroundWork,
   compactionPolicy,
@@ -1025,97 +1012,24 @@ export const compactModelMessagesInRun = async ({
   );
 
   try {
-    // Reserve actual schemas/system plus instruction headroom and bounded output.
-    // If the full prefix cannot fit, keep the existing bounded-summary path.
-    let prefixBudget = 0;
-    if (cacheAlignedSummary) {
-      try {
-        const schemaTokens = safeCountTokens(
-          JSON.stringify(
-            await Promise.all(
-              Object.entries(cacheAlignedSummary.tools).map(
-                async ([name, tool]) => ({
-                  name,
-                  description: tool.description,
-                  schema: await asSchema(tool.inputSchema).jsonSchema,
-                }),
-              ),
-            ),
-          ),
-        );
-        prefixBudget = Math.max(
-          0,
-          maxTokens -
-            Math.max(
-              systemPromptTokens,
-              safeCountTokens(cacheAlignedSummary.system),
-            ) -
-            schemaTokens -
-            12_288,
-        );
-      } catch {
-        // An unplannable warm request must not remove the bounded recovery path.
-      }
-    }
-    const useWarmPrefix =
-      !compactionPolicy &&
-      cacheAlignedSummary &&
-      prefixBudget > 0 &&
-      estimateSummaryInputTokens(modelMessages) <= prefixBudget;
-    let warmPrefixSucceeded = false;
-    const runBoundedSummary = () =>
-      generateSummaryTextWithRetry({
-        onRetry: progress.retry,
-        messagesToSummarize: [],
-        modelMessages,
-        mode,
-        chatSystemPrompt,
-        hasExistingSummary,
-        tools,
-        providerOptions,
-        abortSignal,
-        summaryInputMaxTokens: getSummaryInputMaxTokens(maxTokens),
-        chatId,
-        subscription,
-        reason: compactionReason,
-        onPhaseDuration,
-        compactionPolicy,
-        persistence: "run_scoped",
-      });
-    if (useWarmPrefix) cacheAlignedSummary.onUsed?.();
-    const summaryPromise = useWarmPrefix
-      ? generateSummaryText(
-          [],
-          cacheAlignedSummary.languageModel,
-          mode,
-          cacheAlignedSummary.system,
-          hasExistingSummary,
-          cacheAlignedSummary.tools,
-          cacheAlignedSummary.providerOptions,
-          abortSignal,
-          modelMessages,
-          prefixBudget,
-          {
-            preservePrefix: true,
-            maxRetries: 0,
-            timeout: 60_000,
-            maxOutputTokens: 8192,
-            onDiscardedUsage: cacheAlignedSummary.onDiscardedUsage,
-          },
-        )
-          .then((result) => {
-            warmPrefixSucceeded = true;
-            return {
-              ...result,
-              languageModel: cacheAlignedSummary.languageModel,
-              attempt: "primary" as const,
-            };
-          })
-          .catch((error) => {
-            if (abortSignal?.aborted) throw error;
-            return runBoundedSummary();
-          })
-      : runBoundedSummary();
+    const summaryPromise = generateSummaryTextWithRetry({
+      onRetry: progress.retry,
+      messagesToSummarize: [],
+      modelMessages,
+      mode,
+      chatSystemPrompt,
+      hasExistingSummary,
+      tools,
+      providerOptions,
+      abortSignal,
+      summaryInputMaxTokens: getSummaryInputMaxTokens(maxTokens),
+      chatId,
+      subscription,
+      reason: compactionReason,
+      onPhaseDuration,
+      compactionPolicy,
+      persistence: "run_scoped",
+    });
     const transcriptSave = startTranscriptSave({
       messages: [],
       modelMessages: transcriptModelMessages,
@@ -1151,7 +1065,6 @@ export const compactModelMessagesInRun = async ({
         persistence: "run_scoped",
         compaction_model:
           summaryResult.usage.model ?? CONTEXT_COMPACTION_MODEL_NAME,
-        cache_aligned_prefix: warmPrefixSucceeded,
         summary_input_tokens: summaryResult.usage.inputTokens,
         summary_output_tokens: summaryResult.usage.outputTokens,
         estimated_compacted_input_tokens:

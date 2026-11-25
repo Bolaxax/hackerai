@@ -11,6 +11,7 @@ import {
   limitModelImageToolResults,
   MODEL_IMAGE_TOOL_RESULT_LIMIT,
 } from "../prune-tool-outputs";
+import { resolveSandboxAttachments } from "@/lib/chat/sandbox-attachment-links";
 
 // Helper to create a UIMessage with tool parts
 function makeAssistantMessage(
@@ -57,6 +58,7 @@ describe("pruneToolOutputs", () => {
                 exitCode: null,
                 waitExpired: true,
                 recordPath: "/tmp/records/abcd1234.json",
+                recordPersistenceStatus: "pending",
                 output:
                   "[Full output (5000 chars) saved to: /tmp/evidence.txt]\n" +
                   "x".repeat(5000),
@@ -89,6 +91,8 @@ describe("pruneToolOutputs", () => {
       expect(placeholder).toContain("status wait_expired");
       expect(placeholder).toContain("record /tmp/records/abcd1234.json");
       expect(placeholder).toContain("saved output /tmp/evidence.txt");
+      expect(placeholder).toContain("record persistence pending");
+      expect(placeholder).not.toContain("record persistence failed");
       expect(placeholder).not.toContain("x".repeat(100));
     },
   );
@@ -279,7 +283,34 @@ describe("pruneToolOutputs", () => {
 
     const result = pruneToolOutputs(messages, 5, NO_MIN);
     const filePart = result.messages[0].parts[0] as any;
-    expect(filePart.output).toBe("[File: edit /src/app.ts]");
+    expect(filePart.output).toBe("[File: edit /src/app.ts; outcome unknown]");
+  });
+
+  it("prunes a dedicated file_edit result without an action field", () => {
+    const messages: UIMessage[] = [
+      makeAssistantMessage([
+        makeToolPart(
+          "file_edit",
+          { content: "x".repeat(5000) },
+          { path: "/src/app.ts" },
+        ),
+      ]),
+      makeAssistantMessage(
+        [
+          makeToolPart(
+            "run_terminal_cmd",
+            { stdout: "recent", exitCode: 0 },
+            { command: "echo" },
+          ),
+        ],
+        "msg-new",
+      ),
+    ];
+
+    const result = pruneToolOutputs(messages, 5, NO_MIN);
+    expect((result.messages[0].parts[0] as any).output).toBe(
+      "[File: edit /src/app.ts; outcome unknown]",
+    );
   });
 
   it("generates correct placeholder for match tool", () => {
@@ -844,6 +875,30 @@ describe("compactMessageForStorage", () => {
     expect(result.afterSizeBytes).toBeLessThan(result.beforeSizeBytes);
   });
 
+  it("strips dedicated edit diff fields before storage", () => {
+    const message = makeAssistantMessage([
+      makeToolPart(
+        "file_edit",
+        {
+          content: "latest content",
+          originalContent: "x".repeat(5000),
+          modifiedContent: "y".repeat(5000),
+        },
+        { path: "/tmp/a.txt" },
+      ),
+    ]);
+
+    const result = compactMessageForStorage(message, {
+      softLimitBytes: 1000,
+      toolOutputTokenBudget: 10_000,
+    });
+
+    expect(result.strippedUiOnlyFields).toBe(true);
+    expect((result.message.parts[0] as any).output).toEqual({
+      content: "latest content",
+    });
+  });
+
   it("prunes old tool outputs when stripped parts are still too large", () => {
     const message = makeAssistantMessage([
       makeToolPart(
@@ -1009,6 +1064,53 @@ describe("compactMessageForStorage", () => {
     expect(listNotesPart.output.notes[0].content).toContain(
       "[truncated for storage]",
     );
+  });
+
+  it("keeps protected note excerpts well-formed at both storage cuts", () => {
+    const head = "a".repeat(315);
+    const tail = "z".repeat(168);
+    const notes = Array.from({ length: 30 }, (_, index) => ({
+      note_id: `note-${index}`,
+      title: `Note ${index}`,
+      content: `${head}🙂${"middle".repeat(5_000)}🙂${tail}`,
+    }));
+    const message = makeAssistantMessage([
+      makeToolPart("list_notes", {
+        success: true,
+        notes,
+        total_count: notes.length,
+      }),
+    ]);
+
+    const result = compactMessageForStorage(message);
+    const part = result.message.parts[0] as any;
+
+    expect(result.compacted).toBe(true);
+    expect(result.afterSizeBytes).toBeLessThanOrEqual(850 * 1024);
+    expect(part.output.notes[0].content).toBe(
+      `${head}... [truncated for storage]${tail}`,
+    );
+  });
+
+  it("keeps the saved reasoning tail from starting with half a character", () => {
+    const prefix = "[Earlier reasoning compacted for storage]\n\n";
+    const tail = "z".repeat(8_000 - prefix.length - 1);
+    const message = makeAssistantMessage([
+      {
+        type: "reasoning",
+        text: `${"x".repeat(16_000)}🙂${tail}`,
+        state: "done",
+      },
+    ]);
+
+    const result = compactMessageForStorage(message, {
+      softLimitBytes: 12_000,
+    });
+
+    expect(result.afterSizeBytes).toBeLessThanOrEqual(12_000);
+    expect(result.message.parts).toEqual([
+      { type: "reasoning", text: prefix + tail, state: "done" },
+    ]);
   });
 
   it("enforces the byte cap for a single oversized assistant text part", () => {
@@ -1210,6 +1312,7 @@ describe("pruneModelMessages", () => {
             session: "abcd1234",
             status: "running",
             recordPath: "/tmp/record.json",
+            recordPersistenceStatus: "pending",
             outputPath: "/tmp/output.txt",
             output: "evidence\n".repeat(1000),
           },
@@ -1248,6 +1351,8 @@ describe("pruneModelMessages", () => {
       expect(output.value).toContain("status running");
       expect(output.value).toContain("record /tmp/record.json");
       expect(output.value).toContain("output /tmp/output.txt");
+      expect(output.value).toContain("record persistence pending");
+      expect(output.value).not.toContain("record persistence failed");
       expect(output.value).not.toContain("evidence");
     },
   );
@@ -1951,4 +2056,266 @@ it("stores compact report read/update receipts even below the size threshold", (
     compactMessageForStorage(result.message, { softLimitBytes: 1_000_000 })
       .compacted,
   ).toBe(false);
+});
+
+describe("file mutation outcomes survive compaction", () => {
+  const failure =
+    "Atomic edit failed - find string was not found. No edits were applied. " +
+    "Mismatch detail. ".repeat(200);
+  it.each([{ error: failure }, { result: { error: failure } }])(
+    "preserves a failed UI edit without claiming success",
+    (output) => {
+      const original = makeAssistantMessage([
+        makeToolPart("file_edit", output, { path: "/fixture.ts" }),
+      ]);
+      const snapshot = JSON.stringify(original);
+      const result = pruneToolOutputs([original], 0, 0);
+      expect((result.messages[0].parts[0] as any).output).toContain(
+        "outcome failed",
+      );
+      expect((result.messages[0].parts[0] as any).output).toContain(
+        "no changes applied",
+      );
+      expect(JSON.stringify(original)).toBe(snapshot);
+    },
+  );
+  it.each([
+    { type: "text", value: `Error: ${failure}` },
+    { type: "error-text", value: "Operation rejected. ".repeat(200) },
+    {
+      type: "error-json",
+      value: { message: "Operation rejected. ".repeat(200) },
+    },
+    { type: "json", value: { result: { error: failure } } },
+  ])("retains model tool error semantics through pruning", (output) => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "edit",
+            toolName: "file_edit",
+            input: { path: "/fixture.ts" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "edit",
+            toolName: "file_edit",
+            output,
+          },
+        ],
+      },
+    ];
+    const result = pruneModelMessages(messages, 0, 0);
+    expect((result.messages[1].content as any[])[0].output.value).toContain(
+      "outcome failed",
+    );
+    const again = pruneModelMessages(result.messages, 0, 0);
+    expect(again.messages).toEqual(result.messages);
+  });
+  it("preserves the failure in byte-limited saved chat compaction", () => {
+    const message = makeAssistantMessage([
+      makeToolPart("file_edit", { error: failure }, { path: "/fixture.ts" }),
+    ]);
+    const result = compactMessageForStorage(message, {
+      softLimitBytes: 1024,
+      toolOutputTokenBudget: 0,
+    });
+    expect((result.message.parts[0] as any).output).toContain("outcome failed");
+    expect((result.message.parts[0] as any).output).toContain(
+      "no changes applied",
+    );
+  });
+  it("does not treat source contents mentioning Error as an edit failure", () => {
+    const output = {
+      content:
+        'Multi-edit completed: 1 edits applied, 1 total replacements made\nLatest content with line numbers:\n1|throw new Error("example")',
+    };
+    const result = pruneToolOutputs(
+      [
+        makeAssistantMessage([
+          makeToolPart("file_edit", output, { path: "/fixture.ts" }),
+        ]),
+      ],
+      0,
+      0,
+    );
+    expect((result.messages[0].parts[0] as any).output).toContain(
+      "outcome success",
+    );
+  });
+  it("retains unknown rather than inventing success for an unrecognized response", () => {
+    const result = pruneToolOutputs(
+      [
+        makeAssistantMessage([
+          makeToolPart(
+            "file_edit",
+            { arbitrary: "Unrecognized payload ".repeat(200) },
+            { path: "/fixture.ts" },
+          ),
+        ]),
+      ],
+      0,
+      0,
+    );
+    expect((result.messages[0].parts[0] as any).output).toContain(
+      "outcome unknown",
+    );
+  });
+});
+
+describe("get_terminal_files delivery records", () => {
+  // Mirrors the object returned by createGetTerminalFiles.
+  const makeDeliveryOutput = (delivered: number, failedReason?: string) => {
+    const paths = Array.from(
+      { length: delivered },
+      (_, index) => `/home/user/report-${index}.txt`,
+    );
+    return {
+      result: failedReason
+        ? `Partially provided ${delivered} of ${delivered + 1} file(s) to the user. 1 file(s) could not be retrieved: /home/user/missing.zip: ${failedReason}.`
+        : `Successfully provided ${delivered} file(s) to the user`,
+      files: paths.map((path) => ({ path })),
+      deliveryReceipts: paths.map((path, index) => ({
+        fileId: `file-${index}`,
+        sourcePath: path,
+        name: path.split("/").pop(),
+        sizeBytes: 100,
+        sourceEnvironment: "cloud",
+        storageStatus: "stored",
+        validation: "not_performed_by_delivery_tool",
+      })),
+      failedFiles: failedReason
+        ? [{ path: "/home/user/missing.zip", reason: failedReason }]
+        : [],
+    };
+  };
+  const newerTerminalPart = () =>
+    makeToolPart(
+      "run_terminal_cmd",
+      { result: { output: "scan output\n".repeat(2000), exitCode: 0 } },
+      { command: "nmap target" },
+    );
+
+  it("keeps old delivery receipts in the chat history the runner prunes", () => {
+    const delivery = makeDeliveryOutput(2);
+    const messages = [
+      makeAssistantMessage([makeToolPart("get_terminal_files", delivery)]),
+      makeAssistantMessage([newerTerminalPart()], "msg-new"),
+    ];
+
+    const result = pruneToolOutputs(messages, 1, NO_MIN);
+
+    expect((result.messages[0].parts[0] as any).output).toEqual(delivery);
+  });
+
+  it("keeps old delivery receipts in the live model loop", () => {
+    const delivery = makeDeliveryOutput(2, "upload failed");
+    const messages = [
+      makeAssistantModelMsg([
+        {
+          toolCallId: "deliver",
+          toolName: "get_terminal_files",
+          args: { files: ["/home/user/report-0.txt"] },
+        },
+      ]),
+      makeToolModelMsg([
+        {
+          toolCallId: "deliver",
+          toolName: "get_terminal_files",
+          output: { type: "json", value: delivery },
+        },
+      ]),
+      makeAssistantModelMsg([
+        {
+          toolCallId: "scan",
+          toolName: "run_terminal_cmd",
+          args: { command: "nmap target" },
+        },
+      ]),
+      makeToolModelMsg([
+        {
+          toolCallId: "scan",
+          toolName: "run_terminal_cmd",
+          output: { type: "text", value: "scan output\n".repeat(2000) },
+        },
+      ]),
+    ];
+
+    const result = pruneModelMessages(messages, 1, NO_MIN);
+
+    expect((result.messages[1].content as any)[0].output).toEqual({
+      type: "json",
+      value: delivery,
+    });
+  });
+
+  it("keeps every requested path a string when storage compacts a failed delivery", () => {
+    const requested = Array.from(
+      { length: 25 },
+      (_, index) => `/home/user/missing-${index}.zip`,
+    );
+    const message = makeAssistantMessage([
+      makeToolPart(
+        "get_terminal_files",
+        {
+          result: "x".repeat(40_000),
+          files: [],
+          deliveryReceipts: [],
+          failedFiles: requested.map((path) => ({ path, reason: "not found" })),
+        },
+        { files: requested },
+      ),
+    ]);
+    const before = estimateSerializedSizeBytes(message.parts);
+
+    const result = compactMessageForStorage(message, {
+      softLimitBytes: before - 10_000,
+      toolOutputTokenBudget: 0,
+    });
+
+    // The file card falls back to these paths when nothing was delivered.
+    expect((result.message.parts[0] as any).input.files).toEqual(requested);
+  });
+
+  it("keeps every receipt, path, and failure when the storage byte cap compacts a delivery", () => {
+    const delivered = 25;
+    const delivery = makeDeliveryOutput(delivered, "x".repeat(20_000));
+    const lastPath = `/home/user/report-${delivered - 1}.txt`;
+    const message = makeAssistantMessage([
+      makeToolPart("get_terminal_files", delivery, {
+        files: [...delivery.files.map(({ path }) => path), "missing.zip"],
+      }),
+      { type: "text", text: `Download [the report](sandbox:${lastPath}).` },
+    ]);
+    const before = estimateSerializedSizeBytes(message.parts);
+
+    const result = compactMessageForStorage(message, {
+      softLimitBytes: before - 10_000,
+      toolOutputTokenBudget: 0,
+    });
+    const output = (result.message.parts[0] as any).output;
+
+    expect(result.afterSizeBytes).toBeLessThanOrEqual(before - 10_000);
+    // The file card counts these entries; each must still be a real path.
+    expect(output.files).toEqual(delivery.files);
+    expect(output.failedFiles).toHaveLength(1);
+    expect(output.failedFiles[0].path).toBe("/home/user/missing.zip");
+    expect(output.deliveryReceipts).toEqual(delivery.deliveryReceipts);
+    // The compacted record still tells the model exactly what was delivered.
+    expect(output.result).toContain(`delivered ${delivered} of 26 file(s)`);
+    expect(output.result).toContain(lastPath);
+    expect(output.result).toContain("failed 1: /home/user/missing.zip");
+    // Inline sandbox links resolve against these receipts after reload.
+    const attachments = resolveSandboxAttachments(result.message.parts, [
+      { fileId: `file-${delivered - 1}`, name: "report.txt" } as any,
+    ]);
+    expect(attachments.get(lastPath)?.fileId).toBe(`file-${delivered - 1}`);
+  });
 });

@@ -1,3 +1,7 @@
+jest.mock("server-only", () => ({}), { virtual: true });
+
+import type { UIMessage } from "ai";
+import { prepareLocalDesktopAttachmentsForTrigger } from "@/lib/utils/sandbox-file-utils";
 import {
   AUXILIARY_VISION_SLUG,
   DEEPSEEK_V4_FLASH_VISION_SLUG,
@@ -77,6 +81,73 @@ const createPdfParserRequest = (includeSandboxPath = true) => ({
   ],
 });
 
+// Builds annotations with the real Desktop stager so recovery tests follow the
+// marker shape the app currently emits.
+const stageDesktopAttachments = (names: string[]) => {
+  const { messages, sandboxFiles } = prepareLocalDesktopAttachmentsForTrigger([
+    {
+      id: "desktop-user",
+      role: "user",
+      parts: names.map((name, index) => ({
+        type: "file",
+        storage: "local-desktop",
+        localAttachmentId: `local-${index}`,
+        localPath: `/Users/tester/Documents/${name}`,
+        name,
+        mediaType: name.endsWith(".pdf") ? "application/pdf" : "text/plain",
+      })),
+    },
+  ] as unknown as UIMessage[]);
+  const tagPart = messages[0].parts.find(
+    (part) => part.type === "text" && part.text.startsWith("<attachment "),
+  );
+  if (tagPart?.type !== "text") throw new Error("Missing staged annotation");
+  return {
+    tagText: tagPart.text,
+    stagedPaths: sandboxFiles.map((file) => file.localPath),
+  };
+};
+
+const PDF_FILE_PART = {
+  type: "file",
+  file: {
+    filename: "report.pdf",
+    file_data: "data:application/pdf;base64,JVBERi0=",
+  },
+};
+const TEXT_FILE_PART = {
+  type: "file",
+  file: {
+    filename: "notes.txt",
+    file_data: "data:text/plain;base64,bm90ZXM=",
+  },
+};
+
+const createDesktopPdfRequest = (tagText: string) => ({
+  model: "deepseek/deepseek-v4-flash-0731",
+  plugins: [{ id: "file-parser", pdf: { engine: "cloudflare-ai" } }],
+  messages: [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Review these attachments." },
+        PDF_FILE_PART,
+        TEXT_FILE_PART,
+        { type: "text", text: tagText },
+      ] as Array<Record<string, unknown>>,
+    },
+  ],
+});
+
+const getRequestFilenames = (request: {
+  messages: Array<{ content?: Array<{ type?: string; file?: unknown }> }>;
+}) =>
+  request.messages.flatMap((message) =>
+    (message.content ?? [])
+      .filter((part) => part.type === "file")
+      .map((part) => (part.file as { filename?: string }).filename),
+  );
+
 const parserErrorResponse = (message: string) =>
   new Response(
     JSON.stringify({ error: { message: `Failed to parse : ${message}` } }),
@@ -105,23 +176,6 @@ describe("enrichOpenRouterStreamError", () => {
 
 describe("provider registry", () => {
   it("keeps active routes pointed at their provider slugs", () => {
-    expect(
-      (myProvider.languageModel("model-abliterated") as { modelId: string })
-        .modelId,
-    ).toBe("abliterated-model");
-    expect(
-      (
-        myProvider.languageModel("model-abliterated-large-v2") as {
-          modelId: string;
-        }
-      ).modelId,
-    ).toBe("abliterated-model-large-v2");
-    expect(
-      (myProvider.languageModel("ask-model") as { modelId: string }).modelId,
-    ).toBe("x-ai/grok-4.6");
-    expect(
-      (myProvider.languageModel("agent-model") as { modelId: string }).modelId,
-    ).toBe("x-ai/grok-4.6");
     expect(
       (myProvider.languageModel("ask-model-free") as { modelId: string })
         .modelId,
@@ -199,27 +253,12 @@ describe("provider registry", () => {
         .modelId,
     ).toBe("x-ai/grok-4.5");
     expect(
-      (myProvider.languageModel("model-grok-4.6-pro") as { modelId: string })
-        .modelId,
-    ).toBe("x-ai/grok-4.6");
-    expect(
-      (
-        myProvider.languageModel("model-deepseek-v4-flash-0731") as {
-          modelId: string;
-        }
-      ).modelId,
-    ).toBe("deepseek/deepseek-v4.1-flash-1017");
-    expect(
       (
         myProvider.languageModel("model-deepseek-v4-pro-0813") as {
           modelId: string;
         }
       ).modelId,
     ).toBe("deepseek/deepseek-v4-pro-0813");
-    expect(
-      (myProvider.languageModel("model-glm-5.2") as { modelId: string })
-        .modelId,
-    ).toBe("z-ai/glm-5.2");
     expect(
       (myProvider.languageModel("model-glm-5.3") as { modelId: string })
         .modelId,
@@ -229,17 +268,21 @@ describe("provider registry", () => {
         .modelId,
     ).toBe("moonshotai/kimi-k3");
     expect(
-      (myProvider.languageModel("model-opus-4.6") as { modelId: string })
-        .modelId,
-    ).toBe("moonshotai/kimi-k3");
-    expect(
       (myProvider.languageModel("fallback-agent-model") as { modelId: string })
         .modelId,
-    ).toBe("x-ai/grok-4.6");
+    ).toBe("x-ai/grok-4.7");
     expect(
       (myProvider.languageModel("fallback-ask-model") as { modelId: string })
         .modelId,
-    ).toBe("x-ai/grok-4.6");
+    ).toBe("x-ai/grok-4.7");
+    expect(
+      (myProvider.languageModel("model-grok-4.7") as { modelId: string })
+        .modelId,
+    ).toBe("x-ai/grok-4.7");
+    expect(
+      (myProvider.languageModel("model-kimi-k3.1-pro") as { modelId: string })
+        .modelId,
+    ).toBe("moonshotai/kimi-k3.1-pro");
     expect(
       (myProvider.languageModel("title-generator-model") as { modelId: string })
         .modelId,
@@ -251,33 +294,47 @@ describe("provider registry", () => {
     expect(getModelDisplayName("model-grok-4.5-pro")).toBe("xAI Grok 4.5");
     expect(getModelCutoffDate("model-grok-4.5")).toBeUndefined();
     expect(getModelCutoffDate("model-grok-4.5-pro")).toBeUndefined();
-    expect(getModelDisplayName("model-grok-4.6-pro")).toBe("xAI Grok 4.6");
-    expect(getModelCutoffDate("model-grok-4.6-pro")).toBe("August 2026");
-    expect(getModelDisplayName("model-deepseek-v4-flash-0731")).toBe(
-      "DeepSeek V4.1 Flash",
-    );
-    expect(getModelCutoffDate("model-deepseek-v4-flash-0731")).toBe(
-      "August 2026",
-    );
     expect(getModelDisplayName("model-deepseek-v4-pro-0813")).toBe(
       "DeepSeek V4 Pro 0813",
     );
     expect(getModelCutoffDate("model-deepseek-v4-pro-0813")).toBe(
       "August 2026",
     );
-    expect(getModelDisplayName("model-glm-5.2")).toBe("Z.ai GLM 5.2");
     expect(getModelDisplayName("model-glm-5.3")).toBe("Z.ai GLM 5.3");
     expect(getModelCutoffDate("model-glm-5.3")).toBeUndefined();
     expect(getModelDisplayName("model-kimi-k3")).toBe("Moonshot Kimi K3");
-    expect(getModelCutoffDate("model-opus-4.6")).toBe("July 2026");
-    expect(getModelDisplayName("model-opus-4.6")).toBe("Moonshot Kimi K3");
+    expect(getModelDisplayName("model-kimi-k3.1-pro")).toBe(
+      "Moonshot Kimi K3.1 Pro",
+    );
+    expect(getModelDisplayName("model-grok-4.7")).toBe("xAI Grok 4.7");
+    expect(getModelCutoffDate("model-kimi-k3.1-pro")).toBeUndefined();
+    expect(getModelCutoffDate("model-grok-4.7")).toBeUndefined();
     expect(getModelDisplayName("title-generator-model")).toBe("GLM 5.3 Flash");
   });
 
-  it("applies Kimi rather than Anthropic provider behavior to HackerAI Max", () => {
-    expect(isKimiModel("model-opus-4.6")).toBe(true);
-    expect(isAnthropicModel("model-opus-4.6")).toBe(false);
+  it("applies Kimi rather than Anthropic provider behavior to Kimi K3", () => {
+    expect(isKimiModel("model-kimi-k3")).toBe(true);
+    expect(isAnthropicModel("model-kimi-k3")).toBe(false);
     expect(isAnthropicModel("anthropic/claude-opus-4.6")).toBe(true);
+  });
+
+  it("resolves Max to Kimi K3.1 Pro with native image support", () => {
+    const key = resolveAgentTierToProviderKey("hackerai-max");
+    expect(key).toBe("model-kimi-k3.1-pro");
+    expect(myProvider.languageModel(key).modelId).toBe(
+      "moonshotai/kimi-k3.1-pro",
+    );
+    expect(supportsMultimodalToolResults(key)).toBe(true);
+    expect(isKimiModel(key)).toBe(true);
+    expect(isAnthropicModel(key)).toBe(false);
+  });
+
+  it("resolves Standard to the exact native multimodal Flash snapshot", () => {
+    const key = resolveAgentTierToProviderKey("hackerai-standard");
+    expect(myProvider.languageModel(key).modelId).toBe(
+      "deepseek/deepseek-v4.1-flash-1017",
+    );
+    expect(supportsMultimodalToolResults(key)).toBe(true);
   });
 
   it("resolves Agent Pro to V4.1 Flash with native image support", () => {
@@ -286,14 +343,12 @@ describe("provider registry", () => {
       "deepseek/deepseek-v4.1-flash-1017",
     );
     expect(supportsMultimodalToolResults(key)).toBe(true);
-    expect(getModelDisplayName(key)).toBe("DeepSeek V4.1 Flash");
+    expect(getModelDisplayName(key)).toBe("DeepSeek V4.1 Flash 1017");
   });
 
   it("classifies the active DeepSeek tier routes as DeepSeek", () => {
     expect(isDeepSeekModel("ask-model-free")).toBe(true);
     expect(isDeepSeekModel("agent-model-free")).toBe(true);
-    expect(isDeepSeekModel("model-deepseek-v4-flash-0731")).toBe(true);
-    expect(isDeepSeekModel("model-deepseek-v4-pro")).toBe(true);
     expect(isDeepSeekModel("model-deepseek-v4-pro-0813")).toBe(true);
   });
 
@@ -682,6 +737,25 @@ describe("makeOpenRouterToolChoiceCompatibleWithXaiReasoning", () => {
     });
   });
 
+  it("keeps Grok 4.7 mandatory reasoning by promoting a non-xAI fallback", () => {
+    const body = {
+      model: "x-ai/grok-4.7",
+      models: ["z-ai/glm-5.3", "moonshotai/kimi-k3"],
+      reasoning: { enabled: true, effort: "high" },
+      tool_choice: "required",
+    };
+
+    expect(makeOpenRouterToolChoiceCompatibleWithXaiReasoning(body)).toEqual({
+      changed: true,
+      body: {
+        model: "z-ai/glm-5.3",
+        models: ["moonshotai/kimi-k3"],
+        reasoning: { enabled: true, effort: "high" },
+        tool_choice: "required",
+      },
+    });
+  });
+
   it("keeps the existing disabled-reasoning compatibility for older xAI routes", () => {
     const body = {
       model: "x-ai/grok-4.5",
@@ -701,6 +775,42 @@ describe("makeOpenRouterToolChoiceCompatibleWithXaiReasoning", () => {
 });
 
 describe("OpenRouter request normalization", () => {
+  it("requires zero data retention without dropping caller routing", async () => {
+    const fetchMock = jest
+      .fn()
+      .mockImplementation(async () => new Response("ok", { status: 200 }));
+    const patchedFetch = createOpenRouterPatchFetch(
+      fetchMock as unknown as typeof fetch,
+    );
+
+    await patchedFetch("https://openrouter.test/chat", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "z-ai/glm-5.3-flash",
+        models: ["z-ai/glm-5.3"],
+        provider: { sort: "latency", data_collection: "deny" },
+        messages: [{ role: "user", content: "synthetic" }],
+      }),
+    });
+    await patchedFetch("https://openrouter.test/chat", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "x-ai/grok-4.6",
+        messages: [{ role: "user", content: "synthetic" }],
+      }),
+    });
+
+    const [routed, unrouted] = fetchMock.mock.calls.map(
+      ([, init]) => JSON.parse(init.body).provider,
+    );
+    expect(routed).toEqual({
+      sort: "latency",
+      data_collection: "deny",
+      zdr: true,
+    });
+    expect(unrouted).toEqual({ zdr: true });
+  });
+
   it("allows a request exactly at the complete serialized byte limit", async () => {
     const fetchMock = jest
       .fn()
@@ -1163,6 +1273,10 @@ describe("OpenRouter PDF parser recovery", () => {
     expect(response.headers.get(PDF_PARSER_ENGINE_HEADER)).toBe(
       "cloudflare-ai",
     );
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(warnSpy.mock.calls[0][0]).event).toBe(
+      "openrouter_pdf_parser_recovery",
+    );
   });
 
   it.each([PDF_PARSER_RATE_LIMIT_ERROR, PDF_PARSER_INVALID_DOCUMENT_ERROR])(
@@ -1205,6 +1319,13 @@ describe("OpenRouter PDF parser recovery", () => {
         MALFORMED_PDF_USER_RESPONSE,
       );
       expect(response.headers.get(PDF_PARSER_RECOVERY_HEADER)).toBe("sandbox");
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(
+        warnSpy.mock.calls.every(
+          ([value]) =>
+            JSON.parse(value).event === "openrouter_pdf_parser_recovery",
+        ),
+      ).toBe(true);
     },
   );
 
@@ -1232,6 +1353,122 @@ describe("OpenRouter PDF parser recovery", () => {
     expect(response.headers.get(PDF_PARSER_RECOVERY_HEADER)).toBeNull();
   });
 
+  it.each(["mistral-ocr", "cloudflare-ai", "generic"])(
+    "diagnoses unavailable sandbox recovery after %s without another request",
+    async (engine) => {
+      const request = createPdfParserRequest(false);
+      if (engine === "cloudflare-ai") request.plugins[0].pdf.engine = engine;
+      const failure =
+        engine === "generic"
+          ? "Failed to parse the file"
+          : PDF_PARSER_INVALID_DOCUMENT_ERROR;
+      const originalResponse = parserErrorResponse(failure);
+      const fetchMock = jest.fn();
+      if (engine === "mistral-ocr") {
+        fetchMock.mockResolvedValueOnce(parserErrorResponse(failure));
+      }
+      fetchMock.mockResolvedValueOnce(originalResponse);
+      const controller = new AbortController();
+      const response = await createOpenRouterPatchFetch(
+        fetchMock as typeof fetch,
+      )("https://openrouter.test/chat", {
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+
+      expect(response).toBe(originalResponse);
+      expect(fetchMock).toHaveBeenCalledTimes(engine === "mistral-ocr" ? 2 : 1);
+      for (const [, init] of fetchMock.mock.calls) {
+        expect(init.signal).toBe(controller.signal);
+      }
+      const unavailable = warnSpy.mock.calls
+        .map(([value]) => JSON.parse(value))
+        .filter(
+          (value) =>
+            value.event === "openrouter_pdf_parser_recovery_unavailable",
+        );
+      expect(unavailable).toEqual([
+        {
+          timestamp: expect.any(String),
+          level: "warn",
+          event: "openrouter_pdf_parser_recovery_unavailable",
+          service: "openrouter",
+          environment: expect.any(String),
+          from_engine: engine === "generic" ? "unknown" : "cloudflare-ai",
+          to_engine: "sandbox",
+          reason: engine === "generic" ? "generic_parse" : "invalid_document",
+          unavailable_reason: "no_staged_attachments",
+        },
+      ]);
+    },
+  );
+
+  it.each(["duplicate", "different_message", "different_filename"])(
+    "keeps strict file matching and diagnoses %s ambiguity",
+    async (scenario) => {
+      const request = createPdfParserRequest();
+      request.plugins[0].pdf.engine = "cloudflare-ai";
+      const file = request.messages[0].content[1];
+      if (scenario === "duplicate") request.messages[0].content.push(file);
+      if (scenario === "different_filename")
+        file.file!.filename = "private.pdf";
+      if (scenario === "different_message") {
+        const tag = request.messages[0].content.shift()!;
+        request.messages.unshift({ role: "assistant", content: [tag] });
+      }
+      const serialized = JSON.stringify(request);
+      const originalResponse = parserErrorResponse(
+        PDF_PARSER_INVALID_DOCUMENT_ERROR,
+      );
+      const fetchMock = jest.fn().mockResolvedValueOnce(originalResponse);
+      const response = await createOpenRouterPatchFetch(
+        fetchMock as typeof fetch,
+      )("https://openrouter.test/chat", { body: serialized });
+
+      expect(response).toBe(originalResponse);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        ...request,
+        provider: { zdr: true },
+      });
+      expect(JSON.stringify(request)).toBe(serialized);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const diagnostic = JSON.parse(warnSpy.mock.calls[0][0]);
+      expect(diagnostic).toMatchObject({
+        event: "openrouter_pdf_parser_recovery_unavailable",
+        unavailable_reason: "no_unique_matching_file",
+      });
+      expect(JSON.stringify(diagnostic)).not.toMatch(
+        /private\.pdf|report\.pdf|\/home\/user|file_data|messages/,
+      );
+    },
+  );
+
+  it.each(["unsupported_request_shape", "no_user_message"])(
+    "preserves the response when recovery has %s",
+    async (reason) => {
+      const request = createPdfParserRequest();
+      request.plugins[0].pdf.engine = "cloudflare-ai";
+      request.messages[0].role = "assistant";
+      const originalResponse = parserErrorResponse("Failed to parse the file");
+      const fetchMock = jest.fn().mockResolvedValueOnce(originalResponse);
+      const response = await createOpenRouterPatchFetch(
+        fetchMock as typeof fetch,
+      )("https://openrouter.test/chat", {
+        body: JSON.stringify(
+          reason === "unsupported_request_shape" ? {} : request,
+        ),
+      });
+      expect(response).toBe(originalResponse);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(warnSpy.mock.calls[0][0])).toMatchObject({
+        event: "openrouter_pdf_parser_recovery_unavailable",
+        unavailable_reason: reason,
+      });
+    },
+  );
+
   it("recovers directly to the sandbox when a later step already uses Cloudflare", async () => {
     const request = createPdfParserRequest();
     request.plugins[0].pdf.engine = "cloudflare-ai";
@@ -1253,6 +1490,7 @@ describe("OpenRouter PDF parser recovery", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const sandboxRequest = JSON.parse(fetchMock.mock.calls[1][1].body);
     expect(sandboxRequest.plugins).toEqual([]);
+    expect(sandboxRequest.provider.zdr).toBe(true);
     const remainingFiles = sandboxRequest.messages.flatMap(
       (message: { content?: Array<{ type?: string; file?: unknown }> }) =>
         (message.content ?? []).filter((part) => part.type === "file"),
@@ -1343,12 +1581,261 @@ describe("OpenRouter PDF parser recovery", () => {
       expect(response.headers.get(PDF_PARSER_RECOVERY_HEADER)).toBe("sandbox");
     },
   );
+
+  it.each(["generic_parse", "invalid_document"] as const)(
+    "recovers a Desktop-staged PDF through the sandbox after %s",
+    async (reason) => {
+      const { tagText, stagedPaths } = stageDesktopAttachments([
+        "report.pdf",
+        "notes.txt",
+      ]);
+      const fetchMock = jest
+        .fn()
+        .mockResolvedValueOnce(
+          reason === "generic_parse"
+            ? new Response(
+                JSON.stringify({ error: { message: "Failed to parse " } }),
+                {
+                  status: 400,
+                  headers: { "content-type": "application/json" },
+                },
+              )
+            : parserErrorResponse(PDF_PARSER_INVALID_DOCUMENT_ERROR),
+        )
+        .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+
+      const response = await createOpenRouterPatchFetch(
+        fetchMock as unknown as typeof fetch,
+      )("https://openrouter.test/chat", {
+        method: "POST",
+        body: JSON.stringify(createDesktopPdfRequest(tagText)),
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const sandboxRequest = JSON.parse(fetchMock.mock.calls[1][1].body);
+      // A local annotation authorizes removing only the PDF provider part.
+      expect(getRequestFilenames(sandboxRequest)).toEqual(["notes.txt"]);
+      expect(sandboxRequest.plugins).toEqual([]);
+      expect(sandboxRequest.messages[0].content).toContainEqual({
+        type: "text",
+        text: tagText,
+      });
+      expect(tagText).toContain(`local_path="${stagedPaths[0]}"`);
+      expect(JSON.stringify(sandboxRequest)).toContain(
+        reason === "generic_parse"
+          ? "inspect the files with sandbox tools"
+          : MALFORMED_PDF_USER_RESPONSE,
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get(PDF_PARSER_RECOVERY_HEADER)).toBe("sandbox");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const diagnostic = JSON.parse(warnSpy.mock.calls[0][0]);
+      expect(diagnostic).toMatchObject({
+        event: "openrouter_pdf_parser_recovery",
+        to_engine: "sandbox",
+        reason,
+      });
+      expect(JSON.stringify(diagnostic)).not.toMatch(
+        /report\.pdf|notes\.txt|hackerai-upload|[0-9a-f]{64}/,
+      );
+    },
+  );
+
+  type DesktopPdfRequest = ReturnType<typeof createDesktopPdfRequest>;
+  const replaceTag = (
+    request: DesktopPdfRequest,
+    edit: (text: string) => string,
+  ) => {
+    const tagPart = request.messages[0].content[3];
+    tagPart.text = edit(String(tagPart.text));
+  };
+  const stagedNamespace = (stagedPath: string) => stagedPath.split("/")[3];
+
+  it.each<
+    [
+      string,
+      (request: DesktopPdfRequest, stagedPath: string) => void,
+      "no_staged_attachments" | "no_unique_matching_file",
+    ]
+  >([
+    [
+      "an unnamespaced local path",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(stagedPath, "/tmp/hackerai-upload/report.pdf"),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "a basename that differs from the filename",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(
+            stagedPath,
+            stagedPath.replace(/report\.pdf$/, "other.pdf"),
+          ),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "an uppercase namespace",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(
+            stagedNamespace(stagedPath),
+            stagedNamespace(stagedPath).toUpperCase(),
+          ),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "a truncated namespace",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(
+            stagedNamespace(stagedPath),
+            stagedNamespace(stagedPath).slice(1),
+          ),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "a namespace that ends with a line break",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(
+            stagedNamespace(stagedPath),
+            stagedNamespace(stagedPath) + "\n",
+          ),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "an out-of-scope root",
+      (request) =>
+        replaceTag(request, (text) =>
+          text.replace("/tmp/hackerai-upload/", "/tmp/hackerai-uploads/"),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "a traversal segment",
+      (request, stagedPath) =>
+        replaceTag(request, (text) =>
+          text.replace(
+            stagedPath,
+            `/tmp/hackerai-upload/${stagedNamespace(stagedPath)}/../${stagedNamespace(stagedPath)}/report.pdf`,
+          ),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "an unknown staging role",
+      (request) =>
+        replaceTag(request, (text) =>
+          text.replace('staging="requested_this_run"', 'staging="staged"'),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "a missing staging role",
+      (request) =>
+        replaceTag(request, (text) =>
+          text.replace(' staging="requested_this_run"', ""),
+        ),
+      "no_staged_attachments",
+    ],
+    [
+      "an assistant-authored annotation",
+      (request) => {
+        const tagPart = request.messages[0].content.pop()!;
+        request.messages.unshift({ role: "assistant", content: [tagPart] });
+      },
+      "no_staged_attachments",
+    ],
+    [
+      "an annotation in a different user message",
+      (request) => {
+        const tagPart = request.messages[0].content.pop()!;
+        request.messages.unshift({ role: "user", content: [tagPart] });
+      },
+      "no_unique_matching_file",
+    ],
+    [
+      "duplicate PDF file parts",
+      (request) => request.messages[0].content.push(PDF_FILE_PART),
+      "no_unique_matching_file",
+    ],
+    [
+      "only a non-PDF local annotation",
+      (request) =>
+        replaceTag(
+          request,
+          () => stageDesktopAttachments(["notes.txt"]).tagText,
+        ),
+      "no_unique_matching_file",
+    ],
+  ])(
+    "does not use Desktop sandbox recovery for %s",
+    async (_scenario, mutate, unavailableReason) => {
+      const { tagText, stagedPaths } = stageDesktopAttachments(["report.pdf"]);
+      const request = createDesktopPdfRequest(tagText);
+      mutate(request, stagedPaths[0]);
+      const serialized = JSON.stringify(request);
+      const originalResponse = new Response(
+        JSON.stringify({ error: { message: "Failed to parse " } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+      const fetchMock = jest.fn().mockResolvedValueOnce(originalResponse);
+
+      const response = await createOpenRouterPatchFetch(
+        fetchMock as typeof fetch,
+      )("https://openrouter.test/chat", { body: serialized });
+
+      expect(response).toBe(originalResponse);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Only the zero-data-retention requirement is added to the request.
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        ...request,
+        provider: { zdr: true },
+      });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const diagnostic = JSON.parse(warnSpy.mock.calls[0][0]);
+      expect(diagnostic).toMatchObject({
+        event: "openrouter_pdf_parser_recovery_unavailable",
+        unavailable_reason: unavailableReason,
+      });
+      expect(JSON.stringify(diagnostic)).not.toMatch(
+        /report\.pdf|notes\.txt|hackerai-upload|[0-9a-f]{64}/,
+      );
+    },
+  );
+
+  it("keeps the request-size guard unchanged for Desktop-staged PDFs", async () => {
+    const { tagText } = stageDesktopAttachments(["report.pdf"]);
+    const request = createDesktopPdfRequest(tagText);
+    request.messages[0].content[1] = {
+      type: "file",
+      file: {
+        filename: "report.pdf",
+        file_data: `data:application/pdf;base64,${"a".repeat(
+          OPENROUTER_REQUEST_MAX_BYTES,
+        )}`,
+      },
+    };
+    const fetchMock = jest.fn();
+
+    const response = await createOpenRouterPatchFetch(
+      fetchMock as typeof fetch,
+    )("https://openrouter.test/chat", { body: JSON.stringify(request) });
+
+    expect(response.status).toBe(413);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("supportsMultimodalToolResults", () => {
   it("allows active Grok and Kimi routes for image tool results", () => {
-    expect(supportsMultimodalToolResults("agent-model")).toBe(true);
-    expect(supportsMultimodalToolResults("ask-model")).toBe(true);
     expect(supportsMultimodalToolResults("fallback-agent-model")).toBe(true);
     expect(supportsMultimodalToolResults("fallback-ask-model")).toBe(true);
     expect(supportsMultimodalToolResults("model-kimi-k3")).toBe(true);
@@ -1357,9 +1844,6 @@ describe("supportsMultimodalToolResults", () => {
 
   it("allows active multimodal keys and slugs used after image tool results", () => {
     expect(supportsMultimodalToolResults("ask-model-free")).toBe(true);
-    expect(supportsMultimodalToolResults("model-deepseek-v4-flash-0731")).toBe(
-      true,
-    );
     expect(supportsMultimodalToolResults("model-glm-5.3-flash")).toBe(true);
     expect(supportsMultimodalToolResults("model-glm-5.3-flash-pro")).toBe(true);
     expect(
@@ -1380,7 +1864,6 @@ describe("supportsMultimodalToolResults", () => {
     ).toBe(true);
     expect(supportsMultimodalToolResults("model-grok-4.5")).toBe(true);
     expect(supportsMultimodalToolResults("model-grok-4.5-pro")).toBe(true);
-    expect(supportsMultimodalToolResults("model-grok-4.6-pro")).toBe(true);
     expect(supportsMultimodalToolResults("x-ai/grok-4.5")).toBe(true);
     expect(supportsMultimodalToolResults("x-ai/grok-4.6")).toBe(true);
   });
@@ -1390,7 +1873,6 @@ describe("supportsMultimodalToolResults", () => {
     expect(supportsMultimodalToolResults("model-glm-5.3-flash-agent")).toBe(
       true,
     );
-    expect(supportsMultimodalToolResults("model-deepseek-v4-pro")).toBe(false);
     expect(supportsMultimodalToolResults("model-deepseek-v4-pro-0813")).toBe(
       false,
     );

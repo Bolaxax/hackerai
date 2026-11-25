@@ -210,14 +210,77 @@ describe("RateLimitWarning", () => {
       "today's free $0.25 allowance",
     );
     expect(screen.getByText(/this Agent response/i)).toHaveTextContent(
-      "low-cost model",
+      "plan's monthly usage",
     );
+    expect(
+      screen.getByRole("button", { name: "Add Credits" }),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /view usage/i }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /upgrade plan/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("names the daily free allowance when a paid run crosses a usage threshold", () => {
+    render(
+      <RateLimitWarning
+        data={{
+          warningType: "paid-daily-free-allowance",
+          resetTime: new Date(Date.now() + 60_000),
+          subscription: "pro",
+          mode: "agent",
+          costLimitDollars: 0.25,
+          usedDollars: 0.2,
+          midStream: true,
+        }}
+        onDismiss={jest.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("rate-limit-warning")).toHaveTextContent(
+      "$0.20 of today's free $0.25 allowance used. This response stops when it runs out.",
+    );
+    expect(
+      screen.getByRole("button", { name: "Add Credits" }),
+    ).toBeInTheDocument();
+  });
+
+  it("derives the shown percent from the rounded dollar amounts", () => {
+    render(
+      <RateLimitWarning
+        data={{
+          ...monthlyWarning,
+          remainingPercent: 21,
+          usedDollars: 0.198,
+          limitDollars: 0.25,
+        }}
+        onDismiss={jest.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("rate-limit-warning")).toHaveTextContent(
+      "You've used $0.20 of $0.25 (80%).",
+    );
+  });
+
+  it("derives the shown percent from a cent-rounded limit too", () => {
+    render(
+      <RateLimitWarning
+        data={{
+          ...monthlyWarning,
+          remainingPercent: 21,
+          usedDollars: 0.2,
+          limitDollars: 0.254,
+        }}
+        onDismiss={jest.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("rate-limit-warning")).toHaveTextContent(
+      "You've used $0.20 of $0.25 (80%).",
+    );
   });
 
   it("renders legacy Pro Agent run cap copy without upgrade or add-credit CTAs", () => {
@@ -275,6 +338,27 @@ describe("RateLimitWarning", () => {
     );
   });
 
+  it("says usage refills at renewal when a paid cycle ended but has not renewed", () => {
+    render(
+      <RateLimitWarning
+        data={{
+          warningType: "extra-usage-active",
+          bucketType: "monthly",
+          resetTime: new Date(Date.now() - 60_000),
+          subscription: "pro",
+          capReason: "extra_usage_active",
+        }}
+        onDismiss={jest.fn()}
+      />,
+    );
+
+    const warning = screen.getByTestId("rate-limit-warning");
+    expect(warning).toHaveTextContent(
+      "You're now using extra usage credits. Your usage refills when your plan renews.",
+    );
+    expect(warning).not.toHaveTextContent(/resets now/i);
+  });
+
   it("uses extra usage copy when paid overflow credits are active", () => {
     render(
       <RateLimitWarning
@@ -300,32 +384,39 @@ describe("RateLimitWarning", () => {
     ).toBeInTheDocument();
   });
 
-  it("names the spending limit when extra usage balance exists but the monthly cap is hit", () => {
-    render(
-      <RateLimitWarning
-        data={{
-          warningType: "token-bucket",
-          bucketType: "monthly",
-          remainingPercent: 0,
-          resetTime: new Date(Date.now() + 60_000),
-          subscription: "ultra",
-          capReason: "extra_usage_cap",
-          cutOff: true,
-        }}
-        onDismiss={jest.fn()}
-      />,
-    );
+  it.each([true, false])(
+    "names the spending cap without the subscription reset (cutOff=%s)",
+    (cutOff) => {
+      render(
+        <RateLimitWarning
+          data={{
+            warningType: "token-bucket",
+            bucketType: "monthly",
+            remainingPercent: 0,
+            resetTime: new Date(Date.now() + 60_000),
+            subscription: "ultra",
+            capReason: "extra_usage_cap",
+            cutOff,
+          }}
+          onDismiss={jest.fn()}
+        />,
+      );
 
-    expect(screen.getByText(/extra usage spending limit/i)).toHaveTextContent(
-      "Increase your limit to continue",
-    );
-    expect(
-      screen.queryByText(/extra usage balance is empty/i),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /increase limit/i }),
-    ).toBeInTheDocument();
-  });
+      expect(screen.getByText(/extra usage spending limit/i)).toHaveTextContent(
+        "Increase your limit to continue",
+      );
+      expect(screen.queryByText(/resets in/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/extra usage spending limit/i)).toHaveTextContent(
+        "buying credits won't raise the limit",
+      );
+      expect(
+        screen.queryByText(/extra usage balance is empty/i),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /increase limit/i }),
+      ).toBeInTheDocument();
+    },
+  );
 });
 
 it("shows the daily Free Agent allowance and reset on a mid-stream cutoff", () => {

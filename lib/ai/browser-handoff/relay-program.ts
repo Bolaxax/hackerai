@@ -1,0 +1,380 @@
+import { createBrowserInputNormalizer } from "./input";
+
+// A run-owned HTTP relay, not a public CDP/WebSocket proxy. Only validated
+// viewport input and image frames cross this boundary. All credentials arrive
+// over stdin and live only in the private memory-backed run directory.
+export const BROWSER_RELAY_PROGRAM = String.raw`
+const fs = require('node:fs');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const directory = process.argv[1];
+fs.writeFileSync(directory + '/pid', String(process.pid), {mode: 0o600});
+const config = JSON.parse(fs.readFileSync(directory + '/config', 'utf8'));
+const { normalizeBrowserInputBatch } = NORMALIZER_FACTORY();
+let stopped = false;
+let viewer;
+let latest;
+let sequence = 0;
+let expectedInput = 1;
+let lastInputBody = '';
+let lastSent = 0;
+let heldMouse;
+const socket = new WebSocket('ws://127.0.0.1:' + config.port);
+const root = config.root;
+function valid() {
+  try {
+    const lease = Number(fs.readFileSync(directory + '/lease', 'utf8'));
+    return !stopped && Date.now() < Math.min(lease, config.expiresAt) &&
+      !fs.existsSync(directory + '/revoked') && fs.existsSync(root + '/paused') &&
+      fs.readFileSync(root + '/active-session', 'utf8').trim() === config.browserSessionName;
+  } catch { return false; }
+}
+function stop() {
+  if (stopped) return;
+  stopped = true;
+  clearInterval(timer);
+  if (viewer) viewer.end();
+  server.close();
+  if (heldMouse && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({type: 'input_mouse', eventType: 'mouseReleased',
+      x: heldMouse.x, y: heldMouse.y, button: 'left'}));
+    heldMouse = undefined;
+  }
+  // The close handshake follows accepted input on the same ordered socket.
+  // Resume waits for this acknowledgement before capturing/unpausing.
+  socket.close();
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+socket.addEventListener('close', () => {
+  try { fs.writeFileSync(directory + '/closed', '1', {mode: 0o600}); } catch {}
+  process.exit(0);
+});
+socket.addEventListener('error', stop);
+socket.addEventListener('message', event => {
+  if (!valid()) { stop(); return; }
+  try {
+    const message = JSON.parse(String(event.data));
+    if (message.type === 'status' && message.connected === false) { stop(); return; }
+    if (message.type !== 'frame') return;
+    const meta = message.metadata || {};
+    if (typeof message.data !== 'string' || message.data.length > 900000 ||
+        !(meta.deviceWidth > 0 && meta.deviceWidth <= 8192) ||
+        !(meta.deviceHeight > 0 && meta.deviceHeight <= 8192)) return;
+    const bytes = Buffer.from(message.data, 'base64');
+    const mime = bytes[0] === 255 && bytes[1] === 216 ? 'image/jpeg' :
+      bytes[0] === 137 && bytes[1] === 80 ? 'image/png' : null;
+    if (!mime || bytes.length > 675000) return;
+    latest = { type: 'frame', sequence: ++sequence, frame: {
+      image: 'data:' + mime + ';base64,' + message.data,
+      width: meta.deviceWidth, height: meta.deviceHeight,
+      capturedAt: Number(meta.timestamp) || 0, browserSessionName: config.browserSessionName,
+    }};
+  } catch { stop(); }
+});
+function reply(res, status, body) {
+  res.writeHead(status, {'Content-Type': 'application/json'});
+  res.end(JSON.stringify(body));
+}
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Vary', 'Origin');
+  if (req.headers.origin !== config.origin) { reply(res, 403, {}); return; }
+  res.setHeader('Access-Control-Allow-Origin', config.origin);
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Max-Age', '600');
+    res.writeHead(204); res.end(); return;
+  }
+  const supplied = Buffer.from(req.headers.authorization || '');
+  const expected = Buffer.from('Bearer ' + config.grant);
+  if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected) || !valid()) {
+    reply(res, 403, {}); return;
+  }
+  if (req.method === 'GET' && req.url === '/frames') {
+    if (viewer) viewer.end();
+    viewer = res;
+    res.writeHead(200, {'Content-Type': 'text/event-stream', 'X-Accel-Buffering': 'no'});
+    res.write('data: {"type":"ready"}\n\n');
+    if (latest) res.write('data: ' + JSON.stringify(latest) + '\n\n');
+    res.on('close', () => { if (viewer === res) viewer = undefined; });
+    return;
+  }
+  if (req.method !== 'POST' || req.url !== '/input') { reply(res, 404, {}); return; }
+  let body = '';
+  try {
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 10000) { reply(res, 413, {}); return; }
+    }
+    const parsed = JSON.parse(body);
+    const events = normalizeBrowserInputBatch(parsed.inputs);
+    if (!events || !Number.isSafeInteger(parsed.sequence)) { reply(res, 400, {}); return; }
+    if (!valid() || socket.readyState !== WebSocket.OPEN) { reply(res, 409, {}); return; }
+    if (parsed.sequence === expectedInput - 1 && body === lastInputBody) {
+      reply(res, 200, {ok: true}); return;
+    }
+    if (parsed.sequence !== expectedInput || socket.bufferedAmount > 65536) {
+      reply(res, 409, {}); return;
+    }
+    for (const event of events) {
+      socket.send(JSON.stringify(event));
+      if (event.type === 'input_mouse') {
+        if (event.eventType === 'mousePressed' ||
+            (event.eventType === 'mouseMoved' && event.button === 'left')) {
+          heldMouse = {x: event.x, y: event.y};
+        } else if (event.eventType === 'mouseReleased' || event.eventType === 'mouseMoved') {
+          heldMouse = undefined;
+        }
+      }
+    }
+    expectedInput++;
+    lastInputBody = body;
+    reply(res, 200, {ok: true});
+  } catch { reply(res, 400, {}); }
+});
+server.requestTimeout = 5000;
+server.headersTimeout = 5000;
+server.maxConnections = 16;
+let tick = 0;
+const timer = setInterval(() => {
+  if (!valid()) { stop(); return; }
+  if (!viewer || socket.readyState !== WebSocket.OPEN) return;
+  // Skip intermediate frames under backpressure. Do not build an old-frame queue.
+  if (viewer.writableLength > 1000000) { viewer.destroy(); viewer = undefined; return; }
+  if (latest && latest.sequence !== lastSent && viewer.writableLength === 0) {
+    viewer.write('data: ' + JSON.stringify(latest) + '\n\n'); lastSent = latest.sequence;
+  }
+  if (++tick % 20 === 0) viewer.write('data: {"type":"ready"}\n\n');
+}, 50);
+socket.addEventListener('open', () => {
+  if (!valid()) { stop(); return; }
+  server.listen(0, '0.0.0.0', () => {
+    fs.writeFileSync(directory + '/port.next', String(server.address().port), {mode: 0o600});
+    fs.renameSync(directory + '/port.next', directory + '/port');
+  });
+});
+`;
+
+export function browserRelayProgram() {
+  return BROWSER_RELAY_PROGRAM.replace(
+    "NORMALIZER_FACTORY",
+    `(${createBrowserInputNormalizer.toString()})`,
+  );
+}
+
+export const RELAY_RENEW_FAILURE_CODES = {
+  invalid_deadline: 41,
+  lock_busy: 42,
+  revoked_or_closed: 43,
+  expired_or_invalid_lease: 44,
+  missing_path: 45,
+  permission: 46,
+  filesystem_error: 47,
+} as const;
+
+// Requests can finish out of order, including after an HTTP timeout. Serialize
+// the read/max/replace so an older deadline cannot undo a successful renewal.
+export const RELAY_RENEW_PROGRAM = String.raw`
+const fs = require('node:fs');
+const d = process.argv[1], deadline = Number(process.argv[2]);
+(async () => {
+  if (!Number.isFinite(deadline) || deadline <= Date.now()) return ${RELAY_RENEW_FAILURE_CODES.invalid_deadline};
+  let locked = false;
+  for (let i = 0; i < 100; i++) {
+    try { fs.mkdirSync(d + '/lease.lock', {mode: 0o700}); locked = true; break; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  if (!locked) return ${RELAY_RENEW_FAILURE_CODES.lock_busy};
+  const next = d + '/lease.next-' + process.pid;
+  try {
+    if (fs.existsSync(d + '/revoked') || fs.existsSync(d + '/closed')) return ${RELAY_RENEW_FAILURE_CODES.revoked_or_closed};
+    const previous = Number(fs.readFileSync(d + '/lease', 'utf8'));
+    if (!Number.isFinite(previous) || previous <= Date.now()) return ${RELAY_RENEW_FAILURE_CODES.expired_or_invalid_lease};
+    fs.writeFileSync(next, String(Math.max(previous, deadline)), {mode: 0o600});
+    fs.renameSync(next, d + '/lease');
+  } finally {
+    fs.rmSync(next, {force: true});
+    fs.rmdirSync(d + '/lease.lock');
+  }
+})().then(code => {
+  if (code !== undefined) process.exitCode = code;
+}, error => {
+  process.exitCode = error.code === 'ENOENT'
+    ? ${RELAY_RENEW_FAILURE_CODES.missing_path}
+    : error.code === 'EACCES' || error.code === 'EPERM'
+      ? ${RELAY_RENEW_FAILURE_CODES.permission}
+      : ${RELAY_RENEW_FAILURE_CODES.filesystem_error};
+});
+`;
+
+export const RELAY_START_PROGRAM = String.raw`
+const fs = require('node:fs');
+const {spawn} = require('node:child_process');
+let data = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { data += chunk; if (data.length > 100000) process.exit(1); });
+process.stdin.on('end', async () => {
+  const {directory, config, program, lease} = JSON.parse(data);
+  fs.mkdirSync(directory, {mode: 0o700});
+  fs.writeFileSync(directory + '/config', JSON.stringify(config), {mode: 0o600});
+  fs.writeFileSync(directory + '/lease', String(lease), {mode: 0o600});
+  const child = spawn(process.execPath, ['--experimental-websocket', '-e', program, directory], {detached: true, stdio: 'ignore'});
+  if (child.pid) fs.writeFileSync(directory + '/pid', String(child.pid), {mode: 0o600});
+  let exited = false;
+  child.on('exit', () => { exited = true; });
+  child.on('error', () => { exited = true; fs.writeFileSync(directory + '/closed', '1', {mode: 0o600}); });
+  child.unref();
+  for (let i = 0; i < 100; i++) {
+    if (exited) break;
+    try {
+      const port = Number(fs.readFileSync(directory + '/port', 'utf8'));
+      if (Number.isInteger(port) && port > 0 && port <= 65535) {
+        process.stdout.write(String(port));
+        return;
+      }
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  fs.writeFileSync(directory + '/revoked', '1', {mode: 0o600});
+  child.kill();
+  process.exitCode = 1;
+});
+`;
+
+// The failing STOP program's only output, read solely from that invocation's
+// result: first failure, then aggregate counts capped at 16, never per-relay
+// results, paths or messages. Stage and code are 1-based indexes into these
+// lists; a drain deadline uses 0 0. Version 2 appends the alive branch (and
+// code, for `_error` branches) last observed by the first relay to reach its
+// drain deadline, or 0 0 without a deadline.
+export const RELAY_STOP_ALIVE_BRANCHES = [
+  "pid_read_error",
+  "pid_invalid",
+  "signal_error",
+  "linux_matching_cmdline",
+  "linux_cmdline_error",
+  "nonlinux_present",
+] as const;
+export const RELAY_STOP_RECEIPT_STAGES = [
+  "scan_root",
+  "write_revoked",
+  "drain_check",
+  "write_closed",
+] as const;
+export const RELAY_STOP_RECEIPT_CODES = [
+  "missing",
+  "permission",
+  "not_directory",
+  "is_directory",
+  "read_only",
+  "no_space",
+  "fd_limit",
+  "other",
+] as const;
+const RELAY_STOP_ERRNO_CODES: ReadonlyArray<
+  [string, (typeof RELAY_STOP_RECEIPT_CODES)[number]]
+> = [
+  ["ENOENT", "missing"],
+  ["EACCES", "permission"],
+  ["EPERM", "permission"],
+  ["ENOTDIR", "not_directory"],
+  ["EISDIR", "is_directory"],
+  ["EROFS", "read_only"],
+  ["ENOSPC", "no_space"],
+  ["EDQUOT", "no_space"],
+  ["EMFILE", "fd_limit"],
+  ["ENFILE", "fd_limit"],
+];
+const relayStopErrnoIndexes = JSON.stringify(
+  RELAY_STOP_ERRNO_CODES.map(([errno, code]) => [
+    errno,
+    RELAY_STOP_RECEIPT_CODES.indexOf(code) + 1,
+  ]),
+);
+
+// Live relays must acknowledge their ordered socket close. A confirmed dead
+// process cannot accept more input and must not permanently block recovery.
+export const RELAY_STOP_PROGRAM = String.raw`
+const fs = require('node:fs');
+const root = process.argv[1], only = process.argv[2];
+const errnoCodes = new Map(${relayStopErrnoIndexes});
+const errnoCode = code => errnoCodes.get(code) || ${RELAY_STOP_RECEIPT_CODES.length};
+let first, deadlines = 0, failures = 0, deadlineAlive = '0 0';
+function failed(stage, error) {
+  let code = ${RELAY_STOP_RECEIPT_CODES.length};
+  try { code = errnoCodes.get(error.code) || code; } catch {}
+  failures++;
+  if (first === undefined) first = '1 ' + stage + ' ' + code;
+}
+process.on('exit', exitCode => {
+  if (exitCode === 0 || first === undefined) return;
+  const cap = count => Math.min(count, 16);
+  try { fs.writeSync(1, 'relay-stop-receipt/2 ' + first + ' ' + cap(deadlines) + ' ' + cap(failures) + ' ' + deadlineAlive + '\n'); } catch {}
+});
+// Records which check kept the relay alive, from values each check already read.
+function alive(directory, seen) {
+  let pid;
+  try { pid = Number(fs.readFileSync(directory + '/pid', 'utf8')); } catch (error) {
+    // This failure never read its code before; never invoke a getter for it.
+    let code = ${RELAY_STOP_RECEIPT_CODES.length};
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+      if (descriptor && 'value' in descriptor) code = errnoCode(descriptor.value);
+    } catch {}
+    seen.alive = '1 ' + code;
+    return true;
+  }
+  if (!Number.isSafeInteger(pid) || pid <= 0) { seen.alive = '2 0'; return true; }
+  try { process.kill(pid, 0); } catch (error) {
+    const code = error.code;
+    if (code === 'ESRCH') return false;
+    seen.alive = '3 ' + errnoCode(code);
+    return true;
+  }
+  if (process.platform === 'linux') {
+    // A reused PID belongs to a different process, not this relay.
+    try {
+      if (!fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').includes(directory)) return false;
+      seen.alive = '4 0';
+      return true;
+    } catch (error) {
+      const code = error.code;
+      if (code === 'ENOENT') return false;
+      seen.alive = '5 ' + errnoCode(code);
+      return true;
+    }
+  }
+  seen.alive = '6 0';
+  return true;
+}
+(async () => {
+  let dirs;
+  try {
+    dirs = only ? [only] : fs.readdirSync(root).filter(n => /^relay-[a-f0-9]{24}$/.test(n)).map(n => root + '/' + n);
+  } catch (error) { failed(1, error); throw error; }
+  await Promise.all(dirs.map(async directory => {
+    let stage = 2;
+    const seen = {};
+    try {
+      if (!fs.existsSync(directory)) return;
+      fs.writeFileSync(directory + '/revoked', '1', {mode: 0o600});
+      stage = 3;
+      for (let i = 0; i < 100; i++) {
+        if (fs.existsSync(directory + '/closed')) return;
+        if (!alive(directory, seen)) {
+          stage = 4;
+          fs.writeFileSync(directory + '/closed', '1', {mode: 0o600});
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    } catch (error) { failed(stage, error); throw error; }
+    if (deadlines++ === 0) deadlineAlive = seen.alive;
+    if (first === undefined) first = '0 0 0';
+    process.exitCode = 1;
+  }));
+})().catch(() => { process.exitCode = 1; });
+`;

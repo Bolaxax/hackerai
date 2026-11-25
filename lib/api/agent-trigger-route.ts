@@ -1,12 +1,27 @@
+import { withServiceQueryRecovery } from "@/lib/db/service-query-recovery.node";
+import { captureGoalLifecycle } from "@/lib/goals/analytics";
+import { api as goalApi } from "@/convex/_generated/api";
+import {
+  createIsolatedConvexClient,
+  isConvexOutcomeUnknownError,
+  type ConvexCallScope,
+} from "@/lib/db/convex-client";
+import { withAgentConvexScope } from "@/lib/api/agent-convex";
+import { getGoal, goalServiceKey, reconcileGoal } from "@/lib/goals/server";
+import type { GoalReconciliationStep } from "@/lib/goals/reconciliation-diagnostics";
+import type { GoalContract } from "@/lib/goals/contracts";
+import { validGoalRequest } from "@/lib/goals/contracts";
+import { resolveCloudWorkspaceRegion } from "@/lib/ai/tools/utils/cloud-workspace-routing";
 import {
   readCloudWorkspaceState,
   assertCloudWorkspaceAvailable,
 } from "@/lib/ai/tools/utils/cloud-workspace-guard";
+import { LOCAL_CONNECTION_LOST_FINISH_REASON } from "@/lib/chat/local-connection-stop";
+import { requiresManualAgentResume } from "@/lib/chat/manual-agent-resume";
 import {
   enforceRegionalSubscriptionFirst,
   subscriptionFirstCountryFromRequest,
 } from "@/lib/experiments/regional-subscription-first.server";
-import { regionalFreeCountryFromRequest } from "@/lib/rate-limit/regional-free-limits-request";
 import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "crypto";
 import { tasks, auth, idempotencyKeys, sessions } from "@trigger.dev/sdk";
@@ -22,6 +37,7 @@ import {
   handleInitialChatAndUserMessage,
   type InitialChatPersistenceStep,
   setActiveTriggerRun,
+  replaceActiveTriggerRun,
 } from "@/lib/db/actions";
 import {
   assertFreeAgentGates,
@@ -31,7 +47,10 @@ import {
   AGENT_TRIGGER_TASK_ID,
   type AgentApiEndpoint,
 } from "@/lib/api/agent-endpoints";
-import { handleAgentRouteError } from "@/lib/api/agent-route-errors";
+import {
+  handleAgentRouteError,
+  type AgentStartGuardBoundary,
+} from "@/lib/api/agent-route-errors";
 import { getRegionalExecutionContextForVercelRequest } from "@/lib/api/trigger-region";
 import {
   coerceAgentPermissionMode,
@@ -61,6 +80,7 @@ import {
   assertLocalSandboxFallbackAllowed,
   getSandboxWithFallbackGuard,
 } from "@/lib/ai/tools/utils/sandbox-fallback";
+import { AttachmentLocalCopySetupDeadlineError } from "@/lib/ai/tools/utils/attachment-command";
 import {
   getUploadBasePath,
   hasLocalDesktopSourcePaths,
@@ -77,31 +97,36 @@ import {
 } from "@/lib/api/agent-approval-session";
 import { createAgentRunCorrelationToken } from "@/lib/api/agent-run-correlation";
 import {
+  buildAgentApprovalSessionId,
+  buildAgentRunDedupeKeyParts,
+  buildAgentRunIdempotencyKey,
+  finalizeStartedAgentRun,
+  getAgentTriggerMachine,
+  getAgentTriggerPriority,
+  isAgentRunAssociationUnconfirmed,
+  type AgentRunPreviousOwner,
+} from "@/lib/api/agent-run-start";
+
+// Existing importers of the route module keep working.
+export {
+  buildAgentApprovalSessionId,
+  buildAgentRunDedupeKeyParts,
+  finalizeStartedAgentRun,
+  getAgentTriggerMachine,
+};
+import {
+  AGENT_START_REJECTION_HEADER,
+  AGENT_START_TRIGGER_PAYLOAD_TOO_LARGE,
+} from "@/lib/agent-start-response";
+import {
   DEFAULT_AGENT_AUTO_REVIEW_ASSIGNMENT,
   type AgentAutoReviewAssignment,
 } from "@/lib/experiments/agent-auto-review";
 
-type AgentTriggerMachinePreset = "small-1x" | "small-2x";
-
-const AGENT_TRIGGER_MACHINE_BY_SUBSCRIPTION: Record<
-  SubscriptionTier,
-  AgentTriggerMachinePreset
-> = {
-  free: "small-1x",
-  pro: "small-2x",
-  "pro-plus": "small-2x",
-  ultra: "small-2x",
-  team: "small-2x",
-};
-
-const AGENT_TRIGGER_PRIORITY_BY_SUBSCRIPTION: Record<SubscriptionTier, number> =
-  {
-    free: 0,
-    pro: 5,
-    "pro-plus": 5,
-    ultra: 10,
-    team: 5,
-  };
+// Both Agent routes have a 60s maxDuration. Desktop local-copy shell/path
+// setup for one admission shares this budget from handler entry, leaving room
+// for an in-flight setup command's bounded Stop and the response.
+const DESKTOP_LOCAL_COPY_SETUP_BUDGET_MS = 45_000;
 
 // Trigger.dev rejects a single trigger payload above 3 MiB. tasks.trigger()
 // offloads large packets, but sessions.start() sends triggerConfig.basePayload
@@ -149,15 +174,13 @@ export const createAgentTriggerPayloadTooLargeResponse = () =>
       cause:
         "This Agent request is too large to start. Remove some attachments or start a new chat and try again.",
     },
-    { status: 413 },
+    {
+      status: 413,
+      headers: {
+        [AGENT_START_REJECTION_HEADER]: AGENT_START_TRIGGER_PAYLOAD_TOO_LARGE,
+      },
+    },
   );
-
-const getAgentTriggerPriority = (subscription: SubscriptionTier) =>
-  AGENT_TRIGGER_PRIORITY_BY_SUBSCRIPTION[subscription];
-
-/** Keep paid Agent starts on the latency-optimized 1 GB worker. */
-export const getAgentTriggerMachine = (subscription: SubscriptionTier) =>
-  AGENT_TRIGGER_MACHINE_BY_SUBSCRIPTION[subscription];
 
 type AgentDeploymentEnvironment = {
   NODE_ENV?: string;
@@ -198,7 +221,16 @@ export const shouldRequireAgentApprovalDeploymentPin = (
     ? environment.VERCEL_ENV === "production"
     : environment.NODE_ENV === "production";
 
+type AgentGoalRequest =
+  | ({
+      action: "start";
+      expectedGeneration?: number;
+      objective: string;
+      criteria: string[];
+    } & GoalContract)
+  | { action: "resume"; expectedGeneration?: number; resumeOnReply?: boolean };
 type AgentTriggerRequestBody = {
+  goal?: AgentGoalRequest;
   messages: UIMessage[];
   chatId: string;
   todos?: Todo[];
@@ -270,6 +302,21 @@ const parseAgentTriggerRequestBody = async (
     };
   }
   if (
+    body.messages.some(
+      (message) =>
+        message === null ||
+        typeof message !== "object" ||
+        !Array.isArray(message.parts),
+    )
+  ) {
+    return {
+      ok: false,
+      response: new NextResponse("Each message must include a parts array", {
+        status: 400,
+      }),
+    };
+  }
+  if (
     body.agentRunRequestId !== undefined &&
     (typeof body.agentRunRequestId !== "string" ||
       !/^[A-Za-z0-9_-]{1,128}$/.test(body.agentRunRequestId))
@@ -282,9 +329,16 @@ const parseAgentTriggerRequestBody = async (
     };
   }
 
+  if (body.goal !== undefined && !validGoalRequest(body.goal)) {
+    return {
+      ok: false,
+      response: new NextResponse("Invalid goal request", { status: 400 }),
+    };
+  }
   return {
     ok: true,
     body: {
+      goal: body.goal as AgentGoalRequest | undefined,
       messages: body.messages as UIMessage[],
       chatId: body.chatId,
       todos: Array.isArray(body.todos) ? (body.todos as Todo[]) : undefined,
@@ -315,170 +369,25 @@ const parseAgentTriggerRequestBody = async (
   };
 };
 
-const getLastRequestMessageId = (messages: UIMessage[]): string | undefined => {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const id = messages[index]?.id;
-    if (typeof id === "string" && id.length > 0) return id;
-  }
-  return undefined;
-};
-
-export const buildAgentRunDedupeKeyParts = ({
-  userId,
-  chatId,
-  requestMessages,
-  regenerate,
-  isAutoContinue,
-  existingChatUpdateTime,
-  triggerRequestedAt,
-  agentRunRequestId,
+/** Share recovery across admission reads without replaying persistence or run dispatch. */
+export const createAgentTriggerPost = ({
+  endpoint,
 }: {
-  userId: string;
-  chatId: string;
-  requestMessages: UIMessage[];
-  regenerate?: boolean;
-  isAutoContinue?: boolean;
-  existingChatUpdateTime?: number;
-  triggerRequestedAt: number;
-  agentRunRequestId?: string;
-}) => {
-  const operation = regenerate
-    ? "regenerate"
-    : isAutoContinue
-      ? "auto-continue"
-      : "send";
-  const turnKey =
-    (regenerate ? agentRunRequestId : undefined) ??
-    getLastRequestMessageId(requestMessages) ??
-    (existingChatUpdateTime !== undefined
-      ? `chat-update:${existingChatUpdateTime}`
-      : `request:${triggerRequestedAt}`);
-
-  return ["agent-run", userId, chatId, operation, turnKey];
-};
-
-const buildAgentRunIdempotencyKey = async (
-  keyParts: ReturnType<typeof buildAgentRunDedupeKeyParts>,
-) => idempotencyKeys.create(keyParts, { scope: "global" });
-
-export const buildAgentApprovalSessionId = ({
-  chatId,
-  keyParts,
-  approvalProtocolVersion,
-  approvalWorkerVersion,
-  approvalExternalDeploymentId,
-}: {
-  chatId: string;
-  keyParts: ReturnType<typeof buildAgentRunDedupeKeyParts>;
-  approvalProtocolVersion: number;
-  approvalWorkerVersion: string | undefined;
-  approvalExternalDeploymentId?: string;
-}) => {
-  const digest = createHash("sha256")
-    .update(
-      [
-        `protocol:${approvalProtocolVersion}`,
-        approvalWorkerVersion
-          ? `worker:${approvalWorkerVersion}`
-          : approvalExternalDeploymentId
-            ? `deployment:${approvalExternalDeploymentId}`
-            : "worker:unversioned",
-        ...keyParts,
-      ].join("\0"),
-    )
-    .digest("base64url")
-    .slice(0, 32);
-  return `agent-approval:v${approvalProtocolVersion}:${chatId}:${digest}`;
-};
-
-type StartedAgentRunAccess = {
-  publicAccessToken: string;
-  approvalSessionPublicAccessToken?: string;
-};
-
-export const finalizeStartedAgentRun = async ({
-  chatId,
-  runId,
-  approvalSessionId,
-}: {
-  chatId: string;
-  runId: string;
-  approvalSessionId: string | undefined;
-}): Promise<StartedAgentRunAccess> => {
-  try {
-    const [publicAccessToken, approvalSessionPublicAccessToken, association] =
-      await Promise.all([
-        auth.createPublicToken({
-          scopes: { read: { runs: [runId] } },
-          // 6h is enough to cover the max task duration plus reconnect grace.
-          expirationTime: "6h",
-        }),
-        approvalSessionId
-          ? auth.createPublicToken({
-              scopes: {
-                write: { sessions: approvalSessionId },
-              } as any,
-              expirationTime: AGENT_APPROVAL_TOKEN_EXPIRATION,
-            })
-          : Promise.resolve(undefined),
-        setActiveTriggerRun({
-          chatId,
-          triggerRunId: runId,
-          approvalSessionId: approvalSessionId ?? null,
-        }),
-      ]);
-
-    if (association !== "updated") {
-      throw new ChatSDKError(
-        "not_found:chat",
-        "The chat was deleted while the Agent run was starting.",
-        { agent_run_association: association },
-      );
-    }
-
-    return {
-      publicAccessToken,
-      ...(approvalSessionPublicAccessToken
-        ? { approvalSessionPublicAccessToken }
-        : {}),
-    };
-  } catch (error) {
-    // A started run must never be returned when its chat association fails.
-    // Close both resources because Session close and run cancellation are
-    // independently idempotent and either one may already be terminal.
-    const cleanupResults = await Promise.allSettled([
-      closeAgentApprovalSession(
-        approvalSessionId,
-        "agent-run-association-failed",
-      ),
-      cancelAgentTriggerRun(runId),
-      setActiveTriggerRun({
-        chatId,
-        triggerRunId: null,
-        approvalSessionId: null,
-        expectedRunId: runId,
-        clearApprovalPending: true,
-      }),
-    ]);
-    for (const cleanupResult of cleanupResults) {
-      if (cleanupResult.status === "rejected") {
-        console.error("Failed to clean up an unreturned Agent run:", {
-          chatId,
-          runId,
-          error: cleanupResult.reason,
-        });
-      }
-    }
-    throw error;
-  }
-};
-
-export const createAgentTriggerPost =
-  ({ endpoint }: { endpoint: AgentApiEndpoint }) =>
-  async (req: NextRequest) => {
+  endpoint: AgentApiEndpoint;
+}) =>
+  withServiceQueryRecovery(async (req: NextRequest) => {
     const routeStartedAt = Date.now();
     let stage = "parse_request";
     let initialPersistenceStep: InitialChatPersistenceStep | undefined;
+    let desktopAttachmentStep:
+      | "sandbox_context"
+      | "acquire_sandbox"
+      | "upload_files"
+      | "close_sandbox"
+      | undefined;
+    // Observational only: names the existing guard callsite still in progress.
+    let guardBoundary: AgentStartGuardBoundary | undefined;
+    let goalReconciliationStep: GoalReconciliationStep | undefined;
     const diagnosticContext: {
       requestId?: string;
       userId?: string;
@@ -507,10 +416,38 @@ export const createAgentTriggerPost =
           ...(stage === "persist_user_message" && initialPersistenceStep
             ? { initial_persistence_step: initialPersistenceStep }
             : {}),
+          ...(stage === "prepare_desktop_attachments" && desktopAttachmentStep
+            ? { desktop_attachment_step: desktopAttachmentStep }
+            : {}),
           elapsed_ms: Date.now() - routeStartedAt,
         }),
       );
     }, 10_000);
+    let reservedGoal:
+      { chatId: string; userId: string; generation: number } | undefined;
+    // Goal lifecycle reads and writes keep their existing unbounded timing and
+    // order, on one fresh client per admission so another chat's pending write
+    // on the shared singleton cannot hold them.
+    let goalConvex: ConvexCallScope | undefined;
+    const getGoalConvex = () =>
+      (goalConvex ??= { client: createIsolatedConvexClient() });
+    const releaseReservedGoal = async () => {
+      if (!reservedGoal) return;
+      const goal = reservedGoal;
+      reservedGoal = undefined;
+      try {
+        await getGoalConvex().client.mutation(goalApi.agentGoals.failDispatch, {
+          serviceKey: goalServiceKey(),
+          ...goal,
+        });
+      } catch {
+        // A persistence outage leaves the goal fenced for explicit recovery.
+      }
+      await captureGoalLifecycle("admission_failed", {
+        ...goal,
+        goalGeneration: goal.generation,
+      });
+    };
     try {
       const parsedBody = await parseAgentTriggerRequestBody(req);
       if (!parsedBody.ok) return parsedBody.response;
@@ -529,12 +466,19 @@ export const createAgentTriggerPost =
         limitRescue,
         agentRunRequestId,
         projectId: requestedProjectId,
+        goal: goalRequest,
       } = parsedBody.body;
 
       diagnosticContext.chatId = chatId.slice(0, 128);
       stage = "authenticate";
-      const { userId, subscription, organizationId, freeQuotaSubject } =
-        await getUserIDAndPro(req);
+      const {
+        userId,
+        subscription,
+        organizationId,
+        freeQuotaSubject: legacyQuotaSubject,
+        freeUsageQuotaSubject,
+      } = await getUserIDAndPro(req);
+      const freeQuotaSubject = freeUsageQuotaSubject ?? legacyQuotaSubject;
       diagnosticContext.userId = userId.slice(0, 128);
       let selectedModelOverride: SelectedModel | undefined =
         normalizeSelectedModelOverrideForSubscription(
@@ -542,40 +486,55 @@ export const createAgentTriggerPost =
           subscription,
         );
       stage = "access_gates";
+      guardBoundary = "account_access_gate";
       await assertUserCanMakeCostIncurringRequest(userId, {
         retryNetworkFailure: true,
         signal: req.signal,
       });
-      // Serialize cloud Agent admission with recovery before a run is queued.
-      // The same activity/fence CAS protects acquisition and cached clients.
-      if (
-        process.env.CLOUD_DISK_RECOVERY_TARGETS &&
-        (!sandboxPreference || sandboxPreference === "e2b")
-      ) {
-        const workspace = await readCloudWorkspaceState(userId);
-        await assertCloudWorkspaceAvailable(
-          userId,
-          workspace?.phase === "e2b" ? workspace.destinationId : undefined,
-        );
-      }
+      guardBoundary = undefined;
       const regionalSubscriptionCountry =
         subscriptionFirstCountryFromRequest(req);
+      guardBoundary = "regional_subscription_gate";
       await enforceRegionalSubscriptionFirst({
         userId,
         subscription,
         country: regionalSubscriptionCountry,
         surface: "agent",
       });
+      guardBoundary = undefined;
       const userLocation = geolocation(req);
-      const { triggerRegion, requestRegionClass } =
+      const { triggerRegion: requestTriggerRegion, requestRegionClass } =
         getRegionalExecutionContextForVercelRequest(req, userLocation);
       const genericDelegationEnabled = true;
 
+      guardBoundary = "free_agent_sandbox_gate";
       assertFreeAgentGates({
         mode: "agent",
         subscription,
         sandboxPreference,
       });
+      guardBoundary = undefined;
+
+      stage = "workspace_routing";
+      const triggerRegion =
+        !sandboxPreference || sandboxPreference === "e2b"
+          ? await resolveCloudWorkspaceRegion({
+              userId,
+              preferredRegion: requestTriggerRegion,
+              signal: req.signal,
+            })
+          : requestTriggerRegion;
+
+      // Serialize cloud Agent admission with recovery before a run is queued.
+      // The same activity/fence CAS protects acquisition and cached clients.
+      if (!sandboxPreference || sandboxPreference === "e2b") {
+        const workspace = await readCloudWorkspaceState(userId);
+        await assertCloudWorkspaceAvailable(
+          userId,
+          workspace?.phase === "e2b" ? workspace.destinationId : undefined,
+          triggerRegion,
+        );
+      }
 
       const requestMessages = Array.isArray(messages) ? messages : [];
       if (!regenerate && !isAutoContinue && requestMessages.length === 0) {
@@ -606,10 +565,75 @@ export const createAgentTriggerPost =
       // soon as possible after the suspension check succeeds.
       stage = "load_chat_and_preferences";
       const [existingChat, userCustomization] = await Promise.all([
-        getChatById({ id: chatId }),
+        withAgentConvexScope("startChatRead", (convex) =>
+          getChatById({ id: chatId }, convex),
+        ),
         getUserCustomization({ userId }),
       ]);
+      if (
+        existingChat?.user_id === userId &&
+        existingChat.active_agent_user_wait
+      ) {
+        return new NextResponse(
+          "Agent is waiting for your reply in this chat. Reply to continue or stop the run first.",
+          { status: 409 },
+        );
+      }
 
+      if (
+        goalRequest &&
+        (subscription === "free" ||
+          limitRescue ||
+          (regenerate &&
+            (goalRequest.action !== "resume" ||
+              goalRequest.expectedGeneration === undefined)))
+      ) {
+        guardBoundary = "persistent_goal_request_gate";
+        throw new ChatSDKError(
+          "forbidden:chat",
+          "Persistent goals are unavailable for this request.",
+        );
+      }
+      if (existingChat && existingChat.user_id !== userId) {
+        guardBoundary = "chat_owner_gate";
+        throw new ChatSDKError("forbidden:chat");
+      }
+      stage = "reconcile_goal";
+      const existingGoal = existingChat
+        ? await reconcileGoal(
+            chatId,
+            userId,
+            (step) => {
+              goalReconciliationStep = step;
+            },
+            getGoalConvex(),
+          )
+        : null;
+      // Later local guards did not fail inside a reconciliation step.
+      goalReconciliationStep = undefined;
+      if (
+        !goalRequest &&
+        existingGoal &&
+        (existingGoal.activeRunId ||
+          ["queued", "running", "waiting", "needs_approval"].includes(
+            existingGoal.state,
+          ))
+      )
+        throw new ChatSDKError(
+          "bad_request:api",
+          "Pause the goal and wait for its current run to settle before sending another Agent request.",
+        );
+      if (
+        goalRequest?.action === "resume" &&
+        existingGoal &&
+        (existingGoal.sandboxPreference !== (sandboxPreference ?? "e2b") ||
+          existingGoal.permissionMode !== agentPermissionMode ||
+          existingGoal.selectedModel !== (selectedModelOverride ?? "auto"))
+      )
+        throw new ChatSDKError(
+          "bad_request:api",
+          "Restore the goal’s original sandbox, model and permission mode before resuming.",
+        );
       // Fetch existing chat to: (a) detect isNewChat for title generation,
       // (b) pass to handleInitialChatAndUserMessage so it skips saveChat on
       //     regenerate/auto-continue and does the ownership check instead.
@@ -629,6 +653,19 @@ export const createAgentTriggerPost =
           organizationId,
         }),
       ]);
+      // A stale client may still send its automatic continuation after the
+      // run saved a stop that only the user can resume.
+      if (
+        isAutomaticContinuation &&
+        requiresManualAgentResume(existingChat?.finish_reason)
+      ) {
+        throw new ChatSDKError(
+          "bad_request:api",
+          existingChat?.finish_reason === LOCAL_CONNECTION_LOST_FINISH_REASON
+            ? "The local connection was lost. Resume manually from the chat when your computer is connected."
+            : "Browser takeover was not completed in time. Resume manually from the chat when you're ready.",
+        );
+      }
       const isNewChat = !existingChat && !regenerate && !isAutoContinue;
       const autoReviewAssignment: AgentAutoReviewAssignment | undefined =
         agentPermissionMode === "auto_review"
@@ -670,6 +707,7 @@ export const createAgentTriggerPost =
             null,
             subscription,
           );
+          desktopAttachmentStep = "sandbox_context";
           await sandboxManager.getSandboxContextForPrompt();
           assertLocalSandboxFallbackAllowed({
             fallbackInfo: sandboxManager.consumeFallbackInfo(),
@@ -679,17 +717,22 @@ export const createAgentTriggerPost =
           let stagedSandbox: any = null;
           let uploadResult: Awaited<ReturnType<typeof uploadSandboxFiles>>;
           try {
+            desktopAttachmentStep = "upload_files";
             uploadResult = await uploadSandboxFiles(
               sandboxFiles,
               async () => {
+                desktopAttachmentStep = "acquire_sandbox";
                 const { sandbox } = await getSandboxWithFallbackGuard({
                   sandboxManager,
                   requireLocalSandbox: true,
                 });
                 stagedSandbox = sandbox;
+                desktopAttachmentStep = "upload_files";
                 return sandbox;
               },
               {
+                localCopySetupDeadlineAt:
+                  routeStartedAt + DESKTOP_LOCAL_COPY_SETUP_BUDGET_MS,
                 logContext: {
                   service: "hackerai-web",
                   requestId:
@@ -699,7 +742,16 @@ export const createAgentTriggerPost =
                 },
               },
             );
+          } catch (error) {
+            // Unconfirmed cancellation and other failures keep their own path.
+            if (!(error instanceof AttachmentLocalCopySetupDeadlineError))
+              throw error;
+            throw new ChatSDKError(
+              "bad_request:api",
+              "Your computer took too long to prepare local attachments. Reconnect this computer, then send the message again.",
+            );
           } finally {
+            desktopAttachmentStep = "close_sandbox";
             await stagedSandbox?.close?.().catch(() => {});
           }
           if (uploadResult.failedCount > 0) {
@@ -719,22 +771,89 @@ export const createAgentTriggerPost =
         localDesktopAttachmentsPrepared = true;
       }
 
+      const reserveGoal = async () => {
+        if (!goalRequest) return;
+        const goalClient = getGoalConvex().client;
+        const savedGoal =
+          goalRequest.action === "start"
+            ? await goalClient.mutation(goalApi.agentGoals.start, {
+                serviceKey: goalServiceKey(),
+                chatId,
+                userId,
+                ...(goalRequest.expectedGeneration !== undefined
+                  ? { expectedGeneration: goalRequest.expectedGeneration }
+                  : {}),
+                objective: goalRequest.objective,
+                criteria: goalRequest.criteria,
+                verificationCommand: goalRequest.verificationCommand,
+                constraints: goalRequest.constraints,
+                boundaries: goalRequest.boundaries,
+                stopWhen: goalRequest.stopWhen,
+                sandboxPreference: sandboxPreference ?? "e2b",
+                permissionMode: agentPermissionMode,
+                selectedModel: selectedModelOverride ?? "auto",
+              })
+            : await goalClient.mutation(goalApi.agentGoals.control, {
+                serviceKey: goalServiceKey(),
+                chatId,
+                userId,
+                action: "resume",
+                ...(goalRequest.resumeOnReply ? { resumeOnReply: true } : {}),
+                ...(goalRequest.expectedGeneration !== undefined
+                  ? { generation: goalRequest.expectedGeneration }
+                  : {}),
+              });
+        reservedGoal = { chatId, userId, generation: savedGoal.generation };
+        await captureGoalLifecycle(
+          goalRequest.action === "start" ? "admitted" : "resumed",
+          { chatId, userId, subscription },
+          savedGoal,
+        );
+      };
+
+      // Fence an existing goal before writing input that a queued worker could
+      // otherwise consume. New chats must exist before reserving their goal.
+      if (existingChat) await reserveGoal();
       stage = "persist_user_message";
-      await handleInitialChatAndUserMessage({
-        chatId,
-        userId,
-        messages: messagesForPersistence,
-        regenerate,
-        chat: existingChat ?? null,
-        isHidden: isAutoContinue ? true : undefined,
-        projectId: projectContext.projectId,
-        sandboxType: sandboxPreference ?? "e2b",
-        onPersistenceStep: (step) => {
-          initialPersistenceStep = step;
-        },
-      });
+      // One isolated, bounded client runs this admission's chat and message
+      // writes in order. Started after Desktop attachment uploads so they
+      // cannot spend it, and outside the singleton's queue so another chat's
+      // pending write cannot hold them. Goal writes and analytics stay outside.
+      await withAgentConvexScope("startPersistence", (persistence) =>
+        handleInitialChatAndUserMessage(
+          {
+            chatId,
+            userId,
+            messages: messagesForPersistence,
+            regenerate,
+            chat: existingChat ?? null,
+            isHidden: isAutoContinue ? true : undefined,
+            projectId: projectContext.projectId,
+            sandboxType: sandboxPreference ?? "e2b",
+            onPersistenceStep: (step) => {
+              initialPersistenceStep = step;
+            },
+          },
+          persistence,
+        ),
+      );
       initialPersistenceStep = undefined;
 
+      if (!existingChat) await reserveGoal();
+      if (reservedGoal && goalRequest?.action === "start") {
+        const goalMessage = messagesForPersistence.findLast(
+          (m) => m.role === "user",
+        );
+        if (goalMessage)
+          await getGoalConvex().client.mutation(
+            goalApi.agentGoals.markMessage,
+            {
+              serviceKey: goalServiceKey(),
+              ...reservedGoal,
+              messageId: goalMessage.id,
+            },
+          );
+      }
       // Snapshot permission behavior once for this run. UI changes made while
       // it is active apply to the next run and cannot mutate a resumed run.
       const permissionSnapshot =
@@ -796,19 +915,19 @@ export const createAgentTriggerPost =
       // The v2 worker must reject unsupported approvalProtocolVersion values;
       // old workers ignore this field, so the route that emits v2 deploys last.
       const agentPayload = {
+        ...(reservedGoal ? { goalGeneration: reservedGoal.generation } : {}),
         chatId,
         userId,
         subscription,
         organizationId,
         freeQuotaSubject,
         regionalSubscriptionCountry,
-        regionalFreeCountry:
-          subscription === "free"
-            ? regionalFreeCountryFromRequest(req)
-            : undefined,
         messages: messagesForPayload,
         localDesktopAttachmentsPrepared,
-        baseTodos: Array.isArray(todos) ? todos : [],
+        // Trigger's sessions.start() caps the entire inline body at 32 KiB.
+        // The Agent worker loads todos from Convex, so the session doesn't need
+        // the client's duplicate list. Keep the field's array shape.
+        baseTodos: approvalSessionId || !Array.isArray(todos) ? [] : todos,
         sandboxPreference,
         agentPermissionMode: permissionSnapshot.mode,
         approvalSessionId,
@@ -820,6 +939,12 @@ export const createAgentTriggerPost =
         requestRegionClass,
         isAutoContinue,
         isAutomaticContinuation,
+        // Content-free analytics link: the user resumed a saved manual stop.
+        ...(isAutoContinue &&
+          !isAutomaticContinuation &&
+          requiresManualAgentResume(existingChat?.finish_reason) && {
+            resumeFromFinishReason: existingChat.finish_reason,
+          }),
         regenerate,
         limitRescue,
         isNewChat,
@@ -883,7 +1008,7 @@ export const createAgentTriggerPost =
         metadata: triggerMetadata,
       };
       let triggerRequestBodyBytes: number | undefined;
-      const triggerPayloadTooLargeResponse = (
+      const triggerPayloadTooLargeResponse = async (
         reason: "payload_limit_exceeded" | "trigger_api_413",
       ) => {
         console.warn(
@@ -913,48 +1038,71 @@ export const createAgentTriggerPost =
           }),
         );
 
+        await releaseReservedGoal();
         return createAgentTriggerPayloadTooLargeResponse();
       };
 
-      let runId: string;
-      try {
-        stage = triggerApiMethod;
-        if (approvalSessionId) {
-          const approvalTriggerConfig = {
-            basePayload: agentPayload,
-            machine: triggerMachine,
-            tags: getAgentApprovalTriggerTags(triggerTags),
-            region: triggerRegion,
-            ...approvalDeploymentPin,
-          };
-          const approvalSessionBody = {
+      const approvalTriggerConfig = {
+        basePayload: agentPayload,
+        machine: triggerMachine,
+        tags: getAgentApprovalTriggerTags(triggerTags),
+        region: triggerRegion,
+        ...approvalDeploymentPin,
+      };
+      const approvalSessionBody = approvalSessionId
+        ? {
             type: `agent-long-approval.v${AGENT_APPROVAL_PROTOCOL_VERSION}`,
             externalId: approvalSessionId,
             taskIdentifier: AGENT_TRIGGER_TASK_ID,
             tags: triggerTags,
             metadata: triggerMetadata,
             triggerConfig: approvalTriggerConfig,
-          };
-          triggerRequestBodyBytes =
-            getAgentTriggerPayloadSizeBytes(approvalSessionBody);
-          if (
-            isAgentTriggerRequestSizeTooLarge({
-              payloadBytes: triggerPayloadBytes,
-              requestBodyBytes: triggerRequestBodyBytes,
-            })
-          ) {
-            return triggerPayloadTooLargeResponse("payload_limit_exceeded");
           }
+        : undefined;
+      if (approvalSessionBody)
+        triggerRequestBodyBytes =
+          getAgentTriggerPayloadSizeBytes(approvalSessionBody);
+      if (
+        isAgentTriggerRequestSizeTooLarge({
+          payloadBytes: triggerPayloadBytes,
+          requestBodyBytes: triggerRequestBodyBytes,
+        })
+      ) {
+        return triggerPayloadTooLargeResponse("payload_limit_exceeded");
+      }
+
+      // The last ordinary owner read runs before dispatch, so its failure or
+      // timeout cannot leave a started run behind. Goal starts are fenced by
+      // their generation at association instead.
+      let previousOwner: AgentRunPreviousOwner | undefined;
+      if (!reservedGoal) {
+        stage = "read_previous_owner";
+        const ownerChat = await withAgentConvexScope(
+          "startPreviousOwnerRead",
+          (convex) => getChatById({ id: chatId }, convex),
+        );
+        if (!ownerChat || ownerChat.deletion_started_at !== undefined)
+          throw new ChatSDKError(
+            "not_found:chat",
+            "The chat was deleted before the Agent run could start.",
+          );
+        if (ownerChat.user_id !== userId) {
+          guardBoundary = "chat_owner_gate";
+          throw new ChatSDKError("forbidden:chat");
+        }
+        previousOwner = {
+          runId: ownerChat.active_trigger_run_id ?? null,
+          approvalSessionId: ownerChat.active_agent_approval_session_id ?? null,
+        };
+      }
+
+      let runId: string;
+      try {
+        stage = triggerApiMethod;
+        if (approvalSessionBody) {
           const session = await sessions.start(approvalSessionBody);
           runId = session.runId;
         } else {
-          if (
-            isAgentTriggerRequestSizeTooLarge({
-              payloadBytes: triggerPayloadBytes,
-            })
-          ) {
-            return triggerPayloadTooLargeResponse("payload_limit_exceeded");
-          }
           const handle = await tasks.trigger<typeof agentLongTask>(
             AGENT_TRIGGER_TASK_ID,
             agentPayload,
@@ -973,14 +1121,20 @@ export const createAgentTriggerPost =
       diagnosticContext.runId = runId;
       stage = "create_tokens_and_associate_run";
 
-      // Access-token creation and durable association are independent, so
-      // overlap them while treating every post-start failure as terminal.
+      // Claim ownership only after tokens are available, then settle the exact
+      // displaced owner. Concurrent admissions cannot overwrite a newer claim.
       const { publicAccessToken, approvalSessionPublicAccessToken } =
         await finalizeStartedAgentRun({
+          expectedRunId: existingChat?.active_trigger_run_id ?? null,
           chatId,
+          userId,
           runId,
           approvalSessionId,
+          goal: reservedGoal,
+          previousOwner,
         });
+      // The associated worker owns this generation, even if response creation fails.
+      reservedGoal = undefined;
 
       console.info(`[${endpoint}] started trigger run`, {
         chatId,
@@ -1012,14 +1166,24 @@ export const createAgentTriggerPost =
       });
       return response;
     } catch (error) {
+      // The dispatched worker may already own this generation; failing its
+      // dispatch would fence out the run the chat can still reconnect to.
+      if (isAgentRunAssociationUnconfirmed(error)) reservedGoal = undefined;
+      await releaseReservedGoal();
       return handleAgentRouteError({
         error,
         endpoint,
         action: "start",
         fallbackMessage: "Failed to start agent run",
-        context: { ...diagnosticContext, stage, initialPersistenceStep },
+        context: {
+          ...diagnosticContext,
+          stage,
+          initialPersistenceStep,
+          guardBoundary,
+          goalReconciliationStep,
+        },
       });
     } finally {
       clearInterval(slowRequestInterval);
     }
-  };
+  });

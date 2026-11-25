@@ -24,6 +24,9 @@ import {
 } from "@/lib/chat/tool-abort-utils";
 import { stripOpenRouterReasoningMetadataFromMessages } from "@/lib/chat/provider-metadata-sanitizer";
 import { usesGlmFlashForStandardVision } from "@/lib/chat/auxiliary-vision-eligibility";
+import { DEEPSEEK_1017_MODEL_KEY } from "@/lib/experiments/paid-deepseek-1017";
+import { CONTEXT_USAGE_PART_TYPE } from "@/lib/chat/context-pressure";
+import { isAgentSteerPart } from "@/lib/chat/agent-steer";
 /**
  * Get maximum steps allowed for a request.
  * Agent mode: 500 steps. Ask mode: 15 steps (free users only).
@@ -39,8 +42,10 @@ export const getMaxStepsForUser = (mode: ChatMode): number => {
  * @param hasImageAttachment - Whether any message has an image attachment.
  * @param hasPdfAttachment - Whether any message has a PDF attachment.
  *   Every paid Auto route (Pro, Pro Plus, Ultra, Team) and Agent Pro use
- *   DeepSeek V4.1 Flash. Paid Standard uses GLM 5.3 Flash, including images.
- *   Paid plans only use Agent mode. Max uses GLM 5.3.
+ *   DeepSeek V4.1 Flash. Paid Standard uses the same snapshot with high
+ *   reasoning; explicit Pro uses max reasoning, including images.
+ *   Entitled Max requests use Kimi K3.1 Pro for text and native images;
+ *   its PDFs go through OpenRouter's file parser.
  *   Pro/Pro+ Auto image turns also use GLM 5.3 Flash; other eligible
  *   image turns use DeepSeek V4.1 Flash vision before fallbacks.
  * @returns Model name to use
@@ -64,8 +69,8 @@ export function selectModel(
     subscription,
     options,
   );
-  // Paid Standard uses native GLM vision as well as text/PDF parsing. Resolve
-  // it before the legacy media promotions so every paid plan keeps this route.
+  // Resolve explicit Standard before legacy media promotions so text, images
+  // and PDFs retain the same native DeepSeek snapshot on every paid plan.
   if (subscription !== "free" && allowedSelectedModel === "hackerai-standard") {
     return resolveAgentTierToProviderKey(allowedSelectedModel);
   }
@@ -79,7 +84,7 @@ export function selectModel(
   const paidAutoTextModel: ModelName = "model-deepseek-v4-flash-vision-pro";
   // Paid Agent Pro accepts original images without a separate vision route.
   if (subscription !== "free" && allowedSelectedModel === "hackerai-pro") {
-    return "model-deepseek-v4-flash-vision-pro";
+    return resolveAgentTierToProviderKey(allowedSelectedModel);
   }
   // Direct image routes retain Standard vision reasoning for Auto.
   const isAutoSelection =
@@ -113,13 +118,6 @@ export function selectModel(
     return autoModel;
   }
 
-  // GLM 5.3 is the Max text model. Keep image requests on the existing
-  // multimodal route because the retired experiment intentionally excluded
-  // image inputs.
-  if (allowedSelectedModel === "hackerai-max" && hasProviderImage) {
-    return "model-grok-4.6";
-  }
-
   const providerKey = resolveAgentTierToProviderKey(allowedSelectedModel);
   return providerKey ?? autoModel;
 }
@@ -148,6 +146,8 @@ function getMediaAttachmentRouting(messages: UIMessage[]): {
 
 const ABORT_RENDERABLE_TOOL_TYPES = new Set([
   "tool-file",
+  "tool-file_edit",
+  "tool-file_write",
   "tool-read_file",
   "tool-write_file",
   "tool-delete_file",
@@ -166,6 +166,7 @@ const ABORT_RENDERABLE_TOOL_TYPES = new Set([
   "tool-list_notes",
   "tool-update_note",
   "tool-delete_note",
+  "tool-get_note",
   "tool-create_vulnerability_report",
   "tool-list_reports",
   "tool-get_report",
@@ -483,8 +484,11 @@ function stripOriginalContentFromMessages(messages: UIMessage[]): UIMessage[] {
     const cleanedParts = message.parts.map((part: any) => {
       // Process tool-file parts with read, edit, or append action and object output
       if (
-        part.type === "tool-file" &&
-        (part.input?.action === "read" ||
+        (part.type === "tool-file" ||
+          part.type === "tool-file_edit" ||
+          part.type === "tool-file_write") &&
+        (part.type === "tool-file_edit" ||
+          part.input?.action === "read" ||
           part.input?.action === "edit" ||
           part.input?.action === "append") &&
         typeof part.output === "object" &&
@@ -638,6 +642,7 @@ function stripProviderMetadata(messages: UIMessage[]): UIMessage[] {
 const UI_ONLY_PART_TYPES = new Set([
   "data-agent-auto-review",
   "data-agent-auto-review-lifecycle",
+  CONTEXT_USAGE_PART_TYPE,
   "data-summarization",
   "data-shared-finding",
 ]);
@@ -735,6 +740,8 @@ export async function processChatMessages({
         if (part.type?.startsWith("tool-")) return true;
         // File parts are valid content
         if (part.type === "file") return !!part.url || !!part.fileId;
+        // A steer the run read is the user's message, even before any output.
+        if (isAgentSteerPart(part)) return true;
         // reasoning and step-start alone are NOT sufficient for assistant messages
         return false;
       });
@@ -796,7 +803,6 @@ export async function processChatMessages({
     sandboxFiles,
     moderationChecked: true,
     platformAuthorized: moderationResult.shouldUncensorResponse,
-    allowsAbliterationContinuation:
-      moderationResult.allowsAbliterationContinuation,
+    allowsFreeAbliteration: moderationResult.allowsFreeAbliteration,
   };
 }

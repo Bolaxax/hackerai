@@ -1,13 +1,16 @@
 import type { PostHog } from "posthog-node";
-import { myProvider, type ModelName } from "@/lib/ai/providers";
+import type { ModelName } from "@/lib/ai/providers";
 import { getExperimentAnalyticsProperties } from "@/lib/analytics/experiment-context";
 import type { ChatMode, SubscriptionTier } from "@/types";
+import {
+  evaluateFreeAskDeepSeek1017,
+  FREE_ASK_DEEPSEEK_1017_KEY,
+} from "./free-ask-deepseek-1017";
 
-export const PAID_AGENT_FLASH_RETURN_KEY = "paid_agent_glm_flash_return_v1";
 export const FLASH_ROUTING_EXPOSURE_EVENT = "flash_routing_experiment_exposed";
 
 export type FlashRoutingAssignment = {
-  key: typeof PAID_AGENT_FLASH_RETURN_KEY;
+  key: typeof FREE_ASK_DEEPSEEK_1017_KEY;
   variant: "control" | "test";
   modelKey: ModelName;
   configuredModel: string;
@@ -24,7 +27,7 @@ export async function evaluateFlashRouting({
   limitRescue = false,
   modelPolicyActive = false,
 }: {
-  posthog: Pick<PostHog, "evaluateFlags"> | null;
+  posthog: Pick<PostHog, "evaluateFlags" | "getFeatureFlagResult"> | null;
   userId: string;
   mode: ChatMode;
   subscription: SubscriptionTier;
@@ -35,40 +38,18 @@ export async function evaluateFlashRouting({
 }): Promise<FlashRoutingAssignment | undefined> {
   if (!posthog || !userId || limitRescue || modelPolicyActive) return undefined;
   if (hasImages) return undefined;
-  const key =
-    mode === "agent" &&
-    subscription !== "free" &&
-    selectedModel === "model-deepseek-v4-flash-0731"
-      ? PAID_AGENT_FLASH_RETURN_KEY
-      : undefined;
-  if (!key) return undefined;
-  // This legacy experiment compares 0731 with GLM. Redirected saved selections
-  // must not enroll a different baseline under its historical experiment key.
   if (
-    myProvider.languageModel(selectedModel).modelId !==
-    "deepseek/deepseek-v4-flash-0731"
+    mode === "ask" &&
+    subscription === "free" &&
+    selectedModel === "ask-model-free-glm"
   ) {
-    return undefined;
+    try {
+      return await evaluateFreeAskDeepSeek1017(posthog, userId);
+    } catch {
+      return undefined;
+    }
   }
-
-  try {
-    const flags = await posthog.evaluateFlags(userId, { flagKeys: [key] });
-    const variant = flags.getFlag(key);
-    if (variant !== "control" && variant !== "test") return undefined;
-    return {
-      key,
-      variant,
-      modelKey:
-        variant === "control" ? selectedModel : "model-glm-5.3-flash-agent",
-      configuredModel:
-        variant === "test"
-          ? "z-ai/glm-5.3-flash"
-          : "deepseek/deepseek-v4-flash-0731",
-    };
-  } catch {
-    // Analytics availability must never make chat unavailable or change the default.
-    return undefined;
-  }
+  return undefined;
 }
 
 /** Drop assignments superseded by rescue or another routing decision. */
@@ -122,6 +103,9 @@ export function createFlashRoutingExposureRecorder({
           request_id: requestId,
           message_id: requestId,
           exposure_surface: "provider_request",
+          ...(assignment.key === FREE_ASK_DEEPSEEK_1017_KEY && {
+            $insert_id: `${requestId}:free-ask-1017-exposure`,
+          }),
           $process_person_profile: false,
         },
       });

@@ -1,23 +1,27 @@
 #!/usr/bin/env node
 // Developer-only orchestration. Never import this module into the application.
 import { spawn, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   access,
   appendFile,
   mkdir,
   lstat,
+  open,
   readFile,
   realpath,
   rename,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { constants } from "node:fs";
-import { connect } from "node:net";
-import { hostname, loadavg, platform } from "node:os";
+import { connect, createServer as createNetServer } from "node:net";
+import { arch, hostname, loadavg, platform, release } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { verifyTargets, TargetVerificationError } from "./verify-targets.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -75,19 +79,49 @@ function sha(value, length) {
   );
   return value;
 }
+const SLUG = /^[a-z0-9][a-z0-9-]{0,47}$/;
+function caseName(value) {
+  check(
+    typeof value === "string" && SLUG.test(value),
+    "Invalid case name; use lowercase letters, digits and hyphens",
+  );
+  return value;
+}
+// Optional exact-reuse identity: SHA-256 revision fingerprints copied from
+// verified local build/run records, plus a synthetic QA profile slug.
+function reuseIdentity(input) {
+  keys(input, ["frontend", "backend", "relay", "profile"]);
+  check(
+    typeof input.profile === "string" && SLUG.test(input.profile),
+    "QA profile must be a short synthetic label, never an email or credential",
+  );
+  return {
+    frontend: sha(input.frontend, 64),
+    backend: sha(input.backend, 64),
+    relay: sha(input.relay, 64),
+    profile: label(input.profile),
+  };
+}
 export function validateConfig(input) {
-  keys(input, ["environment", "frontend", "backend", "worker", "relay", "app"]);
+  keys(input, [
+    "environment",
+    "frontend",
+    "backend",
+    "worker",
+    "relay",
+    "app",
+    "reuse",
+  ]);
   check(
     ["local", "preview"].includes(input.environment),
     "QA only supports local or Preview environments",
   );
   const frontend = url(input.frontend).origin;
+  // Hosted deployments (including Vercel Preview) can show deployment protection
+  // inside the native WebView, so native QA always loads a local frontend.
   check(
-    input.environment === "local"
-      ? loopback(frontend)
-      : new URL(frontend).protocol === "https:" &&
-          new URL(frontend).hostname.endsWith(".vercel.app"),
-    "Frontend does not match the selected QA environment",
+    loopback(frontend),
+    "Native QA requires a loopback frontend (localhost, 127.0.0.1 or [::1]). Build and serve this worktree's frontend locally, pointed at the verified backend/worker/relay; use hosted Vercel Preview only for web-only browser QA.",
   );
   keys(input.backend, ["account", "project", "deployment", "url"]);
   const backend = {
@@ -136,6 +170,7 @@ export function validateConfig(input) {
       sourceCommit: sha(input.app.sourceCommit, 40),
       version: label(input.app.version),
     },
+    ...(input.reuse !== undefined && { reuse: reuseIdentity(input.reuse) }),
   };
 }
 async function inside(root, path) {
@@ -204,19 +239,198 @@ export async function health(config) {
     return { frontend: "unreachable", ...services };
   }
 }
+// Early origin readiness, before any build: no executable, environment,
+// session, provider request or launch record. Evidence lists are copied by the
+// operator from the Development configuration; membership is exact.
+const ORIGIN_LIST_LIMIT = 64;
+const CALLBACK_PATH = /^(?:\/[A-Za-z0-9_~-][A-Za-z0-9._~-]{0,63}){1,8}\/?$/;
+function planUrl(value, form) {
+  const invalid = `Invalid ${form}; use a canonical, credential-free HTTP(S) value without wildcard, query or fragment`;
+  let parsed;
+  try {
+    check(
+      typeof value === "string" &&
+        value.length <= 2048 &&
+        !/[*?#@\s]/.test(value),
+      invalid,
+    );
+    parsed = new URL(value);
+  } catch {
+    throw new QaError(invalid);
+  }
+  const canonical =
+    form === "callback URL"
+      ? parsed.href === value
+      : [parsed.origin, `${parsed.origin}/`].includes(value) &&
+        (form === "frontend origin" || parsed.origin === value);
+  check(
+    ["http:", "https:"].includes(parsed.protocol) &&
+      parsed.port !== "0" &&
+      canonical,
+    invalid,
+  );
+  return parsed;
+}
+function evidenceList(value, parse) {
+  if (value === undefined) return undefined; // Not verified: never inferred.
+  check(
+    Array.isArray(value) && value.length <= ORIGIN_LIST_LIMIT,
+    `Evidence lists must be arrays of at most ${ORIGIN_LIST_LIMIT} entries; omit a list you did not verify`,
+  );
+  return value.map(parse);
+}
+function validateOriginPlan(input) {
+  keys(input, [
+    "frontend",
+    "callbackPaths",
+    "developmentCallbackUrls",
+    "developmentUploadOrigins",
+  ]);
+  const frontend = planUrl(input.frontend, "frontend origin").origin;
+  check(
+    loopback(frontend),
+    "Origin doctor requires a loopback frontend (localhost, 127.0.0.1 or [::1])",
+  );
+  check(
+    Array.isArray(input.callbackPaths) &&
+      input.callbackPaths.length > 0 &&
+      input.callbackPaths.length <= ORIGIN_LIST_LIMIT,
+    "List one or more desired callback paths",
+  );
+  return {
+    frontend,
+    callbacks: input.callbackPaths.map((path) => {
+      check(
+        typeof path === "string" &&
+          CALLBACK_PATH.test(path) &&
+          new URL(path, frontend).pathname === path,
+        "Invalid callback path; use an absolute path without dot segments, query or fragment",
+      );
+      return `${frontend}${path}`;
+    }),
+    callbackEvidence: evidenceList(input.developmentCallbackUrls, (value) => {
+      const parsed = planUrl(value, "callback URL");
+      check(
+        loopback(parsed.href),
+        "Callback evidence lists only Development loopback URLs",
+      );
+      return parsed.href;
+    }),
+    uploadEvidence: evidenceList(
+      input.developmentUploadOrigins,
+      (value) => planUrl(value, "upload origin").origin,
+    ),
+  };
+}
+/**
+ * Point-in-time: a short exclusive bind and close on the host and port that
+ * `serve` passes to next start. Only EADDRINUSE means occupied.
+ */
+export function probePort(origin, create = createNetServer) {
+  const target = new URL(origin);
+  const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
+  return new Promise((done) => {
+    const server = create((socket) => socket.destroy());
+    let settled = false;
+    const finish = (state) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      server.close(() => done(state));
+    };
+    const timer = setTimeout(() => finish("unverified"), 2000);
+    server.once("error", (error) =>
+      finish(error?.code === "EADDRINUSE" ? "occupied" : "unverified"),
+    );
+    server.once("listening", () => finish("available"));
+    server.listen({
+      host: target.hostname.replace(/^\[|\]$/g, ""),
+      port,
+      exclusive: true,
+    });
+  });
+}
+async function readOriginPlan(path) {
+  const limit = 64 * 1024;
+  const file = await open(
+    path,
+    constants.O_RDONLY | (constants.O_NONBLOCK ?? 0),
+  );
+  try {
+    const info = await file.stat();
+    check(
+      info.isFile() && info.size <= limit,
+      "Use an origin plan file of at most 64 KiB",
+    );
+    const chunks = [];
+    for await (const chunk of file.createReadStream({
+      end: limit,
+      autoClose: false,
+    })) {
+      chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+    check(bytes.length <= limit, "Use an origin plan file of at most 64 KiB");
+    return validateOriginPlan(JSON.parse(bytes.toString("utf8")));
+  } finally {
+    await file.close();
+  }
+}
+async function doctorOrigin(file, portProbe) {
+  const plan = await readOriginPlan(file);
+  const statuses = {
+    port: await portProbe(plan.frontend),
+    callback: !plan.callbackEvidence
+      ? "unverified"
+      : plan.callbacks.every((value) => plan.callbackEvidence.includes(value))
+        ? "allowed"
+        : "missing",
+    "upload-origin": !plan.uploadEvidence
+      ? "unverified"
+      : plan.uploadEvidence.includes(plan.frontend)
+        ? "allowed"
+        : "rejected",
+  };
+  const values = Object.values(statuses);
+  const state = values.every((value) =>
+    ["available", "allowed"].includes(value),
+  )
+    ? "READY"
+    : values.some((value) =>
+          ["occupied", "missing", "rejected"].includes(value),
+        )
+      ? "BLOCKED"
+      : "UNVERIFIED";
+  // Fixed statuses and the selected origin only: never lists, paths or errors.
+  console.log(
+    [
+      `doctor origin: ${state}`,
+      `origin: ${plan.frontend}`,
+      ...Object.entries(statuses).map(([name, value]) => `${name}: ${value}`),
+      "- membership is relative to the operator-verified Development lists in the plan; no provider was contacted",
+      "- port availability is point-in-time; another process can bind it before serve",
+    ].join("\n"),
+  );
+  return state === "READY" ? 0 : 2;
+}
+
 async function writeJson(path, data) {
   const temp = `${path}.tmp`;
   await writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
   await rename(temp, path);
 }
-async function sessionDir(root, session, create = false) {
-  check(/^[a-z0-9][a-z0-9-]{0,47}$/.test(session), "Invalid session name");
+async function artifactsBase(root) {
   const base = join(root, ".artifacts", "desktop-qa");
   const artifacts = join(root, ".artifacts");
   await mkdir(artifacts, { recursive: true, mode: 0o700 });
   await inside(root, artifacts);
   await mkdir(base, { recursive: true, mode: 0o700 });
   await inside(root, base);
+  return base;
+}
+async function sessionDir(root, session, create = false) {
+  check(SLUG.test(session), "Invalid session name");
+  const base = await artifactsBase(root);
   const dir = join(base, session);
   if (create) await mkdir(dir, { mode: 0o700 }); // Exclusive: never adopt another session.
   check(
@@ -224,6 +438,290 @@ async function sessionDir(root, session, create = false) {
     "Session aliases are not allowed",
   );
   return inside(base, dir);
+}
+async function dependencyGuard(root) {
+  const guard = spawn(
+    process.execPath,
+    [join(root, "scripts/verify-local-dependencies.mjs")],
+    { cwd: root, stdio: "ignore" },
+  );
+  return new Promise((done) => {
+    guard.on("exit", (code) => done(code === 0));
+    guard.on("error", () => done(false));
+  });
+}
+
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+const git = (root, args) =>
+  execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+function cleanCheckout(root) {
+  try {
+    const commit = git(root, ["rev-parse", "HEAD"]).trim();
+    check(/^[a-f0-9]{40,64}$/.test(commit), "Unknown commit");
+    if (
+      git(root, [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+      ]).length > 0
+    )
+      return { unavailable: "source checkout has uncommitted changes" };
+    return { commit };
+  } catch {
+    return { unavailable: "source commit unknown" };
+  }
+}
+
+async function frontendBuildId(root) {
+  try {
+    const file = await inside(root, join(root, ".next", "BUILD_ID"));
+    const info = await stat(file);
+    if (info.isFile() && info.size > 0 && info.size <= 4096)
+      return await readFile(file);
+  } catch {
+    // A missing or unreadable build cannot support reuse.
+  }
+  return null;
+}
+
+/**
+ * Local-only receipt key for one case, based on the current executable bytes.
+ * Returns { fingerprint } or { unavailable: reason }; never contacts a provider.
+ */
+async function receiptIdentity(
+  root,
+  config,
+  name,
+  verifyExecutable = verifyApp,
+) {
+  if (!config.reuse) return { unavailable: "config has no reuse identity" };
+  const checkout = cleanCheckout(root);
+  if (!checkout.commit) return checkout;
+  const buildId = await frontendBuildId(root);
+  if (!buildId) return { unavailable: "frontend .next/BUILD_ID missing" };
+
+  // Capture a stable checkout and frontend build around executable hashing.
+  await verifyExecutable(root, config.app);
+  const currentBuildId = await frontendBuildId(root);
+  check(
+    currentBuildId?.equals(buildId),
+    "frontend build changed during verification; rerun preflight",
+  );
+  check(
+    cleanCheckout(root).commit === checkout.commit,
+    "source checkout changed during verification; rerun preflight",
+  );
+  // validateConfig fixes key order, so this serialization is canonical.
+  const identity = {
+    version: 1,
+    case: name,
+    config,
+    executableSha256: config.app.sha256,
+    checkoutCommit: checkout.commit,
+    host: {
+      name: hostname(),
+      platform: platform(),
+      arch: arch(),
+      release: release(),
+    },
+    frontendBuildIdSha256: sha256(buildId),
+    revisions: config.reuse,
+  };
+  return { fingerprint: sha256(JSON.stringify(identity)) };
+}
+
+const OUTCOMES = ["pass", "fail", "blocked"];
+// `.receipts` cannot collide with a session name, which must start with [a-z0-9].
+async function receiptFile(root, name, create) {
+  const base = create
+    ? await artifactsBase(root)
+    : await inside(root, join(root, ".artifacts", "desktop-qa"));
+  const dir = join(base, ".receipts");
+  if (create) await mkdir(dir, { recursive: true, mode: 0o700 });
+  check(
+    !(await lstat(dir)).isSymbolicLink(),
+    "Receipt store aliases are not allowed",
+  );
+  return join(await inside(base, dir), `${name}.json`);
+}
+/** Latest operator-observed outcome for one case, null if none, or { invalid }. */
+async function readReceipt(root, name) {
+  let file;
+  try {
+    const path = await receiptFile(root, name, false);
+    // A pre-open check also rejects aliases on Windows, where O_NOFOLLOW
+    // may be unavailable. O_NONBLOCK bounds a replaced FIFO on Unix.
+    if (!(await lstat(path)).isFile()) return { invalid: true };
+    file = await open(
+      path,
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0),
+    );
+  } catch (error) {
+    return error.code === "ENOENT" ? null : { invalid: true };
+  }
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 4096) return { invalid: true };
+    const value = JSON.parse(await file.readFile("utf8"));
+    const valid =
+      value.version === 1 &&
+      value.source === "operator-observed" &&
+      value.case === name &&
+      OUTCOMES.includes(value.outcome) &&
+      /^[a-f0-9]{64}$/.test(value.fingerprint) &&
+      /^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(value.recordedAt);
+    return valid ? value : { invalid: true };
+  } catch {
+    return { invalid: true };
+  } finally {
+    await file.close();
+  }
+}
+async function writeReceipt(root, name, receipt) {
+  const path = await receiptFile(root, name, true);
+  const temp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  // Exclusive create: never write through an existing file or symlink.
+  const file = await open(temp, "wx", 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(receipt)}\n`);
+    await file.close();
+    await rename(temp, path);
+  } catch (error) {
+    await file.close().catch(() => {});
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+function priorResult(identity, receipt) {
+  if (!identity.fingerprint)
+    return [`reuse: unavailable (${identity.unavailable}); run the case`];
+  const lines = [`fingerprint: ${identity.fingerprint}`];
+  if (!receipt)
+    lines.push("prior result: none for this case; run it, then record-result");
+  else if (receipt.invalid)
+    lines.push("prior result: unreadable receipt; run the case");
+  else if (receipt.outcome !== "pass")
+    lines.push(
+      `prior result: latest ${receipt.outcome.toUpperCase()} for this case; fresh run required`,
+    );
+  else if (receipt.fingerprint !== identity.fingerprint)
+    lines.push(
+      "prior result: PASS for a different identity; fresh run required",
+    );
+  else
+    lines.push(
+      `prior result: PASS recorded ${receipt.recordedAt} for this exact identity (operator-observed); reusable unless the case needs fresh evidence`,
+    );
+  return lines;
+}
+
+const OPERATOR_CHECKS = [
+  "operator checks (not inferred):",
+  "- window/lock: host unlocked; the exact QA app window, not the installed app, is visible to Computer Use",
+  "- account: confirm the signed-in account in the native user menu; listeners and browser logins do not prove WebView or relay auth",
+  "- transport: one harmless Agent command shows the worker run and Desktop sandbox transport",
+  "- gates: collect a new observation whenever the check requires fresh evidence",
+];
+const WEB_GUIDANCE = [
+  "preflight web: use the branch's Vercel Preview in a browser. Nothing local was checked or started.",
+  "- push the branch, wait for its Preview deployment and confirm the deployed commit",
+  "- verify the designated Preview backend and Trigger worker, then complete one harmless Agent request with the Preview test account and confirm it survives reload",
+  "- never fall back to Production; native commands, Desktop transport and Save dialogs need preflight native",
+];
+const WINDOWS_GUIDANCE = [
+  "preflight windows-vm: manual. The host checked nothing; a running VM is not proof it is available to you.",
+  "- ownership: confirm this task owns the VM session and no other task is using it; this command never launches, pauses or signs in",
+  "- sign-in: confirm the guest's signed-in user yourself; record guest architecture and whether the executable is emulated",
+  "- guest-local checks: inside the guest's own worktree run `corepack pnpm desktop:qa preflight native <config.json> <case>`",
+  "- required Windows CI and native acceptance remain separate gates",
+];
+
+async function preflightNative(root, config, name, verify, verifyExecutable) {
+  const report = (state, lines) => {
+    console.log(
+      [`preflight native ${name}: ${state}`, ...lines, ...OPERATOR_CHECKS].join(
+        "\n",
+      ),
+    );
+    return state === "READY" ? 0 : 2;
+  };
+  const local = (reason, extra = []) =>
+    report("BLOCKED", [
+      `reason: ${reason}`,
+      ...extra,
+      "no provider control plane was contacted; fix this and rerun",
+    ]);
+  // Hard local readiness first, so a local blocker never triggers remote reads.
+  try {
+    await verifyApp(root, config.app);
+  } catch (error) {
+    return local(
+      error instanceof QaError
+        ? error.message
+        : "Native executable is missing or not executable",
+    );
+  }
+  if (!(await dependencyGuard(root)))
+    return local(
+      "Dependency guard failed; run pnpm check:local-dependencies in this worktree",
+    );
+  const services = await health(config);
+  const healthLine = `health: frontend=${services.frontend} backend=${services.backend} relay=${services.relay} worker=${services.worker}`;
+  const offlineService = ["backend", "relay"].find(
+    (service) => services[service] === "unreachable",
+  );
+  const localBlocker =
+    services.frontend !== "reachable"
+      ? "Local frontend is not ready (unreachable, HTTP error or redirect)"
+      : offlineService && `Loopback ${offlineService} is not listening`;
+  if (!localBlocker) {
+    try {
+      await verify(config, { root });
+    } catch (error) {
+      return report("BLOCKED", [
+        `reason: ${error instanceof TargetVerificationError ? error.message : "Target verification failed"}`,
+        healthLine,
+        "targets did not verify; prior results are not shown",
+      ]);
+    }
+  }
+  let identity;
+  try {
+    identity = await receiptIdentity(root, config, name, verifyExecutable);
+  } catch (error) {
+    const reason =
+      error instanceof QaError
+        ? error.message
+        : "Native executable no longer available during preflight";
+    return localBlocker
+      ? local(reason, [healthLine])
+      : report("BLOCKED", [`reason: ${reason}`, healthLine]);
+  }
+  const receipt = identity.fingerprint ? await readReceipt(root, name) : null;
+  if (localBlocker) {
+    const details = [healthLine];
+    if (
+      receipt?.outcome === "pass" &&
+      receipt.fingerprint === identity.fingerprint
+    )
+      details.push(
+        `historical PASS: ${receipt.recordedAt} for the same recorded inputs; live readiness remains unverified`,
+      );
+    return local(localBlocker, details);
+  }
+  return report("READY", [
+    healthLine,
+    "targets: backend and worker verified (read-only)",
+    ...priorResult(identity, receipt),
+  ]);
 }
 
 // The live supervisor owns the ChildProcess handle. Stop never signals a PID
@@ -366,21 +864,113 @@ export async function record(dir, runId, runStatus, transport) {
     { mode: 0o600 },
   );
 }
-export async function main(args, root = ROOT) {
+const readConfig = async (file) =>
+  validateConfig(JSON.parse(await readFile(file, "utf8")));
+/**
+ * Returns a process exit code: preflight native and doctor origin return 2
+ * unless READY.
+ * Invalid input and other command failures throw (exit 1 from the CLI).
+ * The injected verifiers let tests control concurrent build and service changes.
+ */
+export async function main(
+  args,
+  root = ROOT,
+  {
+    verify = verifyTargets,
+    verifyExecutable = verifyApp,
+    portProbe = probePort,
+  } = {},
+) {
   const [action, session, configFile, ...rest] = args;
   if (action === "help" || !action) {
     console.log(
-      "desktop:qa doctor <config.json>\ndesktop:qa start <session> <config.json>\ndesktop:qa serve <session> <config.json>\ndesktop:qa status <session>\ndesktop:qa stop <session>\ndesktop:qa record <session> <run_id> <starting|running|completed|canceled|failed|unknown> <desktop|local|cloud|unknown>",
+      "desktop:qa preflight web\ndesktop:qa preflight windows-vm\ndesktop:qa preflight native <config.json> <case>\ndesktop:qa record-result <config.json> <case> <pass|fail|blocked> <fingerprint>\ndesktop:qa verify <config.json>\ndesktop:qa doctor origin <plan.json>\ndesktop:qa doctor <config.json>\ndesktop:qa start <session> <config.json>\ndesktop:qa serve <session> <config.json>\ndesktop:qa status <session>\ndesktop:qa stop <session>\ndesktop:qa record <session> <run_id> <starting|running|completed|canceled|failed|unknown> <desktop|local|cloud|unknown>",
     );
-    return;
+    return 0;
   }
-  if (["doctor", "start", "serve"].includes(action)) {
+  if (action === "preflight") {
+    // Guidance targets read no files and make no network or process calls.
+    if (session === "web") {
+      console.log(WEB_GUIDANCE.join("\n"));
+      return 0;
+    }
+    if (session === "windows-vm") {
+      console.log(WINDOWS_GUIDANCE.join("\n"));
+      return 0;
+    }
+    check(
+      session === "native" && rest.length <= 1,
+      "Usage: desktop:qa preflight <web|windows-vm|native <config.json> <case>>",
+    );
+    const name = caseName(rest[0]);
+    return preflightNative(
+      root,
+      await readConfig(configFile),
+      name,
+      verify,
+      verifyExecutable,
+    );
+  }
+  if (action === "record-result") {
+    const [, file, rawCase, outcome, fingerprint] = args;
+    const name = caseName(rawCase);
+    check(OUTCOMES.includes(outcome), "Outcome must be pass, fail or blocked");
+    check(
+      typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint),
+      "Expected the 64-character fingerprint printed by preflight native",
+    );
+    const config = await readConfig(file);
+    // Recompute locally; recording never repeats provider reads.
+    const identity = await receiptIdentity(root, config, name);
+    check(
+      identity.fingerprint,
+      `Result reuse is unavailable (${identity.unavailable}); nothing was recorded`,
+    );
+    check(
+      identity.fingerprint === fingerprint,
+      "Fingerprint does not match this case and current local identity; rerun preflight native. Nothing was recorded",
+    );
+    await writeReceipt(root, name, {
+      version: 1,
+      source: "operator-observed",
+      case: name,
+      outcome,
+      fingerprint,
+      recordedAt: new Date().toISOString(),
+    });
+    console.log(
+      `Recorded operator-observed ${outcome.toUpperCase()} for case ${name}.`,
+    );
+    return 0;
+  }
+  if (action === "doctor" && session === "origin") {
+    check(
+      configFile && rest.length === 0,
+      "Usage: desktop:qa doctor origin <plan.json>",
+    );
+    return doctorOrigin(configFile, portProbe);
+  }
+  if (["verify", "doctor", "start", "serve"].includes(action)) {
     const config = validateConfig(
       JSON.parse(
-        await readFile(action === "doctor" ? session : configFile, "utf8"),
+        await readFile(
+          ["verify", "doctor"].includes(action) ? session : configFile,
+          "utf8",
+        ),
       ),
     );
+    if (action === "verify") {
+      console.log(JSON.stringify(await verify(config, { root }), null, 2));
+      return;
+    }
+    if (action === "serve")
+      check(
+        loopback(config.frontend) &&
+          new URL(config.frontend).protocol === "http:",
+        "serve requires an HTTP loopback frontend",
+      );
     const executable = await verifyApp(root, config.app);
+    const verifiedTargets = await verify(config, { root });
     const report = {
       capturedAt: new Date().toISOString(),
       host: hostname(),
@@ -393,6 +983,7 @@ export async function main(args, root = ROOT) {
       }).trim(),
       nativeExecutableSha256: config.app.sha256,
       declaredIdentity: config,
+      verifiedTargets,
       identityCaveat:
         "Configured identities are operator supplied; verify the loaded native frontend and actual backend/worker/transport through Computer Use.",
       health: await health(config),
@@ -407,26 +998,13 @@ export async function main(args, root = ROOT) {
           report.health.frontend !== "http-error-or-redirect",
         "Local frontend is not ready; finish startup before native acceptance",
       );
-    const guard = spawn(
-      process.execPath,
-      [join(root, "scripts/verify-local-dependencies.mjs")],
-      { cwd: root, stdio: "ignore" },
-    );
-    const valid = await new Promise((done) => {
-      guard.on("exit", (code) => done(code === 0));
-      guard.on("error", () => done(false));
-    });
     check(
-      valid,
+      await dependencyGuard(root),
       "Dependency guard failed; run pnpm check:local-dependencies in this worktree",
     );
     let command = executable;
     let commandArgs = [];
     if (action === "serve") {
-      check(
-        config.environment === "local",
-        "serve only starts a prebuilt local frontend",
-      );
       const buildId = await readFile(join(root, ".next/BUILD_ID"), "utf8");
       report.frontendBuildIdSha256 = createHash("sha256")
         .update(buildId)
@@ -447,11 +1025,15 @@ export async function main(args, root = ROOT) {
     console.log(
       `QA session: ${session}. Diagnostics: .artifacts/desktop-qa/${session}`,
     );
+    const childEnv = { ...process.env };
+    delete childEnv.CONVEX_ACCESS_TOKEN;
+    delete childEnv.TRIGGER_ACCESS_TOKEN;
     const state = await supervise({
       command,
       args: commandArgs,
       cwd: root,
       dir,
+      env: childEnv,
     });
     check(
       state !== "failed",
@@ -508,13 +1090,18 @@ if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
-  main(process.argv.slice(2)).catch((error) => {
-    // Do not echo filesystem/network/JSON parse errors: they can contain input values.
-    console.error(
-      error instanceof QaError
-        ? error.message
-        : "Desktop QA command failed. Check the documented schema, build hash, dependency guard, frontend readiness and session status. No credentials or raw child logs were collected.",
-    );
-    process.exitCode = 1;
-  });
+  main(process.argv.slice(2)).then(
+    (code) => {
+      if (typeof code === "number") process.exitCode = code;
+    },
+    (error) => {
+      // Do not echo filesystem/network/JSON parse errors: they can contain input values.
+      console.error(
+        error instanceof QaError || error instanceof TargetVerificationError
+          ? error.message
+          : "Desktop QA command failed. Check the documented schema, build hash, dependency guard, frontend readiness and session status. No credentials or raw child logs were collected.",
+      );
+      process.exitCode = 1;
+    },
+  );
 }

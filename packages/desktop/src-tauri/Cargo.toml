@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "HackerAI Desktop Application"
 authors = ["HackerAI"]
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.90"
 
 [lib]
 name = "hackerai_desktop_lib"
@@ -15,14 +15,14 @@ name = "hackerai-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2.12", features = [] }
 tauri-plugin-os = "2"
 tauri-plugin-process = "2"
 tauri-plugin-shell = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = "2.14.1"
 tauri-plugin-deep-link = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
@@ -36,6 +36,14 @@ tokio = { version = "1", features = ["time", "net", "io-util", "process", "sync"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
+# reqwest's own default-tls backend; used only to recognize its error type.
+native-tls = "=0.2.14"
+# The Layer and Service traits reqwest's tower re-exports, at their locked versions.
+tower-layer = "=0.3.3"
+tower-service = "=0.3.3"
+os_info = "3.14"
+gethostname = "1.1"
+sha2 = "0.10"
 portable-pty = "0.8"
 cap-std = "3.4.5"
 cap-fs-ext = "3.4.5"
@@ -43,9 +51,48 @@ cap-fs-ext = "3.4.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Already linked through wry at this exact version; used directly only to
+# observe web process termination. Keep it pinned with Tauri's wry.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+# Agent input notifications on Windows and Linux. The webview gets no plugin
+# permissions; only the two app commands in notifications.rs reach it.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-notification = "=2.8.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Win32 features own each streamed command's private Job Object
+# (windows_stream_job.rs); Win32_Security only types CreateJobObjectW's
+# optional security attributes.
+windows = { version = "=0.62.2", features = [
+  "UI_Notifications",
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-web-kit = { version = "0.2", features = ["WKWebView", "WKNavigation", "objc2-app-kit"] }
+# Agent input notifications use the 0.6 family already locked through Tauri.
+# Renamed so the existing objc2 0.5 web view code keeps its import path.
+objc2_06 = { package = "objc2", version = "0.6" }
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "UNNotification",
+  "UNNotificationContent",
+  "UNNotificationRequest",
+  "UNNotificationResponse",
+  "UNNotificationSettings",
+  "UNNotificationTrigger",
+  "UNUserNotificationCenter",
+] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

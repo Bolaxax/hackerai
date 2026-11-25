@@ -2,6 +2,18 @@ import { act, render, screen } from "@testing-library/react";
 import { useState, type ComponentProps } from "react";
 import { useAuthFromAuthKit, type AuthKitDeps } from "../use-auth-from-authkit";
 import { CrossTabMutex } from "../cross-tab-mutex";
+import {
+  readClosedConvexAuthTokenDecision,
+  readConvexAuthProviderState,
+  readConvexAuthTokenDecision,
+} from "../convex-auth-diagnostics";
+
+function tokenDecision() {
+  const { attempt: _attempt, ...fields } = readClosedConvexAuthTokenDecision(
+    readConvexAuthTokenDecision,
+  );
+  return fields;
+}
 
 // Bypass the repository's convex/react mock: the regression is specifically
 // about the real provider's effects after its backend reports auth failure.
@@ -43,6 +55,8 @@ describe("auth recovery through ConvexProviderWithAuth", () => {
       if (ended) user = null;
     });
     deps = {
+      // The refresh lifecycle tests use opaque token labels.
+      matchesToken: () => true,
       useAuth: (() => ({
         user,
         loading: false,
@@ -312,5 +326,222 @@ describe("auth recovery through ConvexProviderWithAuth", () => {
     getAccessToken.mockResolvedValue(token);
     await act(async () => view.rerender(renderApp()));
     expect(observations.at(-1)?.isAuthenticated).toBe(true);
+  });
+
+  it("never authenticates Convex with a previous account's stored token", async () => {
+    delete deps.matchesToken;
+    // Synthetic, unsigned tokens: only their claims are read on the client.
+    const base64url = (value: object) =>
+      btoa(JSON.stringify(value))
+        .replace(/=+$/, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_");
+    const jwt = (claims: object) =>
+      `${base64url({ alg: "RS256", typ: "JWT" })}.${base64url(claims)}.sig`;
+    const previousAccount = jwt({ sub: "user-0", sid: "session-0" });
+    const currentAccount = jwt({ sub: "user-1", sid: "session-1" });
+    // AuthKit's store still holds the previous sign-in's token; its
+    // session check then loads the current session's token.
+    token = previousAccount;
+    refreshAuth.mockImplementation(async () => {
+      token = currentAccount;
+    });
+    const returned: Array<string | null> = [];
+    client.setAuth = jest.fn((fetch, onChange) => {
+      fetchToken = fetch;
+      reportAuth = onChange;
+      void fetch({ forceRefreshToken: false }).then((value) => {
+        returned.push(value);
+        onChange(Boolean(value));
+      });
+    });
+
+    // Refused first; recovery's session check then loads this session's
+    // token and Convex re-registers with it.
+    await act(async () => render(renderApp()));
+    await act(async () => jest.advanceTimersByTimeAsync(10_000));
+    expect(returned[0]).toBeNull();
+    expect(refreshAuth).toHaveBeenCalledWith();
+    expect(observations.at(-1)?.isAuthenticated).toBe(true);
+    expect(screen.queryByText("Signed out")).not.toBeInTheDocument();
+    expect(returned).not.toContain(previousAccount);
+    expect(returned.at(-1)).toBe(currentAccount);
+    expect(
+      observations.some((state) => !state.isLoading && !state.isAuthenticated),
+    ).toBe(false);
+  });
+
+  describe("committed provider state behind Convex loading", () => {
+    it("attributes recovery loading to token recovery, then readiness", async () => {
+      const view = await act(async () => render(renderApp()));
+      expect(observations.at(-1)?.isAuthenticated).toBe(true);
+      expect(readConvexAuthProviderState()).toBe("ready");
+
+      await loseConnection();
+      expect(observations.at(-1)?.isLoading).toBe(true);
+      expect(readConvexAuthProviderState()).toBe("token_recovery");
+
+      offline = false;
+      token = "fresh-token";
+      await act(async () => view.rerender(renderApp()));
+      expect(observations.at(-1)?.isAuthenticated).toBe(true);
+      expect(readConvexAuthProviderState()).toBe("ready");
+
+      view.unmount();
+      expect(readConvexAuthProviderState()).toBe("unavailable");
+    });
+
+    it("attributes initial loading to AuthKit", async () => {
+      const useAuth = deps.useAuth;
+      deps.useAuth = (() => ({
+        ...useAuth(),
+        loading: true,
+      })) as AuthKitDeps["useAuth"];
+      const view = await act(async () => render(renderApp()));
+      expect(observations.at(-1)?.isLoading).toBe(true);
+      expect(readConvexAuthProviderState()).toBe("authkit_loading");
+      view.unmount();
+    });
+
+    it("records the token decisions behind recovery loading", async () => {
+      const view = await act(async () => render(renderApp()));
+      expect(tokenDecision()).toMatchObject({
+        mode: "ordinary",
+        outcome: "token",
+        context: "same",
+      });
+
+      await loseConnection();
+      expect(readConvexAuthProviderState()).toBe("token_recovery");
+      // The forced refresh failed; the provider's re-registration during
+      // recovery loading may fetch again, and that offline fetch fails too.
+      expect(tokenDecision()).toMatchObject({
+        outcome: "exception_fallback",
+        context: "same",
+      });
+
+      offline = false;
+      token = "fresh-token";
+      await act(async () => jest.advanceTimersByTimeAsync(10_000));
+      expect(observations.at(-1)?.isAuthenticated).toBe(true);
+      // Convex re-registers auth after recovery; any later ordinary fetch is
+      // the latest decision, and recovery itself must have succeeded first.
+      expect(tokenDecision()).toMatchObject({
+        outcome: "token",
+        context: "same",
+      });
+      expect(JSON.stringify(readConvexAuthTokenDecision())).not.toContain(
+        "fresh-token",
+      );
+      view.unmount();
+      expect(readConvexAuthTokenDecision()).toBeUndefined();
+    });
+
+    it("reports a recovery result discarded after sign-out as superseded", async () => {
+      const view = await act(async () => render(renderApp()));
+      await loseConnection();
+      let resolveRecovery!: (token: string) => void;
+      getAccessToken.mockImplementation(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveRecovery = resolve;
+          }),
+      );
+      await act(async () => jest.advanceTimersByTimeAsync(10_000));
+      expect(tokenDecision()).toMatchObject({
+        mode: "recovery",
+        outcome: "pending",
+        context: "same",
+      });
+
+      user = null;
+      token = undefined;
+      await act(async () => view.rerender(renderApp()));
+      await act(async () => resolveRecovery("late-token"));
+      expect(screen.getByText("Signed out")).toBeInTheDocument();
+      expect(tokenDecision()).toMatchObject({
+        mode: "recovery",
+        outcome: "context_superseded",
+        result: "no_result",
+        context: "superseded",
+      });
+      view.unmount();
+    });
+
+    async function enterPendingRecovery() {
+      const view = await act(async () => render(renderApp()));
+      await loseConnection();
+      let rejectRecovery!: (error: Error) => void;
+      getAccessToken.mockImplementation(
+        () =>
+          new Promise<string>((_resolve, reject) => {
+            rejectRecovery = reject;
+          }),
+      );
+      await act(async () => jest.advanceTimersByTimeAsync(10_000));
+      expect(tokenDecision()).toMatchObject({
+        mode: "recovery",
+        outcome: "pending",
+        context: "same",
+      });
+      return { view, reject: (error: Error) => rejectRecovery(error) };
+    }
+
+    it("reports a recovery failure after sign-out as superseded without retrying", async () => {
+      const { view, reject } = await enterPendingRecovery();
+      user = null;
+      token = undefined;
+      await act(async () => view.rerender(renderApp()));
+      const attempts = getAccessToken.mock.calls.length;
+      const sessionChecks = refreshAuth.mock.calls.length;
+
+      await act(async () => reject(new Error("Network request timed out")));
+      expect(tokenDecision()).toMatchObject({
+        mode: "recovery",
+        outcome: "context_superseded",
+        result: "no_result",
+        context: "superseded",
+      });
+      await act(async () => jest.advanceTimersByTimeAsync(30_000));
+      expect(getAccessToken).toHaveBeenCalledTimes(attempts);
+      expect(refreshAuth).toHaveBeenCalledTimes(sessionChecks);
+      expect(screen.getByText("Signed out")).toBeInTheDocument();
+      expect(observations.at(-1)).toMatchObject({
+        isLoading: false,
+        isAuthenticated: false,
+      });
+      view.unmount();
+    });
+
+    it("keeps an active recovery failure as an exception and still retries", async () => {
+      const { view, reject } = await enterPendingRecovery();
+      const attempts = getAccessToken.mock.calls.length;
+
+      await act(async () => reject(new Error("Network request timed out")));
+      expect(tokenDecision()).toMatchObject({
+        mode: "recovery",
+        outcome: "exception_fallback",
+        result: "no_result",
+        context: "same",
+      });
+      expect(observations.at(-1)?.isLoading).toBe(true);
+      expect(screen.queryByText("Signed out")).not.toBeInTheDocument();
+
+      await act(async () => jest.advanceTimersByTimeAsync(10_000));
+      expect(getAccessToken).toHaveBeenCalledTimes(attempts + 1);
+      view.unmount();
+    });
+
+    it("reports provider readiness while Convex confirmation is pending", async () => {
+      // The backend has not confirmed the token yet; neither provider boolean
+      // holds Convex in loading.
+      client.setAuth = jest.fn((fetch) => {
+        fetchToken = fetch;
+      });
+      const view = await act(async () => render(renderApp()));
+      expect(observations.at(-1)?.isLoading).toBe(true);
+      expect(readConvexAuthProviderState()).toBe("ready");
+      view.unmount();
+    });
   });
 });

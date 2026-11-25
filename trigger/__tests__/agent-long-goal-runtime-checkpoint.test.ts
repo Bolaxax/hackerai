@@ -1,0 +1,290 @@
+import fs from "node:fs";
+import path from "node:path";
+import ts from "typescript";
+import { createActiveRuntimeBudget } from "@/lib/chat/active-runtime-budget";
+import {
+  createAgentRuntimeCheckpoint,
+  resolveAgentRuntimeCheckpointEnabled,
+} from "@/lib/chat/agent-runtime-checkpoint";
+
+// Execute the worker's actual claim and runtime setup, with remote I/O faked.
+// This catches wiring regressions without loading the Trigger SDK/services.
+const source = ts.createSourceFile(
+  "agent-long.ts",
+  fs.readFileSync(path.resolve(__dirname, "../agent-long.ts"), "utf8"),
+  ts.ScriptTarget.Latest,
+  true,
+);
+const statements = new Map<string, string>();
+let claim: string | undefined;
+function visit(node: ts.Node) {
+  if (ts.isVariableStatement(node)) {
+    for (const declaration of node.declarationList.declarations) {
+      const name = declaration.name.getText(source);
+      if (
+        [
+          "taskStartTime",
+          "taskStartMonotonicMs",
+          "agentLongMaxDurationMs",
+          "activeGoal",
+          "runtimeBudget",
+          "[runtimeCheckpointEnabled, limitWrapUpEnabled]",
+          "runtimeCheckpoint",
+        ].includes(name)
+      )
+        statements.set(name, node.getText(source));
+    }
+  }
+  if (
+    ts.isIfStatement(node) &&
+    node.expression.getText(source) ===
+      "payload.goalGeneration !== undefined" &&
+    node.thenStatement.getText(source).includes("goalApi.agentGoals.claimRun")
+  )
+    claim = node.getText(source);
+  ts.forEachChild(node, visit);
+}
+visit(source);
+if (!claim || statements.size !== 7)
+  throw new Error("Worker goal/runtime setup not found");
+const body = ts.transpileModule(
+  `return (async () => {
+    ${statements.get("taskStartTime")}
+    ${statements.get("taskStartMonotonicMs")}
+    ${statements.get("agentLongMaxDurationMs")}
+    ${statements.get("activeGoal")}
+    ${claim}
+    ${statements.get("runtimeBudget")}
+    ${statements.get("[runtimeCheckpointEnabled, limitWrapUpEnabled]")}
+    ${statements.get("runtimeCheckpoint")}
+    return { agentLongMaxDurationMs, runtimeBudget, runtimeCheckpoint };
+  })();`,
+  { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+).outputText;
+
+async function setup({
+  goal = false,
+  isAutoContinue = false,
+  isAutomaticContinuation = false,
+  claimed = true,
+  enabled = true,
+  wrapUpEnabled = null as boolean | null,
+  maxDurationMs = 1000,
+  duringClaim = () => {},
+} = {}) {
+  const exposed = jest.fn();
+  const abort = jest.fn();
+  const flags: Record<string, boolean | null> = {
+    "agent-runtime-checkpoint-v1": enabled,
+    "agent-limit-wrapup-v1": wrapUpEnabled,
+  };
+  const decision = jest.fn(async (flagKey: string) => flags[flagKey] ?? null);
+  const mutation = jest.fn(async () => {
+    duringClaim();
+    return claimed ? { generation: 2, state: "running" } : null;
+  });
+  const deps = {
+    payload: goal ? { goalGeneration: 2 } : {},
+    isAutoContinue,
+    isAutomaticContinuation,
+    goalConvex: () => ({ mutation }),
+    goalApi: { agentGoals: { claimRun: "claimRun" } },
+    goalServiceKey: () => "test-service-key",
+    approvalSessionId: undefined,
+    goalClaimed: false,
+    captureGoalLifecycle: jest.fn(async () => {}),
+    assertGoalExecutionAllowed: jest.fn(async () => {}),
+    createActiveRuntimeBudget,
+    createAgentRuntimeCheckpoint,
+    resolveAgentRuntimeCheckpointEnabled,
+    getPostHogBooleanFlagDecisionForUser: decision,
+    AGENT_RUNTIME_CHECKPOINT_FLAG: "agent-runtime-checkpoint-v1",
+    AGENT_LIMIT_WRAPUP_FLAG: "agent-limit-wrapup-v1",
+    getAgentLongMaxDurationMs: () => maxDurationMs,
+    // Keep the former cap available so restoring it fails the duration assertion.
+    GOAL_SLICE_MS: 20 * 60 * 1000,
+    subscription: "pro",
+    markAgentLongDurationExceeded: jest.fn(),
+    runtimeSettlementWatchdog: undefined,
+    stopSignal: { abort },
+    userStopSignal: new AbortController(),
+    triggerLogger: { warn: jest.fn() },
+    ctx: { run: { id: "run-test" } },
+    chatId: "chat-test",
+    userId: "user-test",
+    assistantMessageId: "message-test",
+    AGENT_LONG_CLEANUP_GRACE_MS: 100,
+    terminalAgentState: undefined,
+    phLogger: { event: exposed },
+  };
+  const result = await new Function(...Object.keys(deps), body)(
+    ...Object.values(deps),
+  );
+  return { ...result, exposed, abort, decision, mutation };
+}
+
+const nearLimits = {
+  completedSteps: 450,
+  maxSteps: 500,
+  budgetUsedPercent: 95,
+};
+
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+
+it.each([
+  ["ordinary Agent", false],
+  ["Goal", true],
+] as const)("gives %s the plan runtime", async (_, goal) => {
+  const planDurationMs = 6 * 60 * 60 * 1000;
+  const run = await setup({ goal, maxDurationMs: planDurationMs });
+  try {
+    expect(run.agentLongMaxDurationMs).toBe(planDurationMs);
+    expect(run.abort).not.toHaveBeenCalled();
+  } finally {
+    run.runtimeBudget.dispose();
+  }
+});
+
+it("counts setup time toward the hard stop across a wall-clock change", async () => {
+  const run = await setup({
+    goal: true,
+    duringClaim: () => {
+      jest.advanceTimersByTime(250);
+      jest.setSystemTime(Date.now() + 90_000);
+    },
+  });
+  try {
+    expect(run.runtimeBudget.getElapsedTimeMs()).toBe(250);
+    jest.advanceTimersByTime(749);
+    expect(run.abort).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(run.abort).toHaveBeenCalledWith("active_runtime_budget");
+  } finally {
+    run.runtimeBudget.dispose();
+  }
+});
+
+it.each([
+  ["initial", false, false],
+  ["resumed", false, false],
+  ["automatic continuation", true, true],
+] as const)(
+  "excludes a claimed %s goal without changing its hard runtime stop",
+  async (_, isAutoContinue, isAutomaticContinuation) => {
+    const run = await setup({
+      goal: true,
+      isAutoContinue,
+      isAutomaticContinuation,
+      wrapUpEnabled: true,
+    });
+    try {
+      expect(run.mutation).toHaveBeenCalledWith(
+        "claimRun",
+        expect.objectContaining({ generation: 2, runId: "run-test" }),
+      );
+      jest.advanceTimersByTime(900);
+      expect(run.runtimeCheckpoint?.takeNotice(nearLimits)).toBeUndefined();
+      run.runtimeCheckpoint?.recordExposure();
+      expect(run.decision).not.toHaveBeenCalled();
+      expect(run.exposed).not.toHaveBeenCalled();
+      expect(run.abort).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(100);
+      expect(run.abort).toHaveBeenCalledWith("active_runtime_budget");
+      expect(run.runtimeCheckpoint?.takeNotice()).toBeUndefined();
+    } finally {
+      run.runtimeBudget.dispose();
+    }
+  },
+);
+
+it.each([false, true])(
+  "preserves ordinary Agent warning eligibility (continuation=%s)",
+  async (continuation) => {
+    const run = await setup({
+      isAutoContinue: continuation,
+      isAutomaticContinuation: continuation,
+    });
+    try {
+      expect(run.mutation).not.toHaveBeenCalled();
+      expect(run.decision.mock.calls.map(([flagKey]) => flagKey)).toEqual([
+        "agent-runtime-checkpoint-v1",
+        "agent-limit-wrapup-v1",
+      ]);
+      jest.advanceTimersByTime(899);
+      expect(run.runtimeCheckpoint.takeNotice()).toBeUndefined();
+      jest.advanceTimersByTime(1);
+      expect(run.runtimeCheckpoint.takeNotice()).toContain(
+        "<agent_runtime_checkpoint>",
+      );
+      run.runtimeCheckpoint.recordExposure();
+      expect(run.exposed).toHaveBeenCalledTimes(1);
+      expect(run.runtimeCheckpoint.takeNotice()).toBeUndefined();
+      jest.advanceTimersByTime(100);
+      expect(run.abort).toHaveBeenCalledWith("active_runtime_budget");
+    } finally {
+      run.runtimeBudget.dispose();
+    }
+  },
+);
+
+it("keeps a disabled ordinary assignment silent", async () => {
+  const run = await setup({ enabled: false });
+  try {
+    jest.advanceTimersByTime(900);
+    expect(run.runtimeCheckpoint.takeNotice()).toBeUndefined();
+    run.runtimeCheckpoint.recordExposure();
+    expect(run.exposed).not.toHaveBeenCalled();
+  } finally {
+    run.runtimeBudget.dispose();
+  }
+});
+
+it("does not start runtime or checkpoint setup when the goal claim is rejected", async () => {
+  const run = await setup({ goal: true, claimed: false });
+  expect(run.runtimeBudget).toBeUndefined();
+  expect(run.runtimeCheckpoint).toBeUndefined();
+  expect(run.decision).not.toHaveBeenCalled();
+  expect(run.exposed).not.toHaveBeenCalled();
+  expect(jest.getTimerCount()).toBe(0);
+});
+
+it.each([null, false])(
+  "keeps limit wrap-up silent when its assignment is %s",
+  async (wrapUpEnabled) => {
+    const run = await setup({ enabled: false, wrapUpEnabled });
+    try {
+      expect(run.runtimeCheckpoint.takeNotice(nearLimits)).toBeUndefined();
+      run.runtimeCheckpoint.recordExposure();
+      expect(run.exposed).not.toHaveBeenCalled();
+    } finally {
+      run.runtimeBudget.dispose();
+    }
+  },
+);
+
+it("wraps up an assigned ordinary Agent run and reports content-free exposure", async () => {
+  const run = await setup({ enabled: false, wrapUpEnabled: true });
+  try {
+    expect(run.runtimeCheckpoint.takeNotice(nearLimits)).toContain(
+      "<agent_limit_wrapup>",
+    );
+    expect(run.exposed).not.toHaveBeenCalled();
+    run.runtimeCheckpoint.recordExposure();
+    expect(run.exposed).toHaveBeenCalledTimes(1);
+    expect(run.exposed).toHaveBeenCalledWith("agent_limit_wrapup_exposed", {
+      userId: "user-test",
+      trigger_run_id: "run-test",
+      chat_id: "chat-test",
+      flag_key: "agent-limit-wrapup-v1",
+      "$feature/agent-limit-wrapup-v1": true,
+      subscription_tier: "pro",
+      trigger_kind: "usage",
+      step_count_bucket: "450+",
+      budget_pct_bucket: "95-99",
+      $process_person_profile: false,
+    });
+  } finally {
+    run.runtimeBudget.dispose();
+  }
+});

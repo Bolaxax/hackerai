@@ -44,9 +44,12 @@ export type SubagentProfileDefinition = {
 
 const SHARED_SUBAGENT_TOOLS = [
   "run_terminal_cmd",
+  "browser_handoff",
   "interact_terminal_session",
   "get_terminal_files",
   "file",
+  "file_edit",
+  "file_write",
   "todo_write",
   "web_search",
   "open_url",

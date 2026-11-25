@@ -14,6 +14,8 @@ const customJestConfig = {
   workerIdleMemoryLimit: "1GB",
   testEnvironment: "jest-environment-jsdom",
   moduleNameMapper: {
+    // Exercise the real Markdown parser with Jest's CommonJS runtime on Node 20.
+    "^marked$": "<rootDir>/node_modules/marked/lib/marked.umd.js",
     "^jose$": "<rootDir>/__mocks__/jose.ts",
     "^@workos-inc/node$": "<rootDir>/__mocks__/workos-node.ts",
     "^@workos-inc/authkit-nextjs$": "<rootDir>/__mocks__/workos-authkit.ts",
@@ -36,6 +38,8 @@ const customJestConfig = {
     "^@upstash/redis$": "<rootDir>/__mocks__/@upstash/redis.ts",
     "^@upstash/ratelimit$": "<rootDir>/__mocks__/@upstash/ratelimit.ts",
     "^convex/browser$": "<rootDir>/__mocks__/convex/browser.ts",
+    // Real parser, CommonJS build: marked's default entry is ESM-only.
+    "^marked$": "<rootDir>/node_modules/marked/lib/marked.umd.js",
   },
   transformIgnorePatterns: [
     "node_modules/(?!(uuid|@ai-sdk|ai|convex|react-hotkeys-hook|react-markdown|streamdown|remark-.*|unified|bail|is-plain-obj|trough|vfile|unist-.*|mdast-.*|micromark.*|decode-named-character-reference|character-entities|escape-string-regexp|markdown-table|property-information|hast-.*|space-separated-tokens|comma-separated-tokens|zwitch|html-void-elements|ccount|devlop|superjson)/)",

@@ -13,17 +13,36 @@ The skill is versioned in this repository, not a private credential store.
 
 Read the checkout's AGENTS.md and [Desktop acceptance runbook](../../../docs/desktop-local-acceptance.md).
 Use the actual native app for native commands, sandbox transport, or Save dialogs.
-Prefer a verified Vercel Preview for web-only changes. A local native shell can
-load that Preview when its auth, CSP and remote capabilities support it; keep
-those results distinct from a fully local backend/worker test. If a local
-frontend is needed, finish building it before starting acceptance. Avoid another
-watcher or build just to take screenshots.
+Prefer a verified Vercel Preview for web-only changes tested in a browser. For
+native acceptance, build the app against this worktree's loopback frontend;
+the runner rejects hosted origins to avoid Vercel deployment-protection login
+in the native WebView. That local frontend can use verified
+Preview backend/worker/relay services; keep those results distinct from a fully
+local backend/worker test. Finish building the frontend before starting
+acceptance. Avoid another watcher or build just to take screenshots.
 
 For an explicitly authorized Production demo, use the installed Production app
 and verify the signed-in account first. Preserve existing data. Prefer synthetic
 examples labeled **Demo**, with a fictional `.invalid` target and an explicit
 synthetic-evidence disclosure. Do not claim a real vulnerability was verified.
 Do not launch a QA build against Production as a fallback for blocked auth.
+
+## Daily entry point
+
+Pick the surface and case name yourself, then run the matching preflight from
+[the QA runner](../../../docs/desktop-qa-tooling.md#preflight-and-result-reuse):
+
+1. Web-only: `desktop:qa preflight web`, then test the verified Vercel Preview.
+2. Windows VM from a host: `desktop:qa preflight windows-vm` prints manual
+   ownership/sign-in checks; run `preflight native` inside the guest.
+3. Native: `desktop:qa preflight native <config.json> <case>`. Fix any BLOCKED
+   reason (exit 2) and rerun. Confirm the QA window and actual signed-in account
+   before relying on an earlier PASS for the current session. Skip the journey
+   only if the result matches that profile and the case needs no fresh evidence.
+   Otherwise, run the case and verify the actual Desktop transport. If preflight
+   prints a fingerprint, use `desktop:qa record-result` for the observed PASS,
+   FAIL or BLOCKED result. If no fingerprint is available, report the outcome
+   in the QA handoff.
 
 ## Prepare and inspect
 
@@ -34,10 +53,18 @@ native changes. The runner does not install dependencies, build, provision
 Convex, start a worker/relay, or copy credentials. Follow the runbook for those
 operations only when needed.
 
+Use the [safe local diagnostics](../../../docs/safe-local-diagnostics.md) for
+additional process health or browser login state. Do not dump process arguments,
+environments, or full authentication pages. Browser diagnostics do not establish
+native WebView authentication.
+
 Record the tested source revision and binary hash. Independently establish the
-backend account/project/deployment and matching worker environment/branch before
-using external test services. Configured identity and TCP reachability are not
-proof of the backend or worker serving a run. Verify the actual frontend in the
+authorized backend account/project/deployment and matching worker environment/branch.
+Use `desktop:qa verify <config.json>` for read-only provider and live-instance
+checks; `doctor`, `start` and `serve` also enforce them. Missing verification credentials
+or a mismatch blocks launch. The tokens come from the approved environment source,
+never the launch record. Target identity and TCP reachability do not prove the
+backend or worker serving a run. Verify the actual frontend in the
 native WebView, selected account, worker run and sandbox transport.
 
 ## Computer Use navigation

@@ -1,15 +1,34 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { useMutation, useQuery } from "convex/react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+} from "react";
+import { useConvexAuth, useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { SandboxPreference } from "@/types/chat";
 import { toast } from "sonner";
-import type { DesktopSandboxBridge } from "@/app/services/desktop-sandbox-bridge";
-import { isTauriEnvironment } from "@/app/hooks/useTauri";
-import { captureAuthenticatedEvent } from "@/lib/analytics/client";
+import type {
+  DesktopSandboxBridge,
+  NativeAuthFrontendState,
+} from "@/app/services/desktop-sandbox-bridge";
+import {
+  DESKTOP_UPDATE_URL,
+  isTauriEnvironment,
+  openInBrowser,
+} from "@/app/hooks/useTauri";
+import { getDesktopFileFailure } from "@/lib/centrifugo/desktop-file-errors";
+import {
+  captureAuthenticatedEvent,
+  subscribeAuthenticatedAnalytics,
+} from "@/lib/analytics/client";
 import { isEnvironmentPreference } from "@/lib/sandbox/environment";
 import { isUnauthenticatedConvexError } from "@/lib/auth/expected-auth-errors";
+import { DesktopRelayTelemetry } from "@/lib/analytics/desktop-relay";
+import { readConvexAuthProviderState } from "@/lib/auth/convex-auth-diagnostics";
 
 export type DesktopBridgeStatus =
   "idle" | "connecting" | "connected" | "failed";
@@ -41,9 +60,27 @@ let bridgeStateListener:
       environmentId?: string,
     ) => void)
   | null = null;
-const DESKTOP_BRIDGE_RECOVERY_DELAYS_MS = [1_000, 3_000, 8_000, 16_000];
+let bridgeRetryListener: (() => void) | null = null;
+let bridgeStatus: DesktopBridgeStatus = "idle";
+let bridgeEnvironmentId: string | undefined;
+
+function publishBridgeState(
+  active: boolean,
+  status: DesktopBridgeStatus,
+  environmentId?: string,
+): void {
+  bridgeStatus = status;
+  if (environmentId) bridgeEnvironmentId = environmentId;
+  bridgeStateListener?.(active, status, bridgeEnvironmentId);
+}
+
+const DESKTOP_BRIDGE_RECOVERY_DELAYS_MS = [
+  1_000, 3_000, 8_000, 16_000, 30_000, 60_000,
+];
 const DESKTOP_BRIDGE_MAX_RECOVERY_ATTEMPTS = 6;
-const DESKTOP_BRIDGE_STABLE_RESET_MS = 60_000;
+// Brief recoveries during an origin outage must not continually refill the budget.
+const DESKTOP_BRIDGE_STABLE_RESET_MS = 5 * 60_000;
+const DESKTOP_BRIDGE_RESUME_COOLDOWN_MS = 60_000;
 type RecoverableDesktopTerminationReason =
   "connection_not_found" | "connection_inactive" | "transport_disconnected";
 type DesktopBridgeRecoveryReason =
@@ -68,6 +105,18 @@ let bridgeStableResetTimer: ReturnType<typeof setTimeout> | null = null;
 // Only transient failures may be retried on wake/network recovery. Never
 // restart a bridge terminated by an authentication or ownership failure.
 let bridgeRecoveryExhausted = false;
+let bridgeRecoveryPausedOffline = false;
+let bridgeRecoveryResumeAt = 0;
+const bridgeTelemetry = new DesktopRelayTelemetry(captureAuthenticatedEvent);
+// The bridge outlives the consumer that created it, so its auth-stop
+// diagnostics read the latest committed consumer rather than a render closure.
+// Each commit's snapshot object is its owner token for cleanup.
+let nativeAuthFrontendSnapshot: { state: NativeAuthFrontendState } | null =
+  null;
+
+function readNativeAuthFrontendState(): NativeAuthFrontendState {
+  return nativeAuthFrontendSnapshot?.state ?? "unavailable";
+}
 
 function clearBridgeRecovery(resetAttempt: boolean): void {
   if (bridgeRecoveryTimer) {
@@ -100,6 +149,24 @@ export function useSandboxPreference(
     useState<DesktopBridgeStatus>("idle");
   const [desktopBridgeRetryAttempt, setDesktopBridgeRetryAttempt] = useState(0);
   const [desktopEnvironmentId, setDesktopEnvironmentId] = useState<string>();
+
+  const convexAuth = useConvexAuth();
+  const nativeAuthFrontendState: NativeAuthFrontendState = !isAuthenticated
+    ? "owner_absent"
+    : convexAuth.isLoading
+      ? "owner_present_convex_loading"
+      : convexAuth.isAuthenticated
+        ? "owner_present_convex_authenticated"
+        : "owner_present_convex_unauthenticated";
+  useLayoutEffect(() => {
+    const snapshot = { state: nativeAuthFrontendState };
+    nativeAuthFrontendSnapshot = snapshot;
+    return () => {
+      if (nativeAuthFrontendSnapshot === snapshot) {
+        nativeAuthFrontendSnapshot = null;
+      }
+    };
+  }, [nativeAuthFrontendState]);
 
   const [sandboxPreference, setSandboxPreferenceState] =
     useState<SandboxPreference>(() => {
@@ -217,9 +284,16 @@ export function useSandboxPreference(
           reason,
           attempts,
         });
-        clearBridgeRecovery(true);
+        clearBridgeRecovery(false);
         bridgeRecoveryExhausted = true;
-        updateBridgeState(false, "failed");
+        bridgeRecoveryPausedOffline = false;
+        bridgeRecoveryResumeAt = Date.now() + DESKTOP_BRIDGE_RESUME_COOLDOWN_MS;
+        publishBridgeState(false, "failed");
+        return true;
+      }
+      if (navigator.onLine === false) {
+        bridgeRecoveryPausedOffline = true;
+        publishBridgeState(false, "connecting");
         return true;
       }
 
@@ -237,27 +311,34 @@ export function useSandboxPreference(
         attempt,
         delayMs,
       });
-      captureAuthenticatedEvent("desktop_bridge_recovery_scheduled", {
+      bridgeTelemetry.record("desktop_bridge_recovery_scheduled", {
         clientSurface: "desktop_bridge",
         reason,
         attempt,
         delayMs,
       });
-      updateBridgeState(false, "connecting");
+      publishBridgeState(false, "connecting");
       bridgeRecoveryTimer = setTimeout(() => {
         bridgeRecoveryTimer = null;
         if (generation !== bridgeGeneration) return;
         bridgeGeneration += 1;
         bridgeStartPromise = null;
-        setDesktopBridgeRetryAttempt((currentAttempt) => currentAttempt + 1);
+        bridgeRetryListener?.();
       }, delayMs);
       return true;
     };
 
     if (!isAuthenticated || !isTauriEnvironment()) {
       bridgeRecoveryExhausted = false;
+      bridgeRecoveryPausedOffline = false;
+      bridgeRecoveryResumeAt = 0;
+      // Never carry diagnostics from a signed-out user into another session.
+      bridgeTelemetry.reset();
       syncDesktopEnvironmentId(undefined);
       bridgeStateListener = null;
+      bridgeRetryListener = null;
+      bridgeStatus = "idle";
+      bridgeEnvironmentId = undefined;
       bridgeGeneration += 1;
       bridgeStartPromise = null;
       const bridgeToStop = activeBridge;
@@ -271,24 +352,59 @@ export function useSandboxPreference(
     }
 
     bridgeStateListener = updateBridgeState;
+    const requestBridgeRetry = () =>
+      setDesktopBridgeRetryAttempt((attempt) => attempt + 1);
+    bridgeRetryListener = requestBridgeRetry;
 
-    // Already running — just sync bridge active state.
-    if (activeBridge?.getConnectionId()) {
-      syncDesktopEnvironmentId(activeBridge.getEnvironmentId?.());
-      syncBridgeState(true, "connected");
-      // setSandboxPreferenceState(activeBridge.getConnectionId()!);
-      return () => {
-        cancelled = true;
-        if (bridgeStateListener === updateBridgeState) {
-          bridgeStateListener = null;
-        }
-      };
+    // The singleton survives remounts; its events and timers must target the
+    // currently mounted consumer, not the component that first started it.
+    const handleBeforeUnload = () => {
+      bridgeTelemetry.flush();
+      bridgeGeneration += 1;
+      clearBridgeRecovery(true);
+      bridgeStartPromise = null;
+      bridgeStateListener = null;
+      bridgeRetryListener = null;
+      bridgeStatus = "idle";
+      bridgeEnvironmentId = undefined;
+      void activeBridge?.stop();
+      activeBridge = null;
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    const cleanup = () => {
+      cancelled = true;
+      if (bridgeStateListener === updateBridgeState) bridgeStateListener = null;
+      if (bridgeRetryListener === requestBridgeRetry)
+        bridgeRetryListener = null;
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+
+    // A connection ID survives transient transport outages. Preserve the
+    // actual readiness state and any backoff instead of declaring it ready.
+    if (
+      activeBridge?.getConnectionId() ||
+      bridgeRecoveryTimer ||
+      bridgeStatus === "failed" ||
+      bridgeRecoveryExhausted
+    ) {
+      syncDesktopEnvironmentId(
+        bridgeEnvironmentId ?? activeBridge?.getEnvironmentId?.(),
+      );
+      syncBridgeState(bridgeStatus === "connected", bridgeStatus);
+      return cleanup;
     }
+
+    if (navigator.onLine === false) {
+      bridgeRecoveryPausedOffline = true;
+      bridgeStatus = "connecting";
+      syncBridgeState(false, "connecting");
+      return cleanup;
+    }
+    bridgeRecoveryPausedOffline = false;
 
     async function startBridge() {
       const startGeneration = bridgeGeneration;
-      setDesktopBridgeActive(false);
-      setDesktopBridgeStatus("connecting");
+      publishBridgeState(false, "connecting");
       try {
         if (!bridgeStartPromise) {
           const generation = startGeneration;
@@ -299,11 +415,14 @@ export function useSandboxPreference(
                 if (generation !== bridgeGeneration) return null;
 
                 const bridge = new DesktopSandboxBridgeClass({
+                  relayTelemetry: bridgeTelemetry,
                   connectDesktop: (args) => connectDesktopRef.current(args),
                   refreshCentrifugoTokenDesktop: (args) =>
                     refreshTokenRef.current(args),
                   disconnectDesktop: (args) => disconnectRef.current(args),
                   heartbeatDesktop: (args) => heartbeatRef.current(args),
+                  readNativeAuthFrontendState,
+                  readNativeAuthProviderState: readConvexAuthProviderState,
                   onConnectionState: (state, environmentId) => {
                     if (generation !== bridgeGeneration) return;
                     if (state === "connected") {
@@ -313,7 +432,7 @@ export function useSandboxPreference(
                       clearTimeout(bridgeStableResetTimer);
                       bridgeStableResetTimer = null;
                     }
-                    bridgeStateListener?.(
+                    publishBridgeState(
                       state === "connected",
                       state,
                       environmentId,
@@ -324,8 +443,9 @@ export function useSandboxPreference(
                     if (activeBridge === bridge) activeBridge = null;
                     if (!isRecoverableDesktopTermination(reason)) {
                       bridgeRecoveryExhausted = false;
+                      bridgeRecoveryPausedOffline = false;
                       clearBridgeRecovery(true);
-                      bridgeStateListener?.(false, "failed");
+                      publishBridgeState(false, "failed");
                       return;
                     }
                     scheduleBridgeRecovery(reason, generation);
@@ -358,16 +478,36 @@ export function useSandboxPreference(
         const bridge = await bridgeStartPromise;
         if (cancelled || !bridge) return;
 
-        setDesktopBridgeActive(true);
-        setDesktopEnvironmentId(bridge.getEnvironmentId?.());
-        setDesktopBridgeStatus("connected");
+        publishBridgeState(true, "connected", bridge.getEnvironmentId?.());
       } catch (error) {
         if (cancelled) return;
+        if (getDesktopFileFailure(error) === "native_ipc_denied") {
+          bridgeRecoveryExhausted = false;
+          bridgeRecoveryPausedOffline = false;
+          clearBridgeRecovery(true);
+          publishBridgeState(false, "failed");
+          toast.error("HackerAI Desktop can't access files", {
+            id: "desktop-file-access-denied",
+            duration: 20_000,
+            description:
+              "Install the latest version, then fully quit and reopen the app. If it still fails, contact support.",
+            action: {
+              label: "Download update",
+              onClick: () => {
+                void openInBrowser(DESKTOP_UPDATE_URL).then((opened) => {
+                  if (!opened) window.location.href = DESKTOP_UPDATE_URL;
+                });
+              },
+            },
+          });
+          return;
+        }
         if (isUnauthenticatedConvexError(error)) {
           // Registration can reject before the bridge has a connection to
           // terminate. Match the heartbeat/token path: wait for an explicit
           // retry or a fresh sign-in instead of retrying the same auth failure.
           bridgeRecoveryExhausted = false;
+          bridgeRecoveryPausedOffline = false;
           clearBridgeRecovery(true);
         } else {
           if (bridgeRecoveryTimer) {
@@ -378,8 +518,7 @@ export function useSandboxPreference(
           if (scheduleBridgeRecovery("startup_failed", startGeneration)) return;
         }
         console.error("[DesktopSandboxBridge] Failed to start:", error);
-        setDesktopBridgeActive(false);
-        setDesktopBridgeStatus("failed");
+        publishBridgeState(false, "failed");
         toast.error("Desktop sandbox failed to connect.", {
           description: "Retry the local connection to use Agent mode.",
         });
@@ -388,31 +527,21 @@ export function useSandboxPreference(
 
     startBridge();
 
-    // Cleanup on beforeunload (page close/refresh)
-    const handleBeforeUnload = () => {
-      bridgeGeneration += 1;
-      clearBridgeRecovery(true);
-      bridgeStartPromise = null;
-      bridgeStateListener = null;
-      try {
-        activeBridge?.stop();
-      } catch {
-        // Best-effort
-      }
-      activeBridge = null;
-    };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-
-    return () => {
-      cancelled = true;
-      if (bridgeStateListener === updateBridgeState) {
-        bridgeStateListener = null;
-      }
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      // Don't tear down the bridge on React strict mode unmount —
-      // it's a module-level singleton that persists across remounts.
-    };
+    return cleanup;
   }, [desktopBridgeRetryAttempt, isAuthenticated]);
+
+  useEffect(() => {
+    // Auth/account and consent changes invalidate pending aggregates too.
+    const unsubscribe = subscribeAuthenticatedAnalytics(() =>
+      bridgeTelemetry.reset(),
+    );
+    const flush = () => bridgeTelemetry.flush();
+    window.addEventListener("pagehide", flush);
+    return () => {
+      unsubscribe();
+      window.removeEventListener("pagehide", flush);
+    };
+  }, []);
 
   // Restoring a task or applying an availability/plan default must not change
   // the user's default for new chats. Only an explicit choice is remembered.
@@ -434,12 +563,16 @@ export function useSandboxPreference(
 
   const retryDesktopBridge = useCallback(() => {
     if (!isAuthenticated || !isTauriEnvironment()) return;
+    // A live bridge owns its bounded transport recovery. Keep its callbacks
+    // valid (and any running commands intact) when Retry is clicked mid-reconnect.
+    if (activeBridge?.getConnectionId()) return;
     bridgeGeneration += 1;
     bridgeRecoveryExhausted = false;
+    bridgeRecoveryPausedOffline = false;
+    bridgeRecoveryResumeAt = 0;
     clearBridgeRecovery(true);
     bridgeStartPromise = null;
-    setDesktopBridgeActive(false);
-    setDesktopBridgeStatus("connecting");
+    publishBridgeState(false, "connecting");
     setDesktopBridgeRetryAttempt((attempt) => attempt + 1);
   }, [isAuthenticated]);
 
@@ -447,14 +580,22 @@ export function useSandboxPreference(
     if (!isAuthenticated || !isTauriEnvironment()) return;
     const resumeRecovery = (event: Event) => {
       if (
-        !bridgeRecoveryExhausted ||
+        (!bridgeRecoveryExhausted && !bridgeRecoveryPausedOffline) ||
+        navigator.onLine === false ||
+        (bridgeRecoveryExhausted && Date.now() < bridgeRecoveryResumeAt) ||
         (event.type !== "online" && document.visibilityState === "hidden") ||
         activeBridge?.getConnectionId() ||
         bridgeStartPromise ||
         bridgeRecoveryTimer
       )
         return;
-      retryDesktopBridge();
+      if (bridgeRecoveryPausedOffline) {
+        bridgeRecoveryPausedOffline = false;
+        bridgeGeneration += 1;
+        setDesktopBridgeRetryAttempt((attempt) => attempt + 1);
+      } else {
+        retryDesktopBridge();
+      }
     };
     window.addEventListener("online", resumeRecovery);
     window.addEventListener("focus", resumeRecovery);

@@ -1,4 +1,6 @@
 import {
+  afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -20,7 +22,14 @@ jest.mock("posthog-js", () => ({
   default: mockPostHog,
 }));
 
+jest.mock("@tauri-apps/api/core", () => ({
+  invoke: async (command: string) =>
+    command === "plugin:app|version" ? "0.0.74" : undefined,
+}));
+
 const {
+  captureAuthenticatedEvent,
+  captureQueuedAuthenticatedEvent,
   getIdentifiedAnalyticsUserId,
   subscribeAuthenticatedAnalytics,
   captureComputerActivationImpression,
@@ -49,6 +58,333 @@ describe("client analytics", () => {
     mockPostHog.get_distinct_id.mockClear();
     mockPostHog.get_distinct_id.mockReturnValue("user_123");
     jest.useFakeTimers().setSystemTime(new Date("2026-07-14T12:00:00Z"));
+  });
+
+  describe("native auth frontend build attribution", () => {
+    const originalBuild = process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+    const properties = {
+      native_auth_diagnostic_version: 1,
+      convex_request_id: "0123456789abcdef",
+    };
+
+    beforeEach(() => {
+      process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = "A".repeat(40);
+    });
+
+    afterEach(() => {
+      if (originalBuild === undefined) {
+        delete process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+      } else {
+        process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = originalBuild;
+      }
+    });
+
+    it.each([
+      "sandbox_connection_terminated",
+      "desktop_bridge_relay_state_changed",
+    ])(
+      "attributes %s to the loaded frontend without mutating its diagnostic",
+      (event) => {
+        expect(captureAuthenticatedEvent(event, properties)).toBe(true);
+        expect(mockCapture).toHaveBeenCalledWith(event, {
+          ...properties,
+          hackerai_frontend_build_commit: "a".repeat(40),
+        });
+        expect(properties).not.toHaveProperty("hackerai_frontend_build_commit");
+      },
+    );
+
+    it("attributes a Desktop file probe failure without requiring an auth diagnostic", () => {
+      const probe = {
+        transport: "native_ipc",
+        reason: "unavailable",
+        file_failure: "unknown",
+        native_app_version: "0.0.72",
+        native_platform: "macos",
+      };
+
+      expect(
+        captureAuthenticatedEvent("desktop_file_bridge_probe_failed", probe),
+      ).toBe(true);
+      expect(mockCapture).toHaveBeenCalledWith(
+        "desktop_file_bridge_probe_failed",
+        { ...probe, hackerai_frontend_build_commit: "a".repeat(40) },
+      );
+      expect(probe).not.toHaveProperty("hackerai_frontend_build_commit");
+    });
+
+    it.each([undefined, "a".repeat(39), "a".repeat(41), "g".repeat(40)])(
+      "omits an absent or malformed build without dropping the diagnostic (%s)",
+      (build) => {
+        if (build === undefined) {
+          delete process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+        } else {
+          process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = build;
+        }
+        expect(
+          captureAuthenticatedEvent(
+            "sandbox_connection_terminated",
+            properties,
+          ),
+        ).toBe(true);
+        expect(mockCapture).toHaveBeenCalledWith(
+          "sandbox_connection_terminated",
+          properties,
+        );
+      },
+    );
+
+    it.each<[string, Record<string, unknown>]>([
+      ["unrelated_event", properties],
+      ["sandbox_connection_terminated", { native_auth_diagnostic_version: 2 }],
+      ["desktop_bridge_relay_state_changed", { reason: "connected" }],
+    ])(
+      "preserves diagnostics outside the versioned auth scope (%s)",
+      (event, diagnostic) => {
+        expect(captureAuthenticatedEvent(event, diagnostic)).toBe(true);
+        expect(mockCapture).toHaveBeenCalledWith(event, diagnostic);
+      },
+    );
+
+    describe("React boundary failure context", () => {
+      const context = {
+        version: 1,
+        failure_family: "null_remove_child",
+        boundary_scope: "chat_content",
+      };
+
+      it("adds only the validated loaded build without mutating the caller's three fields", () => {
+        expect(
+          captureAuthenticatedEvent("react_boundary_failure_context", context),
+        ).toBe(true);
+        expect(mockCapture).toHaveBeenCalledTimes(1);
+        const [event, sent, options] = mockCapture.mock.calls[0];
+        expect(event).toBe("react_boundary_failure_context");
+        expect(sent).toEqual({
+          ...context,
+          hackerai_frontend_build_commit: "a".repeat(40),
+        });
+        expect(options).toBeUndefined();
+        expect(Object.keys(context).sort()).toEqual([
+          "boundary_scope",
+          "failure_family",
+          "version",
+        ]);
+      });
+
+      it.each([undefined, "a".repeat(39), "a".repeat(41), "g".repeat(40)])(
+        "omits an absent or malformed build without dropping the context (%s)",
+        (build) => {
+          if (build === undefined) {
+            delete process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+          } else {
+            process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = build;
+          }
+          expect(
+            captureAuthenticatedEvent(
+              "react_boundary_failure_context",
+              context,
+            ),
+          ).toBe(true);
+          expect(mockCapture).toHaveBeenCalledWith(
+            "react_boundary_failure_context",
+            context,
+          );
+        },
+      );
+
+      it.each<[string, Record<string, unknown>]>([
+        ["react_boundary_failure_context", { ...context, version: 2 }],
+        ["react_boundary_failure_context", { ...context, version: "1" }],
+        ["react_boundary_failure_context", { failure_family: "x" }],
+        ["unrelated_event", context],
+      ])(
+        "does not stamp other events or versions (%s)",
+        (event, diagnostic) => {
+          expect(captureAuthenticatedEvent(event, diagnostic)).toBe(true);
+          expect(mockCapture).toHaveBeenCalledWith(event, diagnostic);
+        },
+      );
+    });
+
+    it.each<[Record<string, unknown>, boolean]>([
+      [{ file_action_auth_diagnostic_version: 1, caller: "upload" }, true],
+      [{ file_action_auth_diagnostic_version: 2, caller: "upload" }, false],
+      [{ file_action_auth_diagnostic_version: "1", caller: "upload" }, false],
+    ])(
+      "attributes only version 1 file action diagnostics to the loaded build (%p)",
+      (diagnostic, stamped) => {
+        expect(
+          captureAuthenticatedEvent("file_action_auth_diagnostic", diagnostic),
+        ).toBe(true);
+        expect(mockCapture).toHaveBeenCalledWith(
+          "file_action_auth_diagnostic",
+          stamped
+            ? {
+                ...diagnostic,
+                hackerai_frontend_build_commit: "a".repeat(40),
+              }
+            : diagnostic,
+        );
+        expect(diagnostic).not.toHaveProperty("hackerai_frontend_build_commit");
+      },
+    );
+
+    it("attributes a queued diagnostic when the identified SDK becomes ready", async () => {
+      mockPostHog.__loaded = false;
+      expect(
+        captureQueuedAuthenticatedEvent({
+          event: "sandbox_connection_terminated",
+          properties,
+          dedupeKey: "owned-native-auth-fixture",
+        }),
+      ).toBe(true);
+      expect(mockCapture).not.toHaveBeenCalled();
+      mockPostHog.__loaded = true;
+      expect(flushPendingAuthenticatedEvents("user_123")).toBe(true);
+      await Promise.resolve();
+      expect(mockCapture).toHaveBeenCalledTimes(1);
+      expect(mockCapture).toHaveBeenCalledWith(
+        "sandbox_connection_terminated",
+        { ...properties, hackerai_frontend_build_commit: "a".repeat(40) },
+        { uuid: expect.stringMatching(/^[0-9a-f-]{36}$/i) },
+      );
+    });
+
+    it("retains best-effort capture failure without retrying the diagnostic", () => {
+      mockCapture.mockImplementationOnce(() => {
+        throw new Error("SDK unavailable");
+      });
+      expect(
+        captureAuthenticatedEvent("sandbox_connection_terminated", properties),
+      ).toBe(false);
+      expect(mockCapture).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["not configured", "SDK not ready"])(
+      "does not bypass the existing capture gate when %s",
+      (state) => {
+        const originalKey = process.env.NEXT_PUBLIC_POSTHOG_KEY;
+        try {
+          if (state === "not configured") {
+            delete process.env.NEXT_PUBLIC_POSTHOG_KEY;
+          } else {
+            mockPostHog.__loaded = false;
+          }
+          expect(
+            captureAuthenticatedEvent(
+              "sandbox_connection_terminated",
+              properties,
+            ),
+          ).toBe(false);
+          expect(mockCapture).not.toHaveBeenCalled();
+        } finally {
+          if (originalKey === undefined) {
+            delete process.env.NEXT_PUBLIC_POSTHOG_KEY;
+          } else {
+            process.env.NEXT_PUBLIC_POSTHOG_KEY = originalKey;
+          }
+          mockPostHog.__loaded = true;
+        }
+      },
+    );
+  });
+
+  describe("Desktop runtime identity", () => {
+    const originalBuild = process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+    const identity = {
+      native_app_version: "0.0.74",
+      native_platform: "windows",
+      hackerai_frontend_build_commit: "a".repeat(40),
+    };
+
+    beforeAll(async () => {
+      Object.defineProperty(window, "__TAURI_INTERNALS__", {
+        configurable: true,
+        value: {},
+      });
+      Object.defineProperty(window, "__TAURI_OS_PLUGIN_INTERNALS__", {
+        configurable: true,
+        value: { platform: "windows" },
+      });
+      const { startDesktopRuntimeIdentityLookup } =
+        require("../desktop-runtime-identity") as typeof import("../desktop-runtime-identity");
+      await startDesktopRuntimeIdentityLookup();
+    });
+
+    beforeEach(() => {
+      process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = "A".repeat(40);
+    });
+
+    afterAll(() => {
+      delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+      delete (window as { __TAURI_OS_PLUGIN_INTERNALS__?: unknown })
+        .__TAURI_OS_PLUGIN_INTERNALS__;
+      if (originalBuild === undefined) {
+        delete process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+      } else {
+        process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = originalBuild;
+      }
+    });
+
+    it("attributes an ordinary diagnostic without a send receipt or caller identity", () => {
+      const caller = { reason: "connected" };
+      expect(
+        captureAuthenticatedEvent("desktop_bridge_relay_state_changed", caller),
+      ).toBe(true);
+      expect(mockCapture).toHaveBeenCalledWith(
+        "desktop_bridge_relay_state_changed",
+        { reason: "connected", ...identity },
+      );
+      expect(caller).toEqual({ reason: "connected" });
+    });
+
+    it("replaces a spoofed probe identity and an invalid build with measured values", () => {
+      process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT = "not-a-commit";
+      captureAuthenticatedEvent("desktop_file_bridge_probe_failed", {
+        reason: "unavailable",
+        native_app_version: "unknown",
+        native_platform: "private-host",
+        hackerai_frontend_build_commit: "b".repeat(40),
+      });
+      expect(mockCapture).toHaveBeenCalledWith(
+        "desktop_file_bridge_probe_failed",
+        {
+          reason: "unavailable",
+          native_app_version: "0.0.74",
+          native_platform: "windows",
+          hackerai_frontend_build_commit: null,
+        },
+      );
+    });
+
+    it("attributes a queued unsampled ACK summary when the SDK becomes ready", () => {
+      mockPostHog.__loaded = false;
+      expect(
+        captureQueuedAuthenticatedEvent({
+          event: "desktop_ack_delivery_summary",
+          properties: { schemaVersion: 2, startedCount: 3, settledCount: 3 },
+          dedupeKey: "desktop-identity-summary",
+        }),
+      ).toBe(true);
+      mockPostHog.__loaded = true;
+      expect(flushPendingAuthenticatedEvents("user_123")).toBe(true);
+      expect(mockCapture).toHaveBeenCalledWith(
+        "desktop_ack_delivery_summary",
+        { schemaVersion: 2, startedCount: 3, settledCount: 3, ...identity },
+        { uuid: expect.stringMatching(/^[0-9a-f-]{36}$/i) },
+      );
+    });
+
+    it("does not bypass the capture gate on Desktop", () => {
+      mockPostHog.__loaded = false;
+      try {
+        expect(captureAuthenticatedEvent("ordinary_event", {})).toBe(false);
+        expect(mockCapture).not.toHaveBeenCalled();
+      } finally {
+        mockPostHog.__loaded = true;
+      }
+    });
   });
 
   it("notifies survey consumers only of the consented, identified account", () => {

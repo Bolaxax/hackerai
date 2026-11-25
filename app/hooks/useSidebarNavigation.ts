@@ -2,18 +2,14 @@ import { useMemo, useCallback } from "react";
 import type { MouseEvent } from "react";
 import {
   extractAllSidebarContent,
+  isSameSidebarContent,
   type Message,
 } from "@/lib/utils/sidebar-utils";
-import {
-  isSidebarFile,
-  isSidebarTerminal,
-  isSidebarProxy,
-  isSidebarWebSearch,
-  isSidebarFinding,
-  type SidebarContent,
-} from "@/types/chat";
+import type { SidebarContent } from "@/types/chat";
 
 interface UseSidebarNavigationProps {
+  /** Undefined when the caller does not know whether the run is active. */
+  isRunActive?: boolean;
   messages: Message[];
   sidebarContent: SidebarContent | null;
   onNavigate?: (
@@ -23,54 +19,22 @@ interface UseSidebarNavigationProps {
 }
 
 export const useSidebarNavigation = ({
+  isRunActive,
   messages,
   sidebarContent,
   onNavigate,
 }: UseSidebarNavigationProps) => {
   const toolExecutions = useMemo(
-    () => extractAllSidebarContent(messages),
-    [messages],
+    () => extractAllSidebarContent(messages, isRunActive),
+    [messages, isRunActive],
   );
 
   const currentIndex = useMemo(() => {
     if (!sidebarContent) return -1;
 
-    // Try to match by toolCallId first (most reliable)
-    const contentToolCallId =
-      "toolCallId" in sidebarContent ? sidebarContent.toolCallId : undefined;
-
-    if (contentToolCallId) {
-      const index = toolExecutions.findIndex(
-        (item) => "toolCallId" in item && item.toolCallId === contentToolCallId,
-      );
-      if (index !== -1) return index;
-    }
-
-    // Fallback to content-based matching
-    return toolExecutions.findIndex((item) => {
-      if (isSidebarTerminal(item) && isSidebarTerminal(sidebarContent)) {
-        return (
-          item.command === sidebarContent.command &&
-          item.toolCallId === sidebarContent.toolCallId
-        );
-      }
-      if (isSidebarProxy(item) && isSidebarProxy(sidebarContent)) {
-        return item.toolCallId === sidebarContent.toolCallId;
-      }
-      if (isSidebarFile(item) && isSidebarFile(sidebarContent)) {
-        return (
-          item.path === sidebarContent.path &&
-          item.action === sidebarContent.action
-        );
-      }
-      if (isSidebarWebSearch(item) && isSidebarWebSearch(sidebarContent)) {
-        return item.toolCallId === sidebarContent.toolCallId;
-      }
-      if (isSidebarFinding(item) && isSidebarFinding(sidebarContent)) {
-        return item.findingId === sidebarContent.findingId;
-      }
-      return false;
-    });
+    return toolExecutions.findIndex((item) =>
+      isSameSidebarContent(item, sidebarContent),
+    );
   }, [sidebarContent, toolExecutions]);
 
   const handlePrev = useCallback(() => {

@@ -45,6 +45,13 @@ describe("systemPrompt security instructions", () => {
       expect(agent).toContain("Do not make unrelated mutations");
       expect(agent).toContain("disclose changes that could not be restored");
       expect(agent).toContain("<finding_quality>");
+      const setupVerification =
+        "verify the expected result after each critical step";
+      expect(agent).toContain(setupVerification);
+      expect(agent).toContain(
+        "identify the blocker and explain any change of approach before retrying",
+      );
+      expect(ask).not.toContain(setupVerification);
       expect(ask).not.toContain("<agent_lifecycle>");
       expect(ask).not.toContain("<agent_deliverables>");
       expect(ask).not.toContain("requested outcome is sufficiently supported");
@@ -746,11 +753,9 @@ Commands run directly on the host OS "workstation" without Docker isolation. Be 
     );
     expect(cloudPrompt).toContain("runtime encrypts it");
     expect(cloudPrompt).toContain("Do not promise recovery across Agent runs");
+    expect(cloudPrompt).not.toContain("npm install -g agent-browser");
     expect(localPrompt).toContain(
-      "use agent-browser only if already installed",
-    );
-    expect(localPrompt).toContain(
-      "On local/Desktop hosts, choose a unique session name",
+      "On Local, Desktop, and remote hosts, choose a unique session name",
     );
 
     for (const prompt of [askPrompt]) {

@@ -4,9 +4,91 @@ import {
   getTerminalFailureAction,
   isToolInputValidationError,
   stripAgentOnlyTerminalGuidance,
+  type ShellToolInput,
+  type ShellToolOutput,
 } from "../shell-tool-utils";
+import { extractAllSidebarContent } from "@/lib/utils/sidebar-utils";
+import { describeCloudUnavailability } from "@/lib/ai/tools/utils/cloud-unavailability-message";
+import type { SidebarTerminal } from "@/types";
 
 describe("terminal shell tool display helpers", () => {
+  const completedCommand = (shellOutput: ShellToolOutput) =>
+    computeShellTerminalBlock({
+      isShellTool: false,
+      shellInput: undefined,
+      shellOutput,
+      isExecuting: false,
+      hasResult: true,
+      toolCallId: "call-exit",
+      legacyCommand: 'sh -c "exit 7"',
+    });
+
+  it.each([
+    { result: { exitCode: 7, error: "exit status 7" } },
+    { result: { exitCode: 7, output: "partial output" } },
+    { result: { exited: { exitCode: 7 }, output: "partial output" } },
+    { exitCode: 7, output: "partial output" },
+  ])("shows a structured nonzero exit in the completed header", (output) => {
+    const result = completedCommand(output);
+
+    expect(result.blockAction(false)).toBe("Exited with code 7");
+    expect(result.blockTarget).toBe('sh -c "exit 7"');
+    expect(result.sidebarContent?.command).toBe('sh -c "exit 7"');
+  });
+
+  it.each([0, null, undefined, NaN, Infinity, 1.5])(
+    "does not infer a failed process from an absent or invalid exit code %s",
+    (exitCode) => {
+      const result = completedCommand({
+        result: { exitCode, output: "exit status 7" },
+      });
+
+      expect(result.blockAction(false)).toBe("Executed");
+    },
+  );
+
+  it("keeps failed commands identifiable when a shell brief is present", () => {
+    const result = computeShellTerminalBlock({
+      isShellTool: true,
+      shellInput: { action: "exec", command: "false", brief: "Check target" },
+      shellOutput: { result: { exitCode: 1, output: "partial output" } },
+      isExecuting: false,
+      hasResult: true,
+      toolCallId: "call-brief",
+    });
+
+    expect(result.blockAction(false)).toBe("Exited with code 1");
+    expect(result.blockTarget).toBe("false");
+    expect(result.finalOutput).toBe("partial output");
+    expect(result.blockAction(true)).toBe("Executing");
+  });
+
+  it("does not label a running command as failed before a result arrives", () => {
+    const result = computeShellTerminalBlock({
+      isShellTool: true,
+      shellInput: { action: "exec", command: "false" },
+      shellOutput: { result: { exitCode: 7 } },
+      isExecuting: true,
+      hasResult: false,
+      toolCallId: "call-running",
+    });
+
+    expect(result.blockAction(true)).toBe("Executing");
+  });
+
+  it("keeps intentional session termination labeled as killed", () => {
+    const result = computeShellTerminalBlock({
+      isShellTool: true,
+      shellInput: { action: "kill", session: "qa-session" },
+      shellOutput: { result: { exited: { exitCode: 130 } } },
+      isExecuting: false,
+      hasResult: true,
+      toolCallId: "call-kill",
+    });
+
+    expect(result.blockAction(false)).toBe("Killed");
+  });
+
   const validationError =
     "Invalid input for tool run_terminal_cmd: Type validation failed: Value: {}.";
 
@@ -141,6 +223,17 @@ describe("terminal shell tool display helpers", () => {
       "Sandbox is unavailable after repeated health check failures. Try again in a moment, or delete the sandbox in Settings > Data Controls. If the issue persists, contact HackerAI support.",
     ],
     [
+      describeCloudUnavailability({ kind: "cooldown", retryAfterMs: 59_200 }),
+      "The cloud workspace is temporarily unavailable. Your workspace is preserved. The next sandbox tool call after about 60 seconds will try to reconnect automatically.",
+    ],
+    [
+      describeCloudUnavailability({
+        kind: "disabled",
+        reason: "workspace_recovery_required",
+      }),
+      "Your cloud workspace needs recovery before it can be used, so cloud tools are unavailable for the rest of this request. Your workspace is preserved.",
+    ],
+    [
       "Sandbox recreation failed. The sandbox environment is not responding. Another attempt may be made but the sandbox will be marked unavailable after repeated failures.",
       "Sandbox recreation failed. The sandbox environment is not responding.",
     ],
@@ -181,4 +274,151 @@ describe("terminal shell tool display helpers", () => {
 
     expect(stripAgentOnlyTerminalGuidance(commandOutput)).toBe(commandOutput);
   });
+});
+
+describe("terminal display text source", () => {
+  const BRIEF = "agent-browser open the sign-in page";
+  const OPEN = "agent-browser open https://example.org";
+  type Part = {
+    type: string;
+    toolCallId: string;
+    state: string;
+    input: Record<string, unknown>;
+    output?: unknown;
+  };
+  const message = (part: Part) => ({
+    id: "assistant",
+    role: "assistant",
+    parts: [part],
+  });
+
+  /** Text and tag from the live producer and the tool-handler producer. */
+  const produced = (part: Part) => {
+    const pick = (item?: SidebarTerminal | null) =>
+      item ? { command: item.command, source: item.commandSource } : null;
+    const live = extractAllSidebarContent(
+      [message(part)] as Parameters<typeof extractAllSidebarContent>[0],
+      true,
+    ).find((item) => "toolCallId" in item) as SidebarTerminal | undefined;
+    const isShellTool = part.type === "tool-shell";
+    const handler =
+      part.type === "tool-interact_terminal_session"
+        ? undefined
+        : computeShellTerminalBlock({
+            isShellTool,
+            shellInput: isShellTool
+              ? (part.input as ShellToolInput)
+              : undefined,
+            shellOutput: undefined,
+            isExecuting: false,
+            hasResult: true,
+            toolCallId: part.toolCallId,
+            legacyCommand: isShellTool
+              ? undefined
+              : (part.input.command as string | undefined),
+          }).sidebarContent;
+    return { live: pick(live), handler: pick(handler) };
+  };
+  const tagged = (command: string, source?: string) => ({ command, source });
+  const shell = (input: Record<string, unknown>): Part => ({
+    type: "tool-shell",
+    toolCallId: "call",
+    state: "output-available",
+    input,
+    output: { output: "" },
+  });
+  const legacy = (type: string, input: Record<string, unknown>): Part => ({
+    type: `tool-${type}`,
+    toolCallId: "call",
+    state: "output-available",
+    input,
+    output: { result: { output: "" } },
+  });
+
+  it.each([
+    [
+      "brief-only exec",
+      shell({ action: "exec", brief: BRIEF }),
+      tagged(BRIEF, "brief"),
+      tagged(BRIEF, "brief"),
+    ],
+    [
+      "real open with a brief",
+      shell({ action: "exec", command: OPEN, brief: "Open the site" }),
+      tagged(OPEN, "command"),
+      tagged(OPEN, "command"),
+    ],
+    [
+      // The live producer shows the command; the handler shows the brief.
+      "interactive view with both fields",
+      shell({ action: "view", session: "s1", command: OPEN, brief: BRIEF }),
+      tagged(OPEN, "command"),
+      tagged(BRIEF, "interactive_brief"),
+    ],
+    [
+      // Equal text still records the field each producer chose.
+      "interactive view whose brief equals its command",
+      shell({ action: "view", session: "s1", command: OPEN, brief: OPEN }),
+      tagged(OPEN, "command"),
+      tagged(OPEN, "interactive_brief"),
+    ],
+    [
+      "interactive brief-only send",
+      shell({ action: "send", session: "s1", input: "q\n", brief: BRIEF }),
+      tagged(BRIEF, "interactive_brief"),
+      tagged(BRIEF, "interactive_brief"),
+    ],
+    [
+      "interactive label",
+      shell({ action: "kill", session: "s1" }),
+      null,
+      tagged("kill"),
+    ],
+    [
+      "legacy open",
+      legacy("run_terminal_cmd", { command: OPEN }),
+      tagged(OPEN, "command"),
+      tagged(OPEN, "command"),
+    ],
+    [
+      "legacy empty-command brief",
+      legacy("run_terminal_cmd", { command: "", brief: BRIEF }),
+      tagged(BRIEF, "brief"),
+      null,
+    ],
+    [
+      "legacy interactive brief",
+      legacy("interact_terminal_session", {
+        action: "send",
+        session: "s1",
+        input: "q\n",
+        brief: BRIEF,
+      }),
+      tagged(BRIEF, "interactive_brief"),
+      null,
+    ],
+    [
+      // Formatted keystrokes read like a command but are not one.
+      "legacy formatted send input",
+      legacy("interact_terminal_session", {
+        action: "send",
+        session: "s1",
+        input: `${OPEN}\n`,
+      }),
+      tagged(OPEN),
+      null,
+    ],
+  ] as Array<
+    [
+      string,
+      Part,
+      ReturnType<typeof tagged> | null,
+      ReturnType<typeof tagged> | null,
+    ]
+  >)(
+    "tags the %s at the producer that chose it",
+    (_name, part, live, handler) => {
+      expect(produced(part)).toEqual({ live, handler });
+    },
+  );
 });

@@ -5,26 +5,44 @@ const mockIsE2BSandbox = jest.fn();
 const mockLoggerWarn = jest.fn();
 let mockTrackSandboxUsage: ((sandbox: unknown) => void) | undefined;
 const mockNetworkQuery = jest.fn();
+const mockStartLeaseHeartbeat = jest.fn(() => ({ stop: async () => {} }));
+const mockReleaseIdleLease = jest.fn(async () => true);
+jest.mock("../utils/e2b-lease", () => ({
+  ...jest.requireActual("../utils/e2b-lease"),
+  startE2BSandboxLeaseHeartbeat: (...args: unknown[]) =>
+    (mockStartLeaseHeartbeat as (...a: unknown[]) => unknown)(...args),
+  releaseE2BSandboxIdleLeaseBestEffort: (...args: unknown[]) =>
+    (mockReleaseIdleLease as (...a: unknown[]) => unknown)(...args),
+}));
 jest.mock("@/lib/db/convex-client", () => ({
-  getConvexClient: () => ({ query: mockNetworkQuery }),
+  getConvexClient: () => ({
+    query: mockNetworkQuery,
+    mutation: jest.fn(async () => true),
+  }),
 }));
 
-jest.mock("../run-terminal-cmd", () => ({ createRunTerminalCmd: jest.fn() }));
+jest.mock("../run-terminal-cmd", () => ({
+  createRunTerminalCmd: jest.fn(() => ({})),
+}));
 jest.mock("../interact-terminal-session", () => ({
-  createInteractTerminalSession: jest.fn(),
+  createInteractTerminalSession: jest.fn(() => ({})),
 }));
 jest.mock("../get-terminal-files", () => ({
-  createGetTerminalFiles: jest.fn(),
+  createGetTerminalFiles: jest.fn(() => ({})),
 }));
-jest.mock("../file", () => ({ createFile: jest.fn() }));
-jest.mock("../web-search", () => ({ createWebSearch: jest.fn() }));
-jest.mock("../open-url", () => ({ createOpenUrlTool: jest.fn() }));
-jest.mock("../todo-write", () => ({ createTodoWrite: jest.fn() }));
+jest.mock("../file", () => ({
+  createFile: jest.fn(() => ({})),
+  createFileEdit: jest.fn(() => ({})),
+  createFileWrite: jest.fn(() => ({})),
+}));
+jest.mock("../web-search", () => ({ createWebSearch: jest.fn(() => ({})) }));
+jest.mock("../open-url", () => ({ createOpenUrlTool: jest.fn(() => ({})) }));
+jest.mock("../todo-write", () => ({ createTodoWrite: jest.fn(() => ({})) }));
 jest.mock("../notes", () => ({
-  createCreateNote: jest.fn(),
-  createListNotes: jest.fn(),
-  createUpdateNote: jest.fn(),
-  createDeleteNote: jest.fn(),
+  createCreateNote: jest.fn(() => ({})),
+  createListNotes: jest.fn(() => ({})),
+  createUpdateNote: jest.fn(() => ({})),
+  createDeleteNote: jest.fn(() => ({})),
 }));
 
 jest.mock("../utils/hybrid-sandbox-manager", () => ({
@@ -48,6 +66,7 @@ jest.mock("../utils/sandbox-manager", () => ({
 
 jest.mock("../utils/sandbox-types", () => ({
   isE2BSandbox: (...args: unknown[]) => mockIsE2BSandbox(...args),
+  isCentrifugoSandbox: (...args: unknown[]) => !mockIsE2BSandbox(...args),
   getCloudSandboxProviderForInstance: (
     sandbox: { provider?: string } | null,
   ) => (sandbox?.provider === "e2b" ? sandbox.provider : null),
@@ -60,17 +79,21 @@ jest.mock("../utils/sandbox-fallback", () => ({
 
 jest.mock("@/lib/posthog/server", () => ({
   phLogger: { event: jest.fn() },
+  getPostHogBooleanFlagDecisionForUser: jest.fn(async () => true),
 }));
 jest.mock("@/lib/logger", () => ({
   logger: { warn: (...args: unknown[]) => mockLoggerWarn(...args) },
 }));
 
 import { createTools } from "..";
+import { createRunTerminalCmd } from "../run-terminal-cmd";
+import { getPostHogBooleanFlagDecisionForUser } from "@/lib/posthog/server";
 import { E2B_COST_PER_MS } from "../utils/e2b-cost";
 
 describe("sandbox acquisition serialization", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(getPostHogBooleanFlagDecisionForUser).mockResolvedValue(true);
     mockResetSandbox.mockResolvedValue(undefined);
     mockQuarantineLocalConnection.mockResolvedValue(undefined);
     mockIsE2BSandbox.mockReturnValue(false);
@@ -80,6 +103,48 @@ describe("sandbox acquisition serialization", () => {
   afterEach(() => {
     jest.useRealTimers();
   });
+
+  it.each(["PREVIEW", "PRODUCTION"])(
+    "builds %s parent tools without CAPTCHA hooks, flag lookups or connected-browser setup",
+    async (environment) => {
+      const originalEnv = process.env;
+      // A leftover provider key must not re-enable any solver path.
+      process.env = { ...originalEnv, TWOCAPTCHA_API_KEY: "test-provider-key" };
+      const args: Parameters<typeof createTools> = [
+        "user-1",
+        "chat-1",
+        {} as never,
+        "agent",
+        {} as never,
+      ];
+      args[9] = "service-key";
+      args[20] = "run-1";
+      args[22] = { environment };
+      try {
+        const created = createTools(...args);
+        const context = jest.mocked(createRunTerminalCmd).mock.calls.at(-1)![0];
+        expect(Object.keys(context).join(" ")).not.toMatch(
+          /captcha|challenge/i,
+        );
+        expect(Object.keys(created).join(" ")).not.toMatch(/captcha/i);
+        expect(created.tools.browser_handoff).toBeDefined();
+        const run = jest.fn();
+        const target = {
+          commands: { run },
+          sandboxKind: "centrifugo",
+          supportsCommandStdin: () => true,
+          getConnectionInfo: () => ({ connectionId: "local" }),
+          isWindows: () => false,
+        } as never;
+        expect(await context.browserSessions!.prepare(target)).toEqual({});
+        expect(run).not.toHaveBeenCalled();
+        expect(getPostHogBooleanFlagDecisionForUser).not.toHaveBeenCalled();
+        await created.cleanupBrowserSessions();
+      } finally {
+        process.env = originalEnv;
+      }
+    },
+  );
 
   it("dispatches parent delegation and child tools without a scope lookup", async () => {
     const execute = jest.fn().mockResolvedValue({ result: "completed" });
@@ -180,6 +245,66 @@ describe("sandbox acquisition serialization", () => {
     expect(mockResetSandbox.mock.invocationCallOrder[0]).toBeGreaterThan(
       mockGetSandboxWithFallbackGuard.mock.invocationCallOrder[0],
     );
+  });
+
+  it("never keeps a lease alive for a sandbox published after run-end cleanup", async () => {
+    mockIsE2BSandbox.mockImplementation(
+      (sandbox: { provider?: string } | null) => sandbox?.provider === "e2b",
+    );
+    const args: Parameters<typeof createTools> = [
+      "user-1",
+      "chat-1",
+      {} as never,
+      "agent",
+      {} as never,
+    ];
+    args[8] = "e2b";
+    args[9] = "service-key";
+    args[20] = "run-1";
+    args[22] = { keepE2BLeaseAliveForRun: true };
+    const { stopE2BSandboxRunLeaseHeartbeat } = createTools(...args);
+    await stopE2BSandboxRunLeaseHeartbeat();
+
+    // A slow acquisition (e.g. the turn-start inventory) lands after cleanup.
+    const late = { provider: "e2b", sandboxId: "late" };
+    mockTrackSandboxUsage?.(late);
+
+    expect(mockStartLeaseHeartbeat).not.toHaveBeenCalled();
+    expect(mockReleaseIdleLease).toHaveBeenCalledWith(late);
+  });
+
+  it("closes the run lease before a pending heartbeat stop settles", async () => {
+    mockIsE2BSandbox.mockImplementation(
+      (sandbox: { provider?: string } | null) => sandbox?.provider === "e2b",
+    );
+    let finishStop!: () => void;
+    mockStartLeaseHeartbeat.mockImplementationOnce(() => ({
+      stop: () => new Promise<void>((resolve) => (finishStop = resolve)),
+    }));
+    const args: Parameters<typeof createTools> = [
+      "user-1",
+      "chat-1",
+      {} as never,
+      "agent",
+      {} as never,
+    ];
+    args[8] = "e2b";
+    args[9] = "service-key";
+    args[20] = "run-1";
+    args[22] = { keepE2BLeaseAliveForRun: true };
+    const { stopE2BSandboxRunLeaseHeartbeat } = createTools(...args);
+    mockTrackSandboxUsage?.({ provider: "e2b", sandboxId: "first" });
+    expect(mockStartLeaseHeartbeat).toHaveBeenCalledTimes(1);
+
+    const cleanup = stopE2BSandboxRunLeaseHeartbeat();
+    // A late client publishes while the heartbeat stop is still pending.
+    const late = { provider: "e2b", sandboxId: "late" };
+    mockTrackSandboxUsage?.(late);
+    expect(mockStartLeaseHeartbeat).toHaveBeenCalledTimes(1);
+    expect(mockReleaseIdleLease).toHaveBeenCalledWith(late);
+
+    finishStop();
+    await cleanup;
   });
 
   it("accounts for E2B runtime", async () => {

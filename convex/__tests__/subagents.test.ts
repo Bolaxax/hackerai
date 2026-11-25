@@ -28,6 +28,11 @@ jest.mock("convex/values", () => ({
   ConvexError: class ConvexError extends Error {},
 }));
 
+const mockBlocked = jest.fn<any>().mockResolvedValue(false);
+jest.mock("../lib/suspensionGuards", () => ({
+  isUserBlockedFromChatHistory: (...args: unknown[]) => mockBlocked(...args),
+}));
+
 const validateServiceKey = jest.fn();
 jest.mock("../lib/utils", () => ({
   validateServiceKey: (...args: unknown[]) => validateServiceKey(...args),
@@ -43,6 +48,7 @@ const {
   failUnattachedForBackend,
   finishForBackend,
   listForParentMessage,
+  markFinalizingForBackend,
   markResultConsumedForParentBackend,
   markResultInjectedForParentBackend,
   reconcileAttachedRun,
@@ -52,6 +58,66 @@ const {
   sendMessageForBackend,
   setMessageFeedback,
 } = require("../subagents") as typeof import("../subagents");
+
+describe("subagent finalization during browser handoff", () => {
+  it.each(["waiting", "claiming", "human", "recovery", "resuming"])(
+    "keeps the child running when %s wins the finalization race",
+    async (state) => {
+      const child = {
+        _id: "child",
+        subagent_id: "child",
+        user_id: "owner",
+        chat_id: "chat",
+        trigger_run_id: "run",
+        status: "running",
+      };
+      const handoff = {
+        user_id: "owner",
+        run_id: "run",
+        expires_at: Date.now() + 60_000,
+        state,
+        exit_note_ids: [] as string[],
+      };
+      const patch = jest.fn<any>().mockImplementation(async (_id, value) => {
+        Object.assign(child, value);
+      });
+      const ctx = {
+        db: {
+          patch,
+          query: (table: string) => ({
+            withIndex: () => ({
+              first: async () => (table === "subagent_runs" ? child : null),
+              order: () => ({ first: async () => handoff }),
+            }),
+          }),
+        },
+      } as any;
+      const args = {
+        serviceKey: "key",
+        subagentId: "child",
+        triggerRunId: "run",
+        modelHandoffNoteIds: [] as string[],
+      };
+      await expect(markFinalizingForBackend.handler(ctx, args)).resolves.toBe(
+        "pending_browser_handoff",
+      );
+      expect(child.status).toBe("running");
+      expect(patch).not.toHaveBeenCalled();
+      handoff.state = "agent";
+      // A whole takeover can also finish between verification and this mutation.
+      handoff.exit_note_ids = ["saved-blank-note"];
+      await expect(markFinalizingForBackend.handler(ctx, args)).resolves.toBe(
+        "pending_browser_handoff",
+      );
+      expect(child.status).toBe("running");
+      args.modelHandoffNoteIds = ["saved-blank-note"];
+      await expect(markFinalizingForBackend.handler(ctx, args)).resolves.toBe(
+        "updated",
+      );
+      expect(child.status).toBe("finalizing");
+    },
+  );
+});
 
 const args = {
   serviceKey: "service-key",
@@ -1521,4 +1587,62 @@ describe("subagent deletion cancellation", () => {
     ).resolves.toEqual({ triggerRunIds: [], hasMore: true });
     expect(patch).not.toHaveBeenCalled();
   });
+});
+
+describe("suspended child attachment", () => {
+  afterEach(() => mockBlocked.mockResolvedValue(false));
+  it.each([
+    ["running", "run_authoritative", "run_stale", "stale"],
+    ["running", "run_authoritative", "run_authoritative", "terminal"],
+    ["completed", "run_authoritative", "run_authoritative", "terminal"],
+    ["failed", "run_authoritative", "run_authoritative", "terminal"],
+    ["queued", undefined, "run_new", "terminal"],
+  ])(
+    "preserves %s history and rejects stale run ownership",
+    async (status, existing, incoming, outcome) => {
+      mockBlocked.mockResolvedValue(true);
+      const row = {
+        _id: "child",
+        user_id: "subject",
+        subagent_id: "child",
+        status,
+        trigger_run_id: existing,
+        started_at: 10,
+        completed_at:
+          status === "completed" || status === "failed" ? 20 : undefined,
+      };
+      const patch = jest
+        .fn<any>()
+        .mockImplementation(async (_id, update) => Object.assign(row, update));
+      const ctx = {
+        db: {
+          query: () => ({ withIndex: () => ({ first: async () => row }) }),
+          patch,
+        },
+        scheduler: { runAfter: jest.fn() },
+      };
+      expect(
+        await attachTriggerRunForBackend.handler(ctx, {
+          serviceKey: "test",
+          subagentId: "child",
+          triggerRunId: incoming,
+        }),
+      ).toBe(outcome);
+      if (
+        status === "queued" ||
+        (status === "running" && outcome === "terminal")
+      )
+        expect(row).toMatchObject({
+          status: "canceled",
+          trigger_run_id: incoming,
+          cancel_reason: "account_restricted",
+        });
+      else
+        expect(row).toMatchObject({
+          status,
+          trigger_run_id: "run_authoritative",
+        });
+      if (outcome === "stale") expect(patch).not.toHaveBeenCalled();
+    },
+  );
 });

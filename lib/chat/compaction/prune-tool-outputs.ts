@@ -30,6 +30,9 @@ const PROTECTED_TOOLS = new Set([
   "delete_note",
   "create_vulnerability_report",
   "update_vulnerability_report",
+  // Delivery receipts are the model's record of what the user received and
+  // resolve inline sandbox: links after reload. Each file adds a small receipt.
+  "get_terminal_files",
 ]);
 
 const TOOL_TYPE_PREFIX = "tool-";
@@ -85,6 +88,120 @@ interface ToolPart {
   output?: any;
 }
 
+/** Keep mutation outcomes without retaining file contents or arbitrary error text. */
+const fileMutationOutcome = (output: any, explicitFailure: boolean): string => {
+  let value = output;
+  let failed = explicitFailure;
+  for (
+    let depth = 0;
+    depth < 4 && value && typeof value === "object";
+    depth++
+  ) {
+    if (value.type === "error-text" || value.type === "error-json")
+      failed = true;
+    if (typeof value.error === "string" && value.error.length > 0) {
+      failed = true;
+      value = value.error;
+      break;
+    }
+    if (value.success === false) failed = true;
+    if (Object.hasOwn(value, "value")) value = value.value;
+    else if (Object.hasOwn(value, "result")) value = value.result;
+    else if (typeof value.content === "string") {
+      value = value.content;
+      break;
+    } else break;
+  }
+  // file.toModelOutput emits this prefix for a structured tool error. A read
+  // result is handled separately, so source contents are never classified here.
+  if (typeof value === "string" && value.startsWith("Error:")) failed = true;
+  if (failed) {
+    const noChanges =
+      typeof value === "string" && /No edits were applied\./.test(value);
+    return `outcome failed${noChanges ? "; no changes applied" : ""}`;
+  }
+  if (
+    typeof value === "string" &&
+    /^(Multi-edit completed:|File (written|appended|created):)/.test(value)
+  ) {
+    return "outcome success";
+  }
+  return "outcome unknown";
+};
+
+type FileDeliveryOutput = {
+  files?: unknown;
+  fileUrls?: unknown;
+  failedFiles?: unknown;
+  deliveryReceipts?: unknown;
+};
+
+const asFileDeliveryOutput = (output: unknown): FileDeliveryOutput | null =>
+  output && typeof output === "object" && !Array.isArray(output)
+    ? (output as FileDeliveryOutput)
+    : null;
+
+const deliveryEntries = (value: unknown): Array<Record<string, unknown>> =>
+  Array.isArray(value)
+    ? value.filter(
+        (entry): entry is Record<string, unknown> =>
+          !!entry && typeof entry === "object",
+      )
+    : [];
+
+const deliveryPath = (entry: Record<string, unknown>): string =>
+  typeof entry.path === "string"
+    ? entry.path.replace(/[\r\n]+/g, " ").slice(0, 512)
+    : "unknown";
+
+/**
+ * Lists every delivered and failed path from a get_terminal_files result so a
+ * compacted record still says exactly which files the user received.
+ */
+const summarizeFileDelivery = (output: unknown): string => {
+  const delivery = asFileDeliveryOutput(output);
+  if (!delivery) return "[Files: no delivery result; treat as not delivered]";
+  const delivered = [
+    ...deliveryEntries(delivery.files),
+    // Legacy messages stored successful deliveries as fileUrls.
+    ...deliveryEntries(delivery.fileUrls),
+  ].map(deliveryPath);
+  const failed = deliveryEntries(delivery.failedFiles).map(deliveryPath);
+  const total = delivered.length + failed.length;
+  const parts = [
+    `delivered ${delivered.length} of ${total} file(s)${
+      delivered.length ? `: ${delivered.join(", ")}` : ""
+    }`,
+    failed.length && `failed ${failed.length}: ${failed.join(", ")}`,
+  ].filter(Boolean);
+  return `[Files: ${parts.join("; ")}]`;
+};
+
+/** Keeps the fields the file card and inline sandbox links read after reload. */
+const compactFileDeliveryForStorage = (output: unknown): unknown => {
+  const delivery = asFileDeliveryOutput(output);
+  if (!delivery) return compactToolInputForStorage(output);
+  return {
+    result: summarizeFileDelivery(delivery),
+    files: deliveryEntries(delivery.files).map(({ path }) => ({ path })),
+    failedFiles: deliveryEntries(delivery.failedFiles).map(
+      ({ path, reason }) => ({
+        path,
+        ...(typeof reason === "string" && {
+          reason: truncateStorageString(reason, 200),
+        }),
+      }),
+    ),
+    deliveryReceipts: deliveryEntries(delivery.deliveryReceipts),
+    ...(Array.isArray(delivery.fileUrls) && {
+      fileUrls: deliveryEntries(delivery.fileUrls).map(({ path }) => ({
+        path,
+      })),
+    }),
+    __hackeraiStorageCompacted: true,
+  };
+};
+
 /**
  * Builds a compact placeholder string given the tool name, its input args, and output.
  * Shared by both UIMessage and ModelMessage pruners.
@@ -93,7 +210,10 @@ const buildPlaceholderFromParts = (
   toolName: string,
   input: any,
   output: any,
+  explicitFailure = false,
 ): string => {
+  const mutationOutcome = fileMutationOutcome(output, explicitFailure);
+  output = unwrapModelToolOutput(output);
   switch (toolName) {
     case "run_terminal_cmd":
     case "interact_terminal_session": {
@@ -141,6 +261,8 @@ const buildPlaceholderFromParts = (
           `record ${String(result.recordPath).slice(0, 4096)}`,
         result.outputPath &&
           `output ${String(result.outputPath).slice(0, 4096)}`,
+        result.recordPersistenceStatus === "pending" &&
+          "record persistence pending",
         result.recordPersistenceFailed && "record persistence failed",
         result.resumable === false && "not resumable",
       ].filter(Boolean);
@@ -161,8 +283,11 @@ const buildPlaceholderFromParts = (
       return `[Terminal: ran '${shortCmd}', exit code ${result.exited?.exitCode ?? result.exitCode ?? exitCode}${references.length ? `; ${references.join("; ")}` : ""}]`;
     }
 
-    case "file": {
-      const action = input?.action ?? "unknown";
+    case "file":
+    case "file_edit":
+    case "file_write": {
+      const action =
+        input?.action ?? (toolName === "file_edit" ? "edit" : "unknown");
       const path = input?.path ?? input?.file_path ?? "unknown";
       if (action === "read") {
         const content = output?.content ?? output ?? "";
@@ -170,7 +295,7 @@ const buildPlaceholderFromParts = (
           typeof content === "string" ? content.split("\n").length : "?";
         return `[File: read ${path} (${lines} lines)]`;
       }
-      return `[File: ${action} ${path}]`;
+      return `[File: ${action} ${path}; ${mutationOutcome}]`;
     }
 
     case "match": {
@@ -199,10 +324,8 @@ const buildPlaceholderFromParts = (
       return `[Search: '${query}']`;
     }
 
-    case "get_terminal_files": {
-      const n = Array.isArray(output) ? output.length : "?";
-      return `[Files: retrieved ${n} files]`;
-    }
+    case "get_terminal_files":
+      return summarizeFileDelivery(output);
 
     case "open_url": {
       const url = input?.url ?? "unknown";
@@ -217,7 +340,12 @@ const buildPlaceholderFromParts = (
 /** Builds a placeholder from a UIMessage ToolPart */
 const buildPlaceholder = (part: ToolPart): string => {
   const toolName = part.type.slice(TOOL_TYPE_PREFIX.length);
-  return buildPlaceholderFromParts(toolName, part.input, part.output);
+  return buildPlaceholderFromParts(
+    toolName,
+    part.input,
+    part.output,
+    part.state === "output-error",
+  );
 };
 
 const isCompactPlaceholderOutput = (output: unknown): output is string =>
@@ -241,21 +369,35 @@ const isCompletedToolPart = (part: ToolPart): boolean =>
   (part.state === "output-available" || part.state === "output-error") &&
   part.output != null;
 
+const splitsPairAt = (value: string, offset: number): boolean =>
+  (value.codePointAt(offset - 1) ?? 0) > 0xffff;
+
+// Move an edge inward if retaining it would split a UTF-16 surrogate pair.
+const sliceStorageText = (
+  value: string,
+  start: number,
+  end = value.length,
+): string => {
+  const safeStart = splitsPairAt(value, start) ? start + 1 : start;
+  const safeEnd = splitsPairAt(value, end) ? end - 1 : end;
+  return value.slice(safeStart, safeEnd);
+};
+
 const truncateStorageString = (
   value: string,
   maxLength = STORAGE_TOOL_INPUT_STRING_LIMIT,
 ): string => {
   if (value.length <= maxLength) return value;
   if (maxLength <= STORAGE_COMPACTED_STRING_SUFFIX.length) {
-    return value.slice(0, maxLength);
+    return sliceStorageText(value, 0, maxLength);
   }
 
   const contentBudget = maxLength - STORAGE_COMPACTED_STRING_SUFFIX.length;
   const headBudget = Math.ceil(contentBudget * 0.65);
   const tailBudget = contentBudget - headBudget;
 
-  return `${value.slice(0, headBudget)}${STORAGE_COMPACTED_STRING_SUFFIX}${
-    tailBudget > 0 ? value.slice(-tailBudget) : ""
+  return `${sliceStorageText(value, 0, headBudget)}${STORAGE_COMPACTED_STRING_SUFFIX}${
+    tailBudget > 0 ? sliceStorageText(value, value.length - tailBudget) : ""
   }`;
 };
 
@@ -314,6 +456,32 @@ const compactToolInputForStorage = (value: unknown, depth = 0): unknown => {
   return compacted;
 };
 
+/**
+ * The file card reads `input.files` as path strings, so storage compaction
+ * keeps that list complete and string-only instead of appending a marker.
+ */
+const compactToolPartInputForStorage = (
+  toolName: string | null,
+  input: unknown,
+): unknown => {
+  if (
+    toolName !== "get_terminal_files" ||
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    !Array.isArray((input as { files?: unknown }).files)
+  ) {
+    return compactToolInputForStorage(input);
+  }
+  const { files, ...rest } = input as { files: unknown[] };
+  return {
+    ...(compactToolInputForStorage(rest) as Record<string, unknown>),
+    files: files
+      .filter((path): path is string => typeof path === "string")
+      .map((path) => truncateStorageString(path, 512)),
+  };
+};
+
 const compactNoteForStorage = (value: unknown): unknown => {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return compactToolInputForStorage(value);
@@ -343,6 +511,21 @@ const compactNoteForStorage = (value: unknown): unknown => {
       : note.tags,
     _creationTime: note._creationTime,
     updated_at: note.updated_at,
+    // Relevant-recall list outputs: bounded previews and metadata.
+    ...(typeof note.preview === "string" && {
+      preview: truncateStorageString(
+        note.preview,
+        STORAGE_NOTE_CONTENT_PREVIEW_LIMIT,
+      ),
+      preview_truncated: note.preview_truncated,
+    }),
+    ...(typeof note.target === "string" && {
+      target: truncateStorageString(note.target, 200),
+    }),
+    ...(typeof note.observed_at === "number" && {
+      observed_at: note.observed_at,
+    }),
+    ...(typeof note.recheck === "string" && { recheck: note.recheck }),
   };
 };
 
@@ -350,6 +533,9 @@ const compactProtectedToolOutputForStorage = (
   toolName: string,
   output: unknown,
 ): unknown => {
+  if (toolName === "get_terminal_files") {
+    return compactFileDeliveryForStorage(output);
+  }
   if (
     toolName !== "list_notes" ||
     !output ||
@@ -366,6 +552,8 @@ const compactProtectedToolOutputForStorage = (
       ? listOutput.notes.map(compactNoteForStorage)
       : listOutput.notes,
     total_count: listOutput.total_count,
+    has_more: listOutput.has_more,
+    next_cursor: listOutput.next_cursor,
     message: listOutput.message,
     error: listOutput.error,
     __hackeraiStorageCompacted: true,
@@ -385,7 +573,7 @@ const compactToolPartForStorage = (
 
   return {
     ...part,
-    input: compactToolInputForStorage(part.input),
+    input: compactToolPartInputForStorage(toolName, part.input),
     output: PROTECTED_TOOLS.has(toolName)
       ? compactProtectedToolOutputForStorage(toolName, part.output)
       : isCompactPlaceholderOutput(part.output)
@@ -483,7 +671,11 @@ const stripBulkyOutputFields = (part: ToolPart): ToolPart => {
     return part;
   }
 
-  if (part.type === "tool-file") {
+  if (
+    part.type === "tool-file" ||
+    part.type === "tool-file_edit" ||
+    part.type === "tool-file_write"
+  ) {
     const { originalContent, modifiedContent, ...restOutput } =
       output as Record<string, unknown>;
 
@@ -551,7 +743,7 @@ const compactReasoningParts = (
         text: `${STORAGE_COMPACTED_REASONING_PREFIX.slice(
           0,
           prefixBudget,
-        )}${tailBudget > 0 ? text.slice(-tailBudget) : ""}`,
+        )}${tailBudget > 0 ? sliceStorageText(text, text.length - tailBudget) : ""}`,
       };
     })
     .filter((part): part is UIMessage["parts"][number] => part !== null)
@@ -568,13 +760,19 @@ const stripStorageOnlyParts = (parts: UIMessage["parts"]): UIMessage["parts"] =>
 const compactToolPartsToByteLimit = (
   parts: UIMessage["parts"],
   softLimitBytes: number,
-  { includeProtectedTools = false }: { includeProtectedTools?: boolean } = {},
+  {
+    includeProtectedTools = false,
+    estimateSizeBytes = estimateSerializedSizeBytes,
+  }: {
+    includeProtectedTools?: boolean;
+    estimateSizeBytes?: (value: unknown) => number;
+  } = {},
 ): {
   parts: UIMessage["parts"];
   compactedCount: number;
   afterSizeBytes: number;
 } => {
-  let afterSizeBytes = estimateSerializedSizeBytes(parts);
+  let afterSizeBytes = estimateSizeBytes(parts);
   if (afterSizeBytes <= softLimitBytes) {
     return { parts, compactedCount: 0, afterSizeBytes };
   }
@@ -599,10 +797,7 @@ const compactToolPartsToByteLimit = (
     const compactedPart = compactToolPartForStorage(part, {
       includeProtectedTools,
     });
-    if (
-      estimateSerializedSizeBytes(compactedPart) >=
-      estimateSerializedSizeBytes(part)
-    ) {
+    if (estimateSizeBytes(compactedPart) >= estimateSizeBytes(part)) {
       continue;
     }
 
@@ -612,7 +807,7 @@ const compactToolPartsToByteLimit = (
         : currentPart,
     );
     compactedCount++;
-    afterSizeBytes = estimateSerializedSizeBytes(compactedParts);
+    afterSizeBytes = estimateSizeBytes(compactedParts);
   }
 
   return {
@@ -629,7 +824,10 @@ const compactNonCompletedPartForStorage = (
   if (toolPart.type?.startsWith(TOOL_TYPE_PREFIX)) {
     return {
       ...toolPart,
-      input: compactToolInputForStorage(toolPart.input),
+      input: compactToolPartInputForStorage(
+        toolPart.type.slice(TOOL_TYPE_PREFIX.length),
+        toolPart.input,
+      ),
     } as UIMessage["parts"][number];
   }
 
@@ -646,6 +844,7 @@ const compactNonCompletedPartForStorage = (
 const fitSinglePartToByteLimit = (
   part: UIMessage["parts"][number],
   byteLimit: number,
+  estimateSizeBytes: (value: unknown) => number,
 ): UIMessage["parts"][number] | null => {
   if (
     (part.type === "text" || part.type === "reasoning") &&
@@ -661,7 +860,7 @@ const fitSinglePartToByteLimit = (
         ...part,
         text: truncateStorageString(part.text, midpoint),
       } as UIMessage["parts"][number];
-      if (estimateSerializedSizeBytes([candidate]) <= byteLimit) {
+      if (estimateSizeBytes([candidate]) <= byteLimit) {
         best = candidate;
         low = midpoint + 1;
       } else {
@@ -688,7 +887,7 @@ const fitSinglePartToByteLimit = (
           }
         : {}),
     } as UIMessage["parts"][number];
-    if (estimateSerializedSizeBytes([minimalToolPart]) <= byteLimit) {
+    if (estimateSizeBytes([minimalToolPart]) <= byteLimit) {
       return minimalToolPart;
     }
 
@@ -696,14 +895,13 @@ const fitSinglePartToByteLimit = (
   }
 
   const minimalPart = { type: part.type } as UIMessage["parts"][number];
-  return estimateSerializedSizeBytes([minimalPart]) <= byteLimit
-    ? minimalPart
-    : null;
+  return estimateSizeBytes([minimalPart]) <= byteLimit ? minimalPart : null;
 };
 
 const enforceStorageByteLimit = (
   parts: UIMessage["parts"],
   byteLimit: number,
+  estimateSizeBytes: (value: unknown) => number,
 ): {
   parts: UIMessage["parts"];
   compactedCount: number;
@@ -711,6 +909,7 @@ const enforceStorageByteLimit = (
 } => {
   const protectedCompaction = compactToolPartsToByteLimit(parts, byteLimit, {
     includeProtectedTools: true,
+    estimateSizeBytes,
   });
   let compactedParts = protectedCompaction.parts;
   let compactedCount = protectedCompaction.compactedCount;
@@ -723,10 +922,7 @@ const enforceStorageByteLimit = (
   ) {
     const currentPart = compactedParts[index];
     const compactedPart = compactNonCompletedPartForStorage(currentPart);
-    if (
-      estimateSerializedSizeBytes(compactedPart) >=
-      estimateSerializedSizeBytes(currentPart)
-    ) {
+    if (estimateSizeBytes(compactedPart) >= estimateSizeBytes(currentPart)) {
       continue;
     }
 
@@ -734,20 +930,24 @@ const enforceStorageByteLimit = (
       partIndex === index ? compactedPart : part,
     );
     compactedCount++;
-    afterSizeBytes = estimateSerializedSizeBytes(compactedParts);
+    afterSizeBytes = estimateSizeBytes(compactedParts);
   }
 
   while (compactedParts.length > 1 && afterSizeBytes > byteLimit) {
     compactedParts = compactedParts.slice(1);
     compactedCount++;
-    afterSizeBytes = estimateSerializedSizeBytes(compactedParts);
+    afterSizeBytes = estimateSizeBytes(compactedParts);
   }
 
   if (compactedParts.length === 1 && afterSizeBytes > byteLimit) {
-    const fittedPart = fitSinglePartToByteLimit(compactedParts[0], byteLimit);
+    const fittedPart = fitSinglePartToByteLimit(
+      compactedParts[0],
+      byteLimit,
+      estimateSizeBytes,
+    );
     compactedParts = fittedPart ? [fittedPart] : [];
     compactedCount++;
-    afterSizeBytes = estimateSerializedSizeBytes(compactedParts);
+    afterSizeBytes = estimateSizeBytes(compactedParts);
   }
 
   return { parts: compactedParts, compactedCount, afterSizeBytes };
@@ -766,12 +966,15 @@ export function compactMessageForStorage<T extends UIMessage>(
   {
     softLimitBytes = STORAGE_MESSAGE_SOFT_LIMIT_BYTES,
     toolOutputTokenBudget = STORAGE_TOOL_OUTPUT_TOKEN_BUDGET,
+    estimateSizeBytes = estimateSerializedSizeBytes,
   }: {
     softLimitBytes?: number;
     toolOutputTokenBudget?: number;
+    /** Use the destination's value encoding when it differs from JSON. */
+    estimateSizeBytes?: (value: unknown) => number;
   } = {},
 ): StorageCompactionResult<T> {
-  const beforeSizeBytes = estimateSerializedSizeBytes(message.parts);
+  const beforeSizeBytes = estimateSizeBytes(message.parts);
   let strippedReportSnapshots = false;
   const snapshotParts =
     message.role === "assistant"
@@ -806,7 +1009,7 @@ export function compactMessageForStorage<T extends UIMessage>(
     return stripped as UIMessage["parts"][number];
   });
 
-  let afterSizeBytes = estimateSerializedSizeBytes(parts);
+  let afterSizeBytes = estimateSizeBytes(parts);
   let prunedCount = 0;
 
   if (afterSizeBytes > softLimitBytes) {
@@ -817,30 +1020,31 @@ export function compactMessageForStorage<T extends UIMessage>(
     );
     parts = pruneResult.messages[0]?.parts ?? parts;
     prunedCount += pruneResult.prunedCount;
-    afterSizeBytes = estimateSerializedSizeBytes(parts);
+    afterSizeBytes = estimateSizeBytes(parts);
   }
 
   if (afterSizeBytes > softLimitBytes) {
     const pruneResult = pruneToolOutputs([{ ...message, parts }], 0, 0);
     parts = pruneResult.messages[0]?.parts ?? parts;
     prunedCount += pruneResult.prunedCount;
-    afterSizeBytes = estimateSerializedSizeBytes(parts);
+    afterSizeBytes = estimateSizeBytes(parts);
   }
 
   if (afterSizeBytes > softLimitBytes) {
     parts = compactReasoningParts(parts);
-    afterSizeBytes = estimateSerializedSizeBytes(parts);
+    afterSizeBytes = estimateSizeBytes(parts);
   }
 
   if (afterSizeBytes > softLimitBytes) {
     parts = stripStorageOnlyParts(parts);
-    afterSizeBytes = estimateSerializedSizeBytes(parts);
+    afterSizeBytes = estimateSizeBytes(parts);
   }
 
   if (afterSizeBytes > softLimitBytes) {
     const byteCompactionResult = compactToolPartsToByteLimit(
       parts,
       softLimitBytes,
+      { estimateSizeBytes },
     );
     parts = byteCompactionResult.parts;
     prunedCount += byteCompactionResult.compactedCount;
@@ -848,7 +1052,11 @@ export function compactMessageForStorage<T extends UIMessage>(
   }
 
   if (afterSizeBytes > softLimitBytes) {
-    const hardLimitResult = enforceStorageByteLimit(parts, softLimitBytes);
+    const hardLimitResult = enforceStorageByteLimit(
+      parts,
+      softLimitBytes,
+      estimateSizeBytes,
+    );
     parts = hardLimitResult.parts;
     prunedCount += hardLimitResult.compactedCount;
     afterSizeBytes = hardLimitResult.afterSizeBytes;
@@ -1226,7 +1434,7 @@ export function pruneModelMessages(
         partIdx: pi,
         toolName: part.toolName,
         toolCallId: part.toolCallId,
-        output: modelOutputValue,
+        output: part.output,
         tokens,
       });
     }
@@ -1294,7 +1502,7 @@ export function pruneModelMessages(
       const placeholder = buildPlaceholderFromParts(
         resultPart.toolName,
         args,
-        unwrapModelToolOutput(resultPart.output),
+        resultPart.output,
       );
 
       return { ...resultPart, output: toTextModelToolOutput(placeholder) };

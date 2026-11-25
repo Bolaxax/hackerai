@@ -207,6 +207,7 @@ describe("BudgetMonitor", () => {
         extraUsageAutoReload: false,
         extraUsageOverflowAllowed: false,
         capReasonOnExhaustion: "paid_daily_free_allowance_cut_off",
+        paidDailyFreeAllowance: { mode: "agent" },
       },
       writer,
       "pro",
@@ -230,6 +231,43 @@ describe("BudgetMonitor", () => {
           capReason: "paid_daily_free_allowance_cut_off",
           limitDollars: 0.1,
         }),
+      }),
+    );
+  });
+
+  it("updates the paid daily allowance banner when a threshold is crossed", () => {
+    const writer = makeWriter();
+    const monitor = new BudgetMonitor(
+      {
+        monthlyLimitPoints: 2500,
+        monthlyRemainingAtStart: 2500,
+        monthlyResetTime: new Date("2026-06-12T00:00:00.000Z"),
+        extraUsageEnabledAtStart: false,
+        extraUsageHasBalanceAtStart: false,
+        extraUsageBalanceAtStart: 0,
+        extraUsageAutoReload: false,
+        extraUsageOverflowAllowed: false,
+        capReasonOnExhaustion: "paid_daily_free_allowance_cut_off",
+        paidDailyFreeAllowance: { mode: "agent" },
+      },
+      writer,
+      "pro",
+    );
+
+    expect(monitor.checkAfterStep(0.2)).toEqual({ type: "continue" });
+    expect(writer.write).toHaveBeenCalledTimes(1);
+    expect(writer.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "data-rate-limit-warning",
+        data: {
+          warningType: "paid-daily-free-allowance",
+          resetTime: "2026-06-12T00:00:00.000Z",
+          subscription: "pro",
+          mode: "agent",
+          costLimitDollars: 0.25,
+          usedDollars: 0.2,
+          midStream: true,
+        },
       }),
     );
   });
@@ -384,4 +422,58 @@ it("cuts off total serving cost at the remaining daily Free Agent budget", () =>
       }),
     }),
   );
+});
+
+describe("BudgetMonitor stop pressure", () => {
+  const noExtraUsage = {
+    ...baseSnapshot,
+    monthlyRemainingAtStart: 20,
+    extraUsageEnabledAtStart: false,
+  };
+
+  it("reports projected usage only after a step when 100% would stop the run", () => {
+    const monitor = new BudgetMonitor(noExtraUsage, makeWriter(), "pro");
+    // A run starting above the threshold has not yet consumed anything.
+    expect(monitor.getStopPressurePercent()).toBeUndefined();
+    monitor.checkAfterStep(0.0005); // 5 points → 85%
+    expect(monitor.getStopPressurePercent()).toBeCloseTo(85);
+    monitor.checkAfterStep(0.0011); // 11 points → 91%
+    expect(monitor.getStopPressurePercent()).toBeCloseTo(91);
+  });
+
+  it.each([
+    ["auto-reload", {}],
+    ["a positive balance", { extraUsageAutoReload: false }],
+  ])(
+    "reports no pressure when extra usage with %s absorbs overflow",
+    (_, overrides) => {
+      const monitor = new BudgetMonitor(
+        { ...baseSnapshot, ...overrides, monthlyRemainingAtStart: 20 },
+        makeWriter(),
+        "pro",
+      );
+      monitor.checkAfterStep(0.0011);
+      expect(monitor.getStopPressurePercent()).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ["overflow is disallowed", { extraUsageOverflowAllowed: false }],
+    [
+      "the monthly extra-usage cap is spent",
+      { extraUsageMonthlyRemainingAtStart: 0 },
+    ],
+    [
+      "the balance is empty without auto-reload",
+      { extraUsageAutoReload: false, extraUsageBalanceAtStart: 0 },
+    ],
+  ])("reports pressure when %s", (_, overrides) => {
+    const monitor = new BudgetMonitor(
+      { ...baseSnapshot, ...overrides, monthlyRemainingAtStart: 20 },
+      makeWriter(),
+      "pro",
+    );
+    monitor.checkAfterStep(0.0011);
+    expect(monitor.getStopPressurePercent()).toBeCloseTo(91);
+  });
 });

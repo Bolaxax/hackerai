@@ -57,6 +57,31 @@ without a metric exporter.
 Regular connection, readiness, cancellation and timeout failure diagnostics
 remain available in Vercel and Trigger logs.
 
+## Desktop command receiver lifecycle
+
+Isolated Desktop command receivers emit content-free JSON records named
+`desktop_command_receiver` to their server logs. Join `command_id` and
+`trigger_run_id` to the sender's command-start and settlement events, and resolve
+worker/build identity from the enclosing run. Ask receivers can lack a Trigger
+run ID. These records do not include command text, output, paths, credentials,
+or raw exception messages.
+
+Each receiver emits at most 12 lifecycle transitions and one cleanup record.
+The final record retains cumulative ACK/resume attempts, cursor publication
+failures, suppressed transitions, subscription generation, received/published
+sequence cursors, terminal type and cancellation confirmation. Routine prefix
+ACKs update counters without emitting individual records. Repeated failures can
+exhaust the transition budget; use final counters rather than interpreting the
+remaining sequence as a complete trace.
+
+`cursor_published` means the broker accepted an ACK/resume publication, not that
+the native sender received it. `terminal_ack_published` cleanup therefore needs
+a matching sender settlement to establish terminal receipt. `cancel_confirmed`
+means the remote cancellation response was affirmative, not that every output
+frame was delivered. A missing cleanup record remains unknown, including worker
+termination or lost log export. These diagnostics do not prove durable output
+persistence, task success, or summary fidelity.
+
 ## Operation channel compatibility
 
 Clients advertising `operationChannels` accept an `operationChannel: true`
@@ -81,7 +106,11 @@ Local/Desktop record stores also emit two counters:
 `hackerai.local_relay.terminal_record_payload_bytes`. Cloud stores emit neither.
 Both use bounded labels only: `source` (Agent, chat handler, or unknown when
 unavailable), `operation`, `outcome`, `transport` (`native_file` or
-`posix_command`), and `reason` (`none`, `windows`, or `node_unavailable`). No
+`posix_command`), and `reason` (`none`, `windows`, or `node_unavailable`). Checkpoint writes also
+include `failure_category`: a bounded transport, filesystem, unsupported-client,
+unsafe-artifact, or unknown classification; successful and unclassified operations
+use `none`. Shell stderr is classified locally and discarded, never used as a
+metric label. No
 commands, output, paths, user/scope/session identifiers, or error text are labels.
 
 - `checkpoint_write`: UTF-8 bytes in the complete serialized record submitted
@@ -113,7 +142,19 @@ flow toward the server, although both pass through the relay.
 
 Use the chronological within-minute query above with the new metric name and
 partition by **machine, worker, operation, outcome, transport, reason and
-source**. Never sum cumulative snapshots. The same initial/boundary/reset
+source and failure_category** (including missing labels on older workers). Never sum cumulative snapshots. The same initial/boundary/reset
 under-counting and exporter-coverage limits apply. Compare complete UTC windows
 and the mix of fallback outcomes before changing persistence behavior. These
 metrics arrive after the server deployment; no client update is required.
+
+## File response recovery
+
+Isolated file requests can opt into `fileResponseAck`. The client retains the
+first completed response, bounded by an aggregate 4 MiB budget and the original
+operation deadline, until the server acknowledges receipt on the same operation
+channel. Retries use backoff and check receiver presence before retransmitting
+payloads. They resend only the response, never the filesystem operation. Stops
+and connection replacement discard old response state. Older clients ignore the
+opt-in field and keep their existing delivery behavior; legacy shared-channel
+requests do not enable this protocol. Deployment alone does not prove that a
+client loaded the new router.

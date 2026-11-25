@@ -5,15 +5,18 @@ import type { ChatMessage, ChatMode, ChatStatus } from "@/types";
 jest.mock("../MessagePartHandler", () => ({
   MessagePartHandler: ({
     part,
+    partIndex,
     keepLatestReasoningOpenDuringStreaming,
     deferReasoningCollapseUntilParent,
   }: {
     part: any;
+    partIndex: number;
     keepLatestReasoningOpenDuringStreaming?: boolean;
     deferReasoningCollapseUntilParent?: boolean;
   }) => (
     <div
       data-testid={`part-${part.type}`}
+      data-part-index={partIndex}
       data-keep-latest-reasoning-open={String(
         !!keepLatestReasoningOpenDuringStreaming,
       )}
@@ -59,7 +62,20 @@ jest.mock("../BranchIndicator", () => ({
 }));
 
 jest.mock("../FinishReasonNotice", () => ({
-  FinishReasonNotice: () => <div data-testid="finish-reason-notice" />,
+  FinishReasonNotice: ({
+    onContinue,
+    lastSavedStep,
+  }: {
+    onContinue?: () => void;
+    lastSavedStep?: string;
+  }) => (
+    <div
+      data-testid="finish-reason-notice"
+      data-last-saved-step={lastSavedStep}
+    >
+      {onContinue && <button onClick={() => onContinue()}>Resume</button>}
+    </div>
+  ),
 }));
 
 const assistantMessage = {
@@ -134,6 +150,102 @@ const renderMessageItem = ({
   );
 
 describe("MessageItem WorkedFor rendering", () => {
+  it("does not call an invisible step marker visible Agent progress", () => {
+    const { unmount } = renderMessageItem({
+      mode: "agent",
+      message: {
+        ...assistantMessage,
+        parts: [{ type: "step-start" }],
+      } as ChatMessage,
+    });
+    expect(screen.getByTestId("finish-reason-notice")).toHaveAttribute(
+      "data-last-saved-step",
+      "conversation",
+    );
+
+    unmount();
+    renderMessageItem({ mode: "agent" });
+    expect(screen.getByTestId("finish-reason-notice")).toHaveAttribute(
+      "data-last-saved-step",
+      "agent-progress",
+    );
+  });
+
+  it.each([false, true])(
+    "counts a file as visible progress only when it renders (whitespace text: %s)",
+    (withWhitespace) => {
+      const file = {
+        type: "file",
+        mediaType: "text/plain",
+        url: "/file",
+      } as const;
+      renderMessageItem({
+        mode: "agent",
+        message: {
+          ...assistantMessage,
+          parts: withWhitespace ? [file, { type: "text", text: " " }] : [file],
+        },
+      });
+
+      if (withWhitespace) {
+        expect(screen.queryByTestId("part-file")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByTestId("part-file")).toBeInTheDocument();
+      }
+      expect(screen.getByTestId("finish-reason-notice")).toHaveAttribute(
+        "data-last-saved-step",
+        withWhitespace ? "conversation" : "agent-progress",
+      );
+    },
+  );
+
+  it("shows a saved goal's completion time on its answer", () => {
+    renderMessageItem({
+      mode: "agent",
+      message: {
+        ...assistantMessage,
+        metadata: { goal: { achievedElapsedMs: 52000 } },
+      },
+    });
+    expect(screen.getByLabelText("Goal message status")).toHaveTextContent(
+      "Goal achieved in 52s",
+    );
+  });
+
+  it("uses the current Resume callback through the real memoized message component", () => {
+    const previous = jest.fn();
+    const current = jest.fn();
+    const props = {
+      message: assistantMessage,
+      index: 1,
+      messagesLength: 2,
+      lastAssistantMessageIndex: 1,
+      lastUserMessageIndex: 0,
+      finishReason: "local-connection-lost",
+      status: "ready" as const,
+      canEdit: false,
+      isEditing: false,
+      feedbackInputMessageId: null,
+      branchBoundaryIndex: undefined,
+      onStartEdit: jest.fn(),
+      onSaveEdit: jest.fn(async () => {}),
+      onCancelEdit: jest.fn(),
+      onRegenerate: jest.fn(),
+      onFeedback: jest.fn(),
+      onFeedbackSubmit: jest.fn(async () => {}),
+      onFeedbackCancel: jest.fn(),
+      onShowAllFiles: jest.fn(),
+      getCachedUrl: jest.fn(),
+    };
+    const { rerender } = render(
+      <MessageItem {...props} onContinue={previous} />,
+    );
+    rerender(<MessageItem {...props} onContinue={current} />);
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(current).toHaveBeenCalledTimes(1);
+    expect(previous).not.toHaveBeenCalled();
+  });
+
   it("hides a stopped run's recovery notice after a newer user message", () => {
     const props = {
       message: assistantMessage,
@@ -262,6 +374,47 @@ describe("MessageItem WorkedFor rendering", () => {
     expect(screen.queryByText(/worked for/i)).not.toBeInTheDocument();
     expect(screen.getByText("ran command")).toBeInTheDocument();
     expect(screen.getByText("final answer")).toBeInTheDocument();
+  });
+
+  it("shows a steer the Agent read between the tool calls it separated", () => {
+    renderMessageItem({
+      mode: "agent",
+      message: {
+        ...assistantMessage,
+        parts: [
+          { type: "step-start" },
+          {
+            type: "tool-shell",
+            toolCallId: "call-1",
+            state: "output-available",
+            input: "first",
+          },
+          {
+            type: "data-agent-steer",
+            id: "steer-1",
+            data: { id: "steer-1", text: "Use staging" },
+          },
+          { type: "step-start" },
+          {
+            type: "tool-shell",
+            toolCallId: "call-2",
+            state: "output-available",
+            input: "second",
+          },
+          { type: "text", text: "final answer" },
+        ],
+      } as ChatMessage,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /worked for/i }));
+    const rendered = screen
+      .getAllByTestId(/^part-/)
+      .map((element) => element.getAttribute("data-part-index"));
+    expect(screen.getByTestId("part-data-agent-steer")).toHaveAttribute(
+      "data-part-index",
+      "2",
+    );
+    expect(rendered.indexOf("2")).toBeGreaterThan(rendered.indexOf("1"));
+    expect(rendered.indexOf("2")).toBeLessThan(rendered.indexOf("4"));
   });
 
   it("shows Worked for for messages generated in agent mode", () => {
@@ -574,6 +727,169 @@ describe("MessageItem WorkedFor rendering", () => {
   });
 });
 
+describe("MessageItem saved hunt results", () => {
+  const savedCompletion = {
+    type: "tool-complete_finding_hunt",
+    toolCallId: "complete-1",
+    state: "output-available",
+    input: "saved hunt card",
+    output: { success: true, hunt_id: "h1", counts: { reproduced: 1 } },
+  };
+  const huntMessage = (
+    parts: unknown[],
+    metadata: Record<string, unknown> = {
+      mode: "agent",
+      generationTimeMs: 1_500,
+    },
+  ) => ({ ...assistantMessage, parts, metadata }) as unknown as ChatMessage;
+  const cards = () =>
+    screen.queryAllByTestId("part-tool-complete_finding_hunt");
+  const workAndAnswer = [
+    { type: "step-start" },
+    { type: "tool-shell", input: "ran command", state: "output-available" },
+    savedCompletion,
+    { type: "text", text: "final answer" },
+  ];
+
+  it("shows the saved card once outside collapsed Worked for, keeping the answer", () => {
+    renderMessageItem({ mode: "agent", message: huntMessage(workAndAnswer) });
+
+    const trigger = screen.getByRole("button", { name: /worked for 2s/i });
+    expect(screen.queryByText("ran command")).not.toBeInTheDocument();
+    expect(cards()).toHaveLength(1);
+    // The card keeps its own position in the message.
+    expect(cards()[0]).toHaveAttribute("data-part-index", "2");
+    expect(screen.getByText("final answer")).toBeInTheDocument();
+
+    fireEvent.click(trigger);
+    expect(screen.getByText("ran command")).toBeInTheDocument();
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("shows it once while the run is still streaming", () => {
+    renderMessageItem({
+      mode: "agent",
+      status: "streaming",
+      message: huntMessage(workAndAnswer, {
+        mode: "agent",
+        generationStartedAt: Date.now(),
+      }),
+    });
+    expect(screen.getByText("ran command")).toBeInTheDocument();
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("shows it once when the run ended without final text", () => {
+    renderMessageItem({
+      mode: "agent",
+      message: huntMessage(workAndAnswer.slice(0, 3)),
+    });
+    expect(screen.getByText("ran command")).toBeInTheDocument();
+    expect(cards()).toHaveLength(1);
+  });
+
+  it.each([
+    ["with", workAndAnswer],
+    ["without", workAndAnswer.slice(0, 3)],
+  ])(
+    "shows it once in the timeline answer shell %s final text",
+    (_label, parts) => {
+      renderMessageItem({
+        mode: "agent",
+        message: huntMessage(parts),
+        workPresentation: "timeline-shell",
+      });
+      // Work belongs to the virtual timeline rows; the card stays here.
+      expect(screen.queryByTestId("part-tool-shell")).not.toBeInTheDocument();
+      expect(cards()).toHaveLength(1);
+      expect(cards()[0]).toHaveAttribute("data-part-index", "2");
+    },
+  );
+
+  it("keeps a refused completion in the collapsed work, never as a saved card", () => {
+    renderMessageItem({
+      mode: "agent",
+      message: huntMessage([
+        { type: "tool-shell", input: "ran command", state: "output-available" },
+        { ...savedCompletion, output: { success: false, error: "conflict" } },
+        { type: "text", text: "final answer" },
+      ]),
+    });
+    expect(cards()).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /worked for 2s/i }));
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("leaves non-Agent rendering in place", () => {
+    renderMessageItem({
+      mode: "agent",
+      message: huntMessage(workAndAnswer, { mode: "ask" }),
+    });
+    expect(cards()).toHaveLength(1);
+    expect(screen.getByText("ran command")).toBeInTheDocument();
+  });
+
+  describe("read report card", () => {
+    const readReport = {
+      type: "tool-get_report",
+      toolCallId: "read-1",
+      state: "output-available",
+      input: "saved report card",
+      output: {
+        success: true,
+        report: {
+          finding_id: "finding-1",
+          title: "Help panel exposure",
+          target: "demo.example.test",
+          severity: "medium",
+          cvss_score: 5.3,
+        },
+      },
+    };
+    const reportCards = () => screen.queryAllByTestId("part-tool-get_report");
+    const readAndAnswer = [
+      { type: "step-start" },
+      { type: "tool-shell", input: "ran command", state: "output-available" },
+      readReport,
+      { type: "text", text: "Use Download PDF on the card." },
+    ];
+
+    it.each(["inline", "timeline-shell"] as const)(
+      "shows a successful read once outside collapsed work (%s)",
+      (workPresentation) => {
+        renderMessageItem({
+          mode: "agent",
+          message: huntMessage(readAndAnswer),
+          workPresentation,
+        });
+        expect(screen.queryByText("ran command")).not.toBeInTheDocument();
+        expect(reportCards()).toHaveLength(1);
+        expect(reportCards()[0]).toHaveAttribute("data-part-index", "2");
+        expect(
+          screen.getByText("Use Download PDF on the card."),
+        ).toBeInTheDocument();
+      },
+    );
+
+    it("keeps a failed read in the collapsed work", () => {
+      renderMessageItem({
+        mode: "agent",
+        message: huntMessage([
+          readAndAnswer[1],
+          {
+            ...readReport,
+            output: { success: false, error: "not_found", message: "x" },
+          },
+          readAndAnswer[3],
+        ]),
+      });
+      expect(reportCards()).toHaveLength(0);
+      fireEvent.click(screen.getByRole("button", { name: /worked for 2s/i }));
+      expect(reportCards()).toHaveLength(1);
+    });
+  });
+});
+
 describe("MessageItem user message collapse", () => {
   it("collapses long user messages behind a full-message button", () => {
     const longMessage = Array.from({ length: 24 }, (_, index) =>
@@ -660,5 +976,87 @@ describe("MessageItem user message collapse", () => {
     expect(
       screen.queryByRole("button", { name: /show fulll message/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("MessageItem stopped-run divider", () => {
+  const stoppedReply = {
+    ...assistantMessage,
+    metadata: { ...assistantMessage.metadata, userStopped: true },
+  } as ChatMessage;
+  const baseProps = {
+    message: stoppedReply,
+    index: 1,
+    messagesLength: 2,
+    lastAssistantMessageIndex: 1,
+    lastUserMessageIndex: 0,
+    status: "ready" as ChatStatus,
+    canEdit: false,
+    isEditing: false,
+    feedbackInputMessageId: null,
+    branchBoundaryIndex: undefined,
+    onStartEdit: jest.fn(),
+    onSaveEdit: jest.fn(async () => {}),
+    onCancelEdit: jest.fn(),
+    onRegenerate: jest.fn(),
+    onFeedback: jest.fn(),
+    onFeedbackSubmit: jest.fn(async () => {}),
+    onFeedbackCancel: jest.fn(),
+    onShowAllFiles: jest.fn(),
+    getCachedUrl: jest.fn(),
+  };
+
+  it("appears below the actions when the saved marker arrives with unchanged parts", () => {
+    const { rerender } = render(
+      <MessageItem {...baseProps} message={assistantMessage} />,
+    );
+    expect(screen.queryByTestId("user-stop-divider")).not.toBeInTheDocument();
+
+    // Same id and parts, as when the Convex marker reconciles after Stop.
+    rerender(<MessageItem {...baseProps} message={stoppedReply} />);
+    const divider = screen.getByTestId("user-stop-divider");
+    expect(divider).toHaveTextContent("Run interrupted · Stopped by user");
+    expect(
+      screen.getByTestId("message-actions").compareDocumentPosition(divider) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("stays attached to a stopped request after a follow-up", () => {
+    render(
+      <MessageItem
+        {...baseProps}
+        message={{
+          ...createUserMessage("Scan the host"),
+          metadata: { userStopped: true },
+        }}
+        index={0}
+        messagesLength={3}
+        lastAssistantMessageIndex={2}
+        lastUserMessageIndex={1}
+        canEdit
+      />,
+    );
+    expect(screen.getByTestId("user-stop-divider")).toBeInTheDocument();
+  });
+
+  it("is hidden while that message is still streaming", () => {
+    render(<MessageItem {...baseProps} status="streaming" />);
+    expect(screen.queryByTestId("user-stop-divider")).not.toBeInTheDocument();
+  });
+
+  it("replaces a generic finish notice but keeps a recovery notice", () => {
+    const { rerender } = render(
+      <MessageItem {...baseProps} finishReason="tool-calls" />,
+    );
+    expect(screen.getByTestId("user-stop-divider")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("finish-reason-notice"),
+    ).not.toBeInTheDocument();
+
+    rerender(
+      <MessageItem {...baseProps} finishReason="local-connection-lost" />,
+    );
+    expect(screen.getByTestId("finish-reason-notice")).toBeInTheDocument();
   });
 });

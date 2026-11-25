@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+import { AgentCrashRecoveryReplayLimitError } from "../agent-crash-recovery-error";
 
 const mockGetUserIDAndPro = jest.fn();
 const mockGetChatById = jest.fn();
@@ -74,9 +75,98 @@ const requestFor = (chatId: string) =>
 describe("agent resume route", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetChatById.mockReset();
+    mockSetActiveTriggerRun.mockReset();
+    mockRunsRetrieve.mockReset();
+    mockRecover.mockReset();
     mockRecover.mockResolvedValue("recovered" as never);
     mockGetUserIDAndPro.mockResolvedValue({ userId: "user-1" } as never);
   });
+
+  it("returns a non-retryable blocked replay result without detaching or issuing another stream token", async () => {
+    const { createAgentResumeGet } = await import("../agent-resume-route");
+    mockGetChatById.mockResolvedValue({
+      id: "chat-1",
+      user_id: "user-1",
+      active_trigger_run_id: "run-1",
+      active_agent_approval_session_id: "approval-1",
+    } as never);
+    mockRunsRetrieve.mockResolvedValue({
+      status: "CRASHED",
+      metadata: { chatId: "chat-1", userId: "user-1" },
+    } as never);
+    const context = {
+      replay_limit_diagnostic_version: 1,
+      replay_prefix_bytes: 8_000_000,
+      replay_discarded_prefix_bytes: 7_000_000,
+      replay_prefix_record_count: 42,
+      replay_crossing_record_bytes: 400_000,
+    } as const;
+    mockRecover.mockRejectedValueOnce(
+      new AgentCrashRecoveryReplayLimitError(context) as never,
+    );
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const response = await createAgentResumeGet({ endpoint: "/api/agent" })(
+        requestFor("chat-1"),
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        code: "bad_request:api",
+        cause:
+          "This Agent run stopped. Saved messages are preserved, but its remaining output could not be restored automatically.",
+        metadata: { recovery: "blocked" },
+      });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(warn.mock.calls[0][0] as string)).toEqual({
+        event: "agent_crash_recovery_blocked",
+        service: "hackerai-web",
+        action: "resume",
+        reason: "replay_byte_limit",
+        chat_id: "chat-1",
+        user_id: "user-1",
+        trigger_run_id: "run-1",
+        ...context,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+    expect(mockSetActiveTriggerRun).not.toHaveBeenCalled();
+    expect(mockCloseAgentApprovalSession).not.toHaveBeenCalled();
+    expect(mockCreatePublicToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { activeRun: undefined, owner: "user-1", expectedStatus: 204 },
+    { activeRun: "run-new", owner: "user-1", expectedStatus: 409 },
+    { activeRun: undefined, owner: "user-other", expectedStatus: 403 },
+  ])(
+    "reconciles a terminal detach race without hiding a replacement run: $expectedStatus",
+    async ({ activeRun, owner, expectedStatus }) => {
+      const { createAgentResumeGet } = await import("../agent-resume-route");
+      mockGetChatById
+        .mockResolvedValueOnce({
+          user_id: "user-1",
+          active_trigger_run_id: "run-stopped",
+        } as never)
+        .mockResolvedValueOnce({
+          user_id: owner,
+          active_trigger_run_id: activeRun,
+        } as never);
+      mockRunsRetrieve.mockResolvedValueOnce({ status: "CANCELED" } as never);
+      mockSetActiveTriggerRun.mockResolvedValueOnce("stale" as never);
+      const response = await createAgentResumeGet({ endpoint: "/api/agent" })(
+        requestFor("chat-1"),
+      );
+      expect(response.status).toBe(expectedStatus);
+      expect(mockSetActiveTriggerRun).toHaveBeenCalledTimes(1);
+      expect(mockSetActiveTriggerRun).toHaveBeenCalledWith(
+        expect.objectContaining({ expectedRunId: "run-stopped" }),
+      );
+      expect(mockCreatePublicToken).not.toHaveBeenCalled();
+    },
+  );
 
   it("awaits crash recovery before detaching and leaves mapping intact on failure", async () => {
     const { createAgentResumeGet } = await import("../agent-resume-route");

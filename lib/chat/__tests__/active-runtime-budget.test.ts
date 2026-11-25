@@ -52,6 +52,33 @@ describe("createActiveRuntimeBudget", () => {
     expect(onExceeded).toHaveBeenCalledTimes(1);
     budget.dispose();
   });
+
+  it.each([-30_000, 90_000])(
+    "preserves the active time budget across a %i ms wall-clock change",
+    (wallClockChangeMs) => {
+      const onExceeded = jest.fn();
+      const budget = createActiveRuntimeBudget({
+        maxDurationMs: 1_000,
+        initialElapsedMs: 100,
+        onExceeded,
+      });
+
+      jest.advanceTimersByTime(300);
+      jest.setSystemTime(Date.now() + wallClockChangeMs);
+      budget.pause();
+      expect(budget.getElapsedTimeMs()).toBe(400);
+
+      jest.advanceTimersByTime(10_000);
+      budget.resume();
+      jest.advanceTimersByTime(599);
+      expect(onExceeded).not.toHaveBeenCalled();
+
+      jest.advanceTimersByTime(1);
+      jest.advanceTimersByTime(1_000);
+      expect(onExceeded).toHaveBeenCalledTimes(1);
+      expect(budget.getElapsedTimeMs()).toBe(1_000);
+    },
+  );
 });
 
 describe("createRuntimeSettlementWatchdog", () => {
@@ -85,6 +112,31 @@ describe("createRuntimeSettlementWatchdog", () => {
       stalledForMs: 30_000,
     });
   });
+
+  it.each([
+    ["backward", -60_000],
+    ["forward", 60_000],
+  ])(
+    "reports the monotonic stall duration after a %s wall-clock step",
+    (_direction, wallClockStepMs) => {
+      const onStalled = jest.fn();
+      const watchdog = createRuntimeSettlementWatchdog({
+        delayMs: 30_000,
+        onStalled,
+      });
+
+      const exceededAt = Date.now();
+      watchdog.arm();
+      jest.setSystemTime(exceededAt + wallClockStepMs);
+      jest.advanceTimersByTime(30_000);
+
+      expect(onStalled).toHaveBeenCalledTimes(1);
+      expect(onStalled).toHaveBeenCalledWith({
+        runtimeBudgetExceededAt: exceededAt,
+        stalledForMs: 30_000,
+      });
+    },
+  );
 
   it("does not report after run cleanup begins", () => {
     const onStalled = jest.fn();

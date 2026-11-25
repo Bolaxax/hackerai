@@ -7,6 +7,10 @@ import {
   LEGACY_USAGE_COST_MULTIPLIER,
   utcDay,
 } from "./unitEconomicsLib";
+import {
+  getUsageModelLabel,
+  usageModelSelectionValidator,
+} from "./lib/usageModelSelection";
 
 const typeValidator = v.union(
   v.literal("included"),
@@ -39,6 +43,7 @@ export const logUsage = mutation({
   args: {
     serviceKey: v.string(),
     usage_settlement_id: v.optional(v.string()),
+    admission_operation_id: v.optional(v.string()),
     user_id: v.string(),
     organization_id: v.optional(v.string()),
     chat_id: v.optional(v.string()),
@@ -65,6 +70,7 @@ export const logUsage = mutation({
     included_points_deducted: v.optional(v.number()),
     extra_usage_points_deducted: v.optional(v.number()),
     uncovered_points: v.optional(v.number()),
+    usage_deduction_outcome_unknown: v.optional(v.boolean()),
     usage_deduction_failure_reason: v.optional(
       usageDeductionFailureReasonValidator,
     ),
@@ -78,10 +84,33 @@ export const logUsage = mutation({
         v.literal("raw_token_estimate"),
       ),
     ),
+    model_selection: v.optional(usageModelSelectionValidator),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
+
+    // One settlement produces one ledger row. A replay must not add a second
+    // daily delta; a reused ID from another account scope is a caller bug.
+    if (args.usage_settlement_id) {
+      const existing = await ctx.db
+        .query("usage_logs")
+        .withIndex("by_usage_settlement_id", (q) =>
+          q.eq("usage_settlement_id", args.usage_settlement_id),
+        )
+        .first();
+      if (existing) {
+        if (
+          existing.user_id !== args.user_id ||
+          existing.organization_id !== args.organization_id
+        ) {
+          throw new Error(
+            "Usage settlement ID is already recorded for another account",
+          );
+        }
+        return null;
+      }
+    }
 
     const nonModelCostDollars = Number.isFinite(args.non_model_cost_dollars)
       ? args.non_model_cost_dollars!
@@ -142,6 +171,7 @@ export const logUsage = mutation({
 
     await ctx.db.insert("usage_logs", {
       usage_settlement_id: args.usage_settlement_id,
+      admission_operation_id: args.admission_operation_id,
       user_id: args.user_id,
       organization_id: args.organization_id,
       chat_id: args.chat_id,
@@ -163,9 +193,11 @@ export const logUsage = mutation({
       extra_usage_points_deducted: args.extra_usage_points_deducted,
       uncovered_points: args.uncovered_points,
       usage_deduction_failure_reason: args.usage_deduction_failure_reason,
+      usage_deduction_outcome_unknown: args.usage_deduction_outcome_unknown,
       model_cost_dollars: modelCostDollars,
       non_model_cost_dollars: nonModelCostDollars,
       cost_source: costSource,
+      model_selection: args.model_selection,
     });
 
     const commonDelta = {
@@ -286,7 +318,18 @@ export const getUserUsageLogs = query({
         _id: log._id,
         _creationTime: log._creationTime,
         assistant_message_id: log.assistant_message_id,
+        // `model` stays the recorded route for CSV export compatibility.
         model: cleanModelName(log.model),
+        model_label: getUsageModelLabel(
+          cleanModelName(log.model),
+          log.model_selection,
+        ),
+        initial_model: log.model_selection?.fallback_model
+          ? cleanModelName(log.model_selection.initial_model)
+          : undefined,
+        fallback_model: log.model_selection?.fallback_model
+          ? cleanModelName(log.model_selection.fallback_model)
+          : undefined,
         type: log.type as "included" | "extra" | "mixed",
         input_tokens: log.input_tokens,
         output_tokens: log.output_tokens,
@@ -306,7 +349,8 @@ export const getUserUsageLogs = query({
         uncovered_points: log.uncovered_points,
         usage_deduction_failed:
           (log.uncovered_points ?? 0) > 0 ||
-          log.usage_deduction_failure_reason !== undefined,
+          log.usage_deduction_failure_reason !== undefined ||
+          log.usage_deduction_outcome_unknown === true,
         usage_deduction_failure_reason: log.usage_deduction_failure_reason,
         model_cost_dollars: log.model_cost_dollars,
         non_model_cost_dollars: log.non_model_cost_dollars,

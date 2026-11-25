@@ -39,7 +39,7 @@ pub fn get_shell_config() -> ShellConfig {
             if let Some(bash) = find_git_bash() {
                 (bash, "-c", false)
             } else {
-                ("cmd".to_string(), "/C", true)
+                (windows_system_executable("cmd.exe"), "/C", true)
             }
         });
         return ShellConfig {
@@ -80,7 +80,21 @@ pub fn get_shell_config() -> ShellConfig {
 /// Locate `bash.exe` from Git for Windows. Tries:
 ///   1. `HACKERAI_BASH_PATH` env override
 ///   2. Common install locations
-///   3. `where git` → `<gitDir>/../../bin/bash.exe`
+///   3. System `where.exe` searches PATH → `<gitDir>/../../bin/bash.exe`
+#[cfg(windows)]
+fn windows_system_executable(name: &str) -> String {
+    use std::path::PathBuf;
+
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+    root.join("System32")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(windows)]
 fn find_git_bash() -> Option<String> {
     use std::os::windows::process::CommandExt;
@@ -103,8 +117,8 @@ fn find_git_bash() -> Option<String> {
         }
     }
 
-    if let Ok(out) = StdCommand::new("where")
-        .arg("git")
+    if let Ok(out) = StdCommand::new(windows_system_executable("where.exe"))
+        .arg("$PATH:git.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
@@ -112,7 +126,7 @@ fn find_git_bash() -> Option<String> {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
                 let line = line.trim();
-                if line.to_lowercase().ends_with("git.exe") {
+                if PathBuf::from(line).is_absolute() && line.to_lowercase().ends_with("git.exe") {
                     // <gitDir>/cmd/git.exe → <gitDir>/bin/bash.exe
                     let p = PathBuf::from(line);
                     if let Some(git_dir) = p.parent().and_then(|d| d.parent()) {
@@ -173,6 +187,17 @@ pub fn build_command(
         cmd.current_dir(cwd);
     }
 
+    if let Some(libraries) = crate::child_environment::appimage_library_path_override() {
+        match libraries {
+            Some(value) => {
+                cmd.env("LD_LIBRARY_PATH", value);
+            }
+            None => {
+                cmd.env_remove("LD_LIBRARY_PATH");
+            }
+        }
+    }
+
     if let Some(env) = env {
         for (k, v) in env {
             cmd.env(k, v);
@@ -185,100 +210,642 @@ pub fn build_command(
     cmd
 }
 
+/// How a bounded wait for a command's leader ended: reaped, at its existing
+/// deadline, or with an error, never its detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaderWait {
+    Reaped,
+    TimedOut,
+    Failed,
+}
+
+impl LeaderWait {
+    #[cfg(any(unix, test))]
+    fn of<T, E, D>(waited: Result<Result<T, E>, D>) -> Self {
+        match waited {
+            Ok(Ok(_)) => Self::Reaped,
+            Ok(Err(_)) => Self::Failed,
+            Err(_) => Self::TimedOut,
+        }
+    }
+}
+
+/// The results of `graceful_kill`'s existing checks, never a PID, output or
+/// OS error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GracefulKill {
+    pub(crate) tree_stopped: bool,
+    pub(crate) leader: LeaderWait,
+    /// How the tree stop's own Windows taskkill failed, only when the tree was
+    /// unconfirmed on that path; None for every other outcome and platform.
+    pub(crate) taskkill: Option<TaskkillFailure>,
+}
+
+impl GracefulKill {
+    /// The tree stop's own result, as `cancel_process_tree_observed` reported
+    /// it, beside the bounded leader wait.
+    #[cfg(any(unix, test))]
+    fn of(tree: Result<(), Option<TaskkillFailure>>, leader: LeaderWait) -> Self {
+        Self {
+            tree_stopped: tree.is_ok(),
+            leader,
+            taskkill: tree.err().flatten(),
+        }
+    }
+
+    /// `graceful_kill`'s unchanged rule: the tree stopped and the shell reaped.
+    pub(crate) fn confirmed(self) -> bool {
+        self.tree_stopped && self.leader == LeaderWait::Reaped
+    }
+}
+
 /// Gracefully kill a child process.
 ///
 /// On Unix: sends SIGTERM, waits up to 2 seconds, then sends SIGKILL.
-/// On Windows: calls kill() directly (which is always immediate).
-/// Always reaps the process with wait() afterward.
-pub async fn graceful_kill(child: &mut tokio::process::Child) {
+/// On Windows: stops the process tree before killing/reaping the shell.
+/// Reaps the process with a bounded wait() afterward. True only when the tree,
+/// as `cancel_process_tree` defines it, was confirmed stopped and the shell
+/// reaped; anything else is unknown. Only the test-only buffered command runs
+/// it; streamed commands stop through `stream_lifecycle`'s owner.
+#[cfg(test)]
+pub async fn graceful_kill(child: &mut tokio::process::Child) -> bool {
+    graceful_kill_observed(child).await.confirmed()
+}
+
+/// `graceful_kill`, which delegates here, reporting which of its checks were
+/// confirmed and, on Windows, its one taskkill call's closed failure. The
+/// signals, waits, commands and their order are unchanged. Streamed Windows
+/// commands stop through their Job instead, so its taskkill leg is test-only.
+#[cfg(any(unix, test))]
+pub(crate) async fn graceful_kill_observed(child: &mut tokio::process::Child) -> GracefulKill {
+    use std::time::Duration;
     #[cfg(unix)]
-    {
-        use std::time::Duration;
+    let stopped: Result<(), Option<TaskkillFailure>> = {
         if let Some(pid) = child.id() {
             // Send SIGTERM first for graceful shutdown
             terminate_process_group(pid, libc::SIGTERM);
             // Wait up to 2 seconds for the process to exit
             match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(_) => return,
+                Ok(_) => {}
                 Err(_) => {
                     // Process didn't exit in time, escalate to SIGKILL
                     terminate_process_group(pid, libc::SIGKILL);
                     let _ = child.kill().await;
                 }
             }
+            // A reaped shell does not prove its descendants stopped. Verify
+            // the group and escalate survivors before releasing update admission.
+            cancel_process_tree(pid).await.then_some(()).ok_or(None)
         } else {
-            // No PID available (already exited), just try kill
-            let _ = child.kill().await;
+            // Already reaped by this owner: no live PID remains to signal.
+            Ok(())
         }
-    }
+    };
 
     #[cfg(not(unix))]
-    {
+    let stopped = {
+        // Killing only bash/cmd can leave its native descendants writing
+        // files after the caller releases update admission. The same single
+        // taskkill call `cancel_process_tree` makes, keeping its closed result.
+        let stopped = match child.id() {
+            Some(pid) => cancel_process_tree_observed(pid)
+                .await
+                .map_err(|failure| failure.and_then(TreeStopFailure::taskkill)),
+            None => Ok(()),
+        };
         let _ = child.kill().await;
-    }
+        stopped
+    };
 
-    // Reap the process to avoid zombies
-    let _ = child.wait().await;
+    // Reap the process to avoid zombies, without waiting forever on a shell
+    // that cannot be stopped.
+    let leader = LeaderWait::of(tokio::time::timeout(Duration::from_secs(5), child.wait()).await);
+    GracefulKill::of(stopped, leader)
 }
 
 #[cfg(unix)]
 fn terminate_process_group(pid: u32, signal: libc::c_int) {
     let pid = pid as libc::pid_t;
+    // build_command places each command in a fresh session (spawn fails if
+    // setsid fails), making the child pid also the process-group id. Kill the
+    // group so pipelines and shell grandchildren stop together. A missing group
+    // means the tree is gone; never fall back to the positive PID, which may
+    // since name an unrelated process.
     unsafe {
-        // build_command places each command in a fresh session, making the
-        // child pid also the process-group id. Kill the group so pipelines and
-        // shell grandchildren stop together.
-        if libc::kill(-pid, signal) == -1 {
-            let _ = libc::kill(pid, signal);
-        }
+        let _ = libc::kill(-pid, signal);
     }
 }
 
 /// Cancel a streaming command and report success only after the OS confirms
-/// that the process tree is no longer running.
+/// that its tree is no longer running: on Unix, the command's process group;
+/// on Windows, `taskkill /T` from the shell. On Unix, descendants that left the
+/// group (`setsid`, `setpgid`, daemonizing) are neither signaled nor counted.
+/// An unknown outcome fences updates even when a caller returns or aborts its
+/// output readers. Other work remains available for the rest of the session.
+#[cfg(any(unix, test))]
 pub async fn cancel_process_tree(pid: u32) -> bool {
+    cancel_process_tree_observed(pid).await.is_ok()
+}
+
+/// How Windows `taskkill` failed to confirm a tree stopped: a closed class of
+/// its result, never its output, text, PID or OS error. Kept for the closed
+/// receipt schema; streamed Windows commands no longer run taskkill.
+// Only tests construct a failure.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskkillFailure {
+    /// It exited unsuccessfully, with its nonzero code when the OS reported
+    /// one, and reported nothing this matcher classifies.
+    NonzeroExit(Option<std::num::NonZeroI32>),
+    /// It exited with `TASKKILL_NOT_FOUND_EXIT` and its only output was its own
+    /// English report that the requested root PID was not found. A command
+    /// report only: never evidence about that process's descendants.
+    RequestedPidNotFound,
+    /// It could not be spawned or its completion could not be collected.
+    OutputError,
+}
+
+/// The only exit code that can carry `RequestedPidNotFound`.
+pub(crate) const TASKKILL_NOT_FOUND_EXIT: std::num::NonZeroI32 =
+    std::num::NonZeroI32::new(128).unwrap();
+
+/// How the Unix tree stop's final existing `kill(-pgid, 0)` probe kept the
+/// group unconfirmed: a closed class of that one call's result, never its
+/// errno, the PID or any process it names. Only `ESRCH` confirms the group
+/// is gone, so this never says which members, if any, survived.
+// Only the Unix path and tests construct a class.
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GroupProbe {
+    /// The probe succeeded: the group still had a member it could signal.
+    GroupVisible,
+    /// It failed with `EPERM`: a member existed that it could not signal.
+    ProbeDenied,
+    /// It failed with any other error but `ESRCH`.
+    ProbeFailed,
+}
+
+/// The existing probe's unchanged predicate as a class: None (absent) only
+/// for `ESRCH`, so `is_some()` is exactly the prior "still running".
+#[cfg(unix)]
+fn group_probe_class(result: libc::c_int, errno: Option<i32>) -> Option<GroupProbe> {
+    if result == 0 {
+        return Some(GroupProbe::GroupVisible);
+    }
+    match errno {
+        Some(libc::ESRCH) => None,
+        Some(libc::EPERM) => Some(GroupProbe::ProbeDenied),
+        _ => Some(GroupProbe::ProbeFailed),
+    }
+}
+
+/// Why a tree stop was unconfirmed: Windows' one taskkill call's closed
+/// failure, or the Unix final group probe's closed class. Each platform
+/// reports only its own; any other path reports neither.
+// Each platform constructs only its own variant outside tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeStopFailure {
+    Taskkill(TaskkillFailure),
+    GroupProbe(GroupProbe),
+}
+
+impl TreeStopFailure {
+    pub(crate) fn taskkill(self) -> Option<TaskkillFailure> {
+        match self {
+            Self::Taskkill(failure) => Some(failure),
+            Self::GroupProbe(_) => None,
+        }
+    }
+
+    pub(crate) fn group_probe(self) -> Option<GroupProbe> {
+        match self {
+            Self::GroupProbe(probe) => Some(probe),
+            Self::Taskkill(_) => None,
+        }
+    }
+}
+
+/// `cancel_process_tree`, which delegates here: Ok only when confirmed stopped.
+/// An unconfirmed outcome carries the Windows taskkill path's closed failure,
+/// or the Unix path's final group probe class; any other path reports None.
+/// Production uses only its Unix path; the Windows taskkill path is test-only.
+#[cfg(any(unix, test))]
+pub(crate) async fn cancel_process_tree_observed(pid: u32) -> Result<(), Option<TreeStopFailure>> {
     #[cfg(unix)]
-    {
+    let stopped = {
         terminate_process_group(pid, libc::SIGTERM);
         for _ in 0..10 {
             if !process_group_is_running(pid) {
-                return true;
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         terminate_process_group(pid, libc::SIGKILL);
         for _ in 0..20 {
             if !process_group_is_running(pid) {
-                return true;
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        return !process_group_is_running(pid);
-    }
+        // The same final probe and predicate, keeping its closed class.
+        match process_group_probe(pid) {
+            Some(probe) => Err(Some(TreeStopFailure::GroupProbe(probe))),
+            None => Ok(()),
+        }
+    };
 
     #[cfg(windows)]
-    {
-        return tokio::process::Command::new("taskkill")
+    let stopped = taskkill_outcome(
+        pid,
+        tokio::process::Command::new(windows_system_executable("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-    }
+            .await,
+    )
+    .map_err(|failure| Some(TreeStopFailure::Taskkill(failure)));
 
     #[cfg(not(any(unix, windows)))]
-    {
-        false
+    let stopped = Err(None);
+
+    if stopped.is_err() {
+        crate::update_safety::UPDATE_GATE.block_for_unconfirmed_command();
     }
+    stopped
+}
+
+/// Confirmed only by a successful exit, as before, whose output is never read.
+/// Otherwise which failure occurred. The captured output of a
+/// `TASKKILL_NOT_FOUND_EXIT` exit is only compared here, then dropped; no
+/// byte of it, nor the PID, leaves this function.
+#[cfg(test)]
+fn taskkill_outcome(
+    pid: u32,
+    result: std::io::Result<std::process::Output>,
+) -> Result<(), TaskkillFailure> {
+    match result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let code = output.status.code().and_then(std::num::NonZeroI32::new);
+            if code == Some(TASKKILL_NOT_FOUND_EXIT)
+                && reports_requested_pid_not_found(pid, &output.stdout, &output.stderr)
+            {
+                Err(TaskkillFailure::RequestedPidNotFound)
+            } else {
+                Err(TaskkillFailure::NonzeroExit(code))
+            }
+        }
+        Err(_) => Err(TaskkillFailure::OutputError),
+    }
+}
+
+/// True only when exactly one channel is nonempty and is, in full, taskkill's
+/// English report for this exact decimal PID, optionally ending in one LF or
+/// CRLF. Another language, PID, line, byte or encoding is unclassified. The
+/// comparison is bounded by the expected line's length.
+#[cfg(test)]
+fn reports_requested_pid_not_found(pid: u32, stdout: &[u8], stderr: &[u8]) -> bool {
+    let report = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, false) => stderr,
+        (false, true) => stdout,
+        _ => return false,
+    };
+    let line = report
+        .strip_suffix(b"\r\n")
+        .or_else(|| report.strip_suffix(b"\n"))
+        .unwrap_or(report);
+    line == format!("ERROR: The process \"{pid}\" not found.").as_bytes()
 }
 
 #[cfg(unix)]
 fn process_group_is_running(pid: u32) -> bool {
+    process_group_probe(pid).is_some()
+}
+
+/// One `kill(-pgid, 0)` and its class; None only when the group is gone.
+#[cfg(unix)]
+fn process_group_probe(pid: u32) -> Option<GroupProbe> {
     let pid = pid as libc::pid_t;
     let result = unsafe { libc::kill(-pid, 0) };
-    if result == 0 {
-        return true;
+    // errno is read only after a failed call, immediately, as before.
+    let errno = (result != 0)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    group_probe_class(result, errno)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroI32;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    #[cfg(unix)]
+    fn exited(code: u8) -> ExitStatus {
+        ExitStatus::from_raw(i32::from(code) << 8)
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    #[cfg(windows)]
+    fn exited(code: u8) -> ExitStatus {
+        ExitStatus::from_raw(u32::from(code))
+    }
+
+    fn output(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    /// A synthetic requested PID; never a real process.
+    const PID: u32 = 4242;
+    const REPORT: &[u8] = b"ERROR: The process \"4242\" not found.\r\n";
+
+    #[test]
+    fn taskkill_outcome_keeps_its_confirmation_and_separates_exit_from_output_error() {
+        let silent = |status| std::io::Result::Ok(output(status, b"", b""));
+        let mut cases = vec![
+            // Only a successful exit confirms the tree stopped, even beside
+            // the not-found report.
+            (silent(exited(0)), Ok(())),
+            (Ok(output(exited(0), b"", REPORT)), Ok(())),
+            (
+                silent(exited(1)),
+                Err(TaskkillFailure::NonzeroExit(NonZeroI32::new(1))),
+            ),
+            (
+                silent(exited(128)),
+                Err(TaskkillFailure::NonzeroExit(NonZeroI32::new(128))),
+            ),
+            (
+                Err(std::io::Error::other("spawn failed")),
+                Err(TaskkillFailure::OutputError),
+            ),
+        ];
+        // An unsuccessful status without a code stays a nonzero exit, even
+        // beside the not-found report.
+        #[cfg(unix)]
+        cases.push((
+            Ok(output(ExitStatus::from_raw(libc::SIGKILL), b"", REPORT)),
+            Err(TaskkillFailure::NonzeroExit(None)),
+        ));
+        // Windows codes keep their signed 32-bit value.
+        #[cfg(windows)]
+        cases.push((
+            silent(ExitStatus::from_raw(0xC000_013A)),
+            Err(TaskkillFailure::NonzeroExit(NonZeroI32::new(
+                -1_073_741_510,
+            ))),
+        ));
+        for (result, expected) in cases {
+            let label = format!("{result:?}");
+            assert_eq!(taskkill_outcome(PID, result), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn taskkill_outcome_classifies_only_its_exact_requested_pid_not_found_report() {
+        let not_found = Err(TaskkillFailure::RequestedPidNotFound);
+        let unclassified = Err(TaskkillFailure::NonzeroExit(NonZeroI32::new(128)));
+        let line = b"ERROR: The process \"4242\" not found.";
+        let with = |suffix: &[u8]| [line.as_slice(), suffix].concat();
+        let cases: Vec<(&str, Vec<u8>, Vec<u8>, _)> = vec![
+            // The verified synthetic report, on either channel alone.
+            ("stderr crlf", vec![], REPORT.to_vec(), not_found),
+            ("stdout crlf", REPORT.to_vec(), vec![], not_found),
+            ("stderr lf", vec![], with(b"\n"), not_found),
+            ("stderr bare", vec![], line.to_vec(), not_found),
+            // Anything else under exit 128 is unclassified.
+            ("silent", vec![], vec![], unclassified),
+            (
+                "both channels",
+                REPORT.to_vec(),
+                REPORT.to_vec(),
+                unclassified,
+            ),
+            (
+                "other channel",
+                b"SUCCESS".to_vec(),
+                REPORT.to_vec(),
+                unclassified,
+            ),
+            (
+                "other pid",
+                vec![],
+                b"ERROR: The process \"4243\" not found.\r\n".to_vec(),
+                unclassified,
+            ),
+            (
+                "zero-padded pid",
+                vec![],
+                b"ERROR: The process \"04242\" not found.\r\n".to_vec(),
+                unclassified,
+            ),
+            (
+                "longer pid",
+                vec![],
+                b"ERROR: The process \"42420\" not found.\r\n".to_vec(),
+                unclassified,
+            ),
+            (
+                "localized",
+                vec![],
+                b"FEHLER: Der Prozess \"4242\" wurde nicht gefunden.\r\n".to_vec(),
+                unclassified,
+            ),
+            (
+                "another error",
+                vec![],
+                b"ERROR: The process \"4242\" could not be terminated.\r\n".to_vec(),
+                unclassified,
+            ),
+            ("two newlines", vec![], with(b"\r\n\r\n"), unclassified),
+            (
+                "second line",
+                vec![],
+                with(b"\r\nSUCCESS\r\n"),
+                unclassified,
+            ),
+            ("bare cr", vec![], with(b"\r"), unclassified),
+            ("trailing space", vec![], with(b" \r\n"), unclassified),
+            ("trailing nul", vec![], with(b"\0"), unclassified),
+            (
+                "leading newline",
+                vec![],
+                [b"\r\n".as_slice(), REPORT].concat(),
+                unclassified,
+            ),
+            (
+                "lowercase",
+                vec![],
+                b"error: the process \"4242\" not found.\r\n".to_vec(),
+                unclassified,
+            ),
+        ];
+        for (label, stdout, stderr, expected) in cases {
+            assert_eq!(
+                taskkill_outcome(PID, Ok(output(exited(128), &stdout, &stderr))),
+                expected,
+                "{label}"
+            );
+        }
+        // The exact report under any other nonzero code is unclassified.
+        for code in [1u8, 127, 129, 255] {
+            let expected = TaskkillFailure::NonzeroExit(NonZeroI32::new(i32::from(code)));
+            assert_eq!(
+                taskkill_outcome(PID, Ok(output(exited(code), b"", REPORT))),
+                Err(expected),
+                "{code}"
+            );
+        }
+        // The report must name the requested PID itself.
+        assert_eq!(
+            taskkill_outcome(4243, Ok(output(exited(128), b"", REPORT))),
+            unclassified
+        );
+    }
+
+    #[test]
+    fn graceful_kill_keeps_its_confirmation_rule_over_each_reported_check() {
+        use LeaderWait::*;
+        // The bounded wait's own result, never its detail.
+        assert_eq!(LeaderWait::of::<_, (), ()>(Ok(Ok(()))), Reaped);
+        assert_eq!(LeaderWait::of::<(), _, ()>(Ok(Err(()))), Failed);
+        assert_eq!(LeaderWait::of::<(), (), _>(Err(())), TimedOut);
+        for tree_stopped in [true, false] {
+            for leader in [Reaped, TimedOut, Failed] {
+                // Exactly the prior `stopped && reaped`.
+                assert_eq!(
+                    GracefulKill {
+                        tree_stopped,
+                        leader,
+                        taskkill: None,
+                    }
+                    .confirmed(),
+                    tree_stopped && leader == Reaped,
+                    "{tree_stopped} {leader:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graceful_kill_keeps_only_its_tree_stops_own_taskkill_failure() {
+        use LeaderWait::*;
+        let failures = [
+            TaskkillFailure::RequestedPidNotFound,
+            TaskkillFailure::NonzeroExit(NonZeroI32::new(128)),
+            TaskkillFailure::NonzeroExit(NonZeroI32::new(-1_073_741_510)),
+            TaskkillFailure::NonzeroExit(None),
+            TaskkillFailure::OutputError,
+        ];
+        for leader in [Reaped, TimedOut, Failed] {
+            // A confirmed tree stop has no failure to keep.
+            let stopped = GracefulKill::of(Ok(()), leader);
+            assert_eq!(
+                (stopped.tree_stopped, stopped.taskkill),
+                (true, None),
+                "{leader:?}"
+            );
+            assert_eq!(stopped.confirmed(), leader == Reaped, "{leader:?}");
+            // Unix, or another platform: unconfirmed without a taskkill result.
+            let other = GracefulKill::of(Err(None), leader);
+            assert_eq!(
+                (other.tree_stopped, other.taskkill),
+                (false, None),
+                "{leader:?}"
+            );
+            assert!(!other.confirmed(), "{leader:?}");
+            // Windows: exactly the one taskkill call's failure, which never
+            // changes the Boolean confirmation.
+            for failure in failures {
+                let killed = GracefulKill::of(Err(Some(failure)), leader);
+                assert_eq!(
+                    killed,
+                    GracefulKill {
+                        tree_stopped: false,
+                        leader,
+                        taskkill: Some(failure),
+                    },
+                    "{leader:?} {failure:?}"
+                );
+                assert!(!killed.confirmed(), "{leader:?} {failure:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_probe_class_keeps_the_prior_predicate_and_names_only_its_closed_class() {
+        use GroupProbe::*;
+        for (result, errno, expected) in [
+            // Only ESRCH confirms the group is gone, as before.
+            (-1, Some(libc::ESRCH), None),
+            (0, None, Some(GroupVisible)),
+            // A success never reads errno, whatever it holds.
+            (0, Some(libc::ESRCH), Some(GroupVisible)),
+            (-1, Some(libc::EPERM), Some(ProbeDenied)),
+            (-1, Some(libc::EINVAL), Some(ProbeFailed)),
+            // Not an error kill(2) returns: never classified as denied.
+            (-1, Some(libc::EACCES), Some(ProbeFailed)),
+            (-1, None, Some(ProbeFailed)),
+        ] {
+            let class = group_probe_class(result, errno);
+            assert_eq!(class, expected, "{result} {errno:?}");
+            // `is_some()` is exactly the prior `process_group_is_running`.
+            assert_eq!(
+                class.is_some(),
+                result == 0 || errno != Some(libc::ESRCH),
+                "{result} {errno:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_stop_failure_projects_only_its_own_platform_detail() {
+        let probe = TreeStopFailure::GroupProbe(GroupProbe::ProbeDenied);
+        assert_eq!(
+            (probe.taskkill(), probe.group_probe()),
+            (None, Some(GroupProbe::ProbeDenied))
+        );
+        let taskkill = TreeStopFailure::Taskkill(TaskkillFailure::OutputError);
+        assert_eq!(
+            (taskkill.taskkill(), taskkill.group_probe()),
+            (Some(TaskkillFailure::OutputError), None)
+        );
+        for (probe, wire) in [
+            (GroupProbe::GroupVisible, "group_visible"),
+            (GroupProbe::ProbeDenied, "probe_denied"),
+            (GroupProbe::ProbeFailed, "probe_failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(probe).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_kill_reports_a_stopped_and_reaped_command_and_an_already_reaped_one() {
+        let confirmed = GracefulKill {
+            tree_stopped: true,
+            leader: LeaderWait::Reaped,
+            taskkill: None,
+        };
+        let mut running = build_command("sleep 30", None, None).spawn().unwrap();
+        assert_eq!(graceful_kill_observed(&mut running).await, confirmed);
+        let mut finished = build_command("exit 0", None, None).spawn().unwrap();
+        finished.wait().await.unwrap();
+        assert_eq!(graceful_kill_observed(&mut finished).await, confirmed);
+        // The Boolean contract every other caller uses is unchanged.
+        let mut again = build_command("sleep 30", None, None).spawn().unwrap();
+        assert!(graceful_kill(&mut again).await);
+    }
 }

@@ -1,5 +1,18 @@
 import { describe, it, expect, jest, beforeEach } from "@jest/globals";
-import { UsageTracker } from "../usage-tracker";
+import { UsageTracker, createUsageModelSelection } from "../usage-tracker";
+import {
+  observeServedModelFallback,
+  recordRequestedModelFallback,
+} from "@/convex/lib/usageModelSelection";
+import { BudgetMonitor } from "@/lib/chat/budget-monitor";
+import {
+  billableCostDollarsToPoints,
+  POINTS_PER_DOLLAR,
+} from "@/lib/rate-limit/token-bucket";
+import {
+  createUsageSettlementState,
+  getUnsettledUsagePoints,
+} from "@/lib/rate-limit/usage-settlement";
 
 describe("UsageTracker", () => {
   let tracker: UsageTracker;
@@ -7,6 +20,84 @@ describe("UsageTracker", () => {
   beforeEach(() => {
     tracker = new UsageTracker();
     jest.clearAllMocks();
+  });
+
+  it("keeps recorded primary work billable and budgeted after loop recovery", () => {
+    tracker.accumulateStep(
+      { inputTokens: 100, outputTokens: 20, raw: { cost: 0.6 } },
+      "primary",
+    );
+    tracker.nonModelCost = 0.1;
+    tracker.prepareModelRetry({ isLoopRecovery: true });
+    tracker.accumulateStep(
+      { inputTokens: 50, outputTokens: 10, raw: { cost: 0.4 } },
+      "fallback",
+    );
+
+    const cost = tracker.computeCostDollars("fallback");
+    expect(cost).toBeCloseTo(1.1);
+    expect(tracker.inputTokens).toBe(150);
+    expect(tracker.outputTokens).toBe(30);
+    expect(tracker.measurementProperties("fallback")).toMatchObject({
+      usage_discarded_retry_cost_dollars: 0,
+      usage_retry_resets: 0,
+    });
+
+    const rateLimitInfo = {
+      remaining: 0.4 * POINTS_PER_DOLLAR,
+      resetTime: new Date(),
+      limit: POINTS_PER_DOLLAR,
+      pointsDeducted: billableCostDollarsToPoints(0.6),
+    };
+    const usage = tracker.createUsageCostRecord({
+      selectedModel: "primary",
+      accountingModel: "fallback",
+      rateLimitInfo,
+    });
+    expect(usage.modelCostDollars).toBeCloseTo(1);
+    expect(usage.costDollars).toBeCloseTo(cost);
+    expect(
+      getUnsettledUsagePoints(
+        createUsageSettlementState(rateLimitInfo),
+        usage.costDollars,
+      ),
+    ).toBeCloseTo(billableCostDollarsToPoints(0.5));
+
+    const monitor = new BudgetMonitor(
+      {
+        monthlyLimitPoints: POINTS_PER_DOLLAR,
+        monthlyRemainingAtStart: POINTS_PER_DOLLAR,
+        monthlyResetTime: new Date(),
+        extraUsageEnabledAtStart: false,
+        extraUsageHasBalanceAtStart: false,
+        extraUsageBalanceAtStart: 0,
+        extraUsageAutoReload: false,
+      },
+      { write: jest.fn() } as any,
+      "pro",
+    );
+    expect(monitor.checkAfterStep(cost).type).toBe("abort");
+  });
+
+  it("retains primary token estimates when loop recovery changes models", () => {
+    tracker.accumulateStep(
+      { inputTokens: 1000, outputTokens: 200 },
+      "model-default",
+    );
+    const primaryCost = tracker.computeModelCostDollars("model-default");
+    expect(primaryCost).toBeGreaterThan(0);
+
+    tracker.prepareModelRetry({ isLoopRecovery: true });
+    tracker.accumulateStep(
+      { inputTokens: 50, outputTokens: 10, raw: { cost: 0.4 } },
+      "model-kimi-k3",
+    );
+
+    expect(tracker.computeModelCostDollars("model-kimi-k3")).toBeCloseTo(
+      primaryCost + 0.4,
+      8,
+    );
+    expect(tracker.hasAuthoritativeModelCost).toBe(false);
   });
 
   describe("usage settlement correlation", () => {
@@ -81,6 +172,111 @@ describe("UsageTracker", () => {
       expect(tracker.inputTokens).toBe(0);
       expect(tracker.outputTokens).toBe(0);
       expect(tracker.providerCost).toBe(0);
+    });
+
+    it.each([
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 1,
+      "100",
+      null,
+    ])(
+      "ignores malformed %p token counts without reducing earlier usage",
+      (malformed) => {
+        const value = malformed as unknown as number;
+        tracker.accumulateStep({
+          inputTokens: 100,
+          outputTokens: 50,
+          totalTokens: 150,
+        });
+        tracker.accumulateStep({
+          inputTokens: value,
+          outputTokens: value,
+          totalTokens: value,
+          inputTokenDetails: {
+            cacheReadTokens: value,
+            cacheWriteTokens: value,
+          },
+        });
+
+        expect(tracker.inputTokens).toBe(100);
+        expect(tracker.outputTokens).toBe(50);
+        expect(tracker.totalTokens).toBe(150);
+        expect(tracker.cacheReadTokens).toBe(0);
+        expect(tracker.cacheWriteTokens).toBe(0);
+        expect(tracker.lastStepInputTokens).toBe(0);
+        expect(tracker.hasCacheData).toBe(false);
+      },
+    );
+
+    it("keeps valid fields when another field in the receipt is malformed", () => {
+      tracker.accumulateStep({
+        inputTokens: 100,
+        outputTokens: -1,
+        totalTokens: 1.5,
+      });
+      tracker.accumulateStep({
+        inputTokens: "7" as unknown as number,
+        outputTokens: 3,
+      });
+
+      expect(tracker.inputTokens).toBe(100);
+      expect(tracker.outputTokens).toBe(3);
+      // Each invalid or missing total falls back to its valid components.
+      expect(tracker.totalTokens).toBe(103);
+    });
+
+    it("keeps a valid provider total that differs from its components", () => {
+      tracker.accumulateStep({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 175,
+      });
+
+      expect(tracker.totalTokens).toBe(175);
+    });
+
+    it("does not discount cache counts without a valid input to bound them", () => {
+      tracker.accumulateStep(
+        { inputTokenDetails: { cacheReadTokens: 10, cacheWriteTokens: 10 } },
+        "anthropic/claude-4.6-opus-20260205",
+      );
+      tracker.accumulateStep(
+        {
+          inputTokens: 1.5,
+          outputTokens: 0,
+          inputTokenDetails: { cacheReadTokens: 0 },
+        },
+        "anthropic/claude-4.6-opus-20260205",
+      );
+
+      expect(tracker.cacheReadTokens).toBe(0);
+      expect(tracker.cacheWriteTokens).toBe(0);
+      expect(tracker.hasCacheData).toBe(false);
+    });
+
+    it("leaves bounded read and write overlap to the existing pricing caps", () => {
+      tracker.accumulateStep(
+        {
+          inputTokens: 100_000,
+          outputTokens: 0,
+          inputTokenDetails: {
+            cacheReadTokens: 80_000,
+            cacheWriteTokens: 50_000,
+          },
+        },
+        "anthropic/claude-4.6-opus-20260205",
+      );
+
+      expect(tracker.cacheReadTokens).toBe(80_000);
+      expect(tracker.cacheWriteTokens).toBe(50_000);
+      // 80k reads ($0.04) plus the remaining 20k input as writes ($0.125).
+      expect(tracker.computeModelCostDollars("model-default")).toBeCloseTo(
+        0.165,
+        10,
+      );
     });
   });
 
@@ -252,20 +448,101 @@ describe("UsageTracker", () => {
       );
     });
 
-    it("should prefer OpenRouter upstream inference cost over raw provider cost", () => {
+    it("charges both BYOK provider inference and an OpenRouter platform fee", () => {
       tracker.accumulateStep({
         inputTokens: 1000,
         outputTokens: 500,
         raw: {
           cost: 0.001,
+          is_byok: true,
           cost_details: {
             upstream_inference_cost: 0.003,
           },
         },
       });
 
-      expect(tracker.modelProviderCost).toBeCloseTo(0.003);
-      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.003);
+      expect(tracker.modelProviderCost).toBeCloseTo(0.004);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.004);
+    });
+
+    it("adds a BYOK platform fee when route metadata arrives after usage", () => {
+      const index = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: { cost: 0.00015 },
+      });
+      tracker.setAuthoritativeModelCostForStep(index, 0.003, {
+        isByok: true,
+      });
+
+      expect(tracker.modelProviderCost).toBeCloseTo(0.00315);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.00315);
+    });
+
+    it("uses generation metadata for a BYOK fee missing from streamed usage", () => {
+      const index = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: { cost: 0 },
+      });
+      tracker.setAuthoritativeModelCostForStep(index, 0.003, {
+        isByok: true,
+        chargedCost: 0.00015,
+      });
+
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.00315);
+    });
+
+    it("keeps the charged non-BYOK cost after upstream metadata arrives", () => {
+      const index = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: {
+          cost: 0.0015,
+          is_byok: false,
+          cost_details: { upstream_inference_cost: 0.0012 },
+        },
+      });
+      tracker.setAuthoritativeModelCostForStep(index, 0.0012, {
+        isByok: false,
+      });
+
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.0015);
+      expect(tracker.modelProviderCost).toBeCloseTo(0.0015);
+    });
+
+    it("uses charged cost when BYOK metadata is missing and cost is positive", () => {
+      const index = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: {
+          cost: 0.0015,
+          cost_details: { upstream_inference_cost: 0.0012 },
+        },
+      });
+      tracker.setAuthoritativeModelCostForStep(index, 0.0012, {});
+
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.0015);
+    });
+
+    it("keeps BYOK and non-BYOK costs separate across model steps", () => {
+      const byok = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: { cost: 0, is_byok: true },
+      });
+      const nonByok = tracker.accumulateStep({
+        inputTokens: 1000,
+        outputTokens: 500,
+        raw: { cost: 0.0015, is_byok: false },
+      });
+      tracker.setAuthoritativeModelCostForStep(byok, 0.003, { isByok: true });
+      tracker.setAuthoritativeModelCostForStep(nonByok, 0.0012, {
+        isByok: false,
+      });
+
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.0045);
+      expect(tracker.modelProviderCost).toBeCloseTo(0.0045);
     });
 
     it("should fall back to raw provider cost when OpenRouter upstream inference cost is not positive", () => {
@@ -398,12 +675,15 @@ describe("UsageTracker", () => {
           outputTokens: 100_000,
           inputTokenDetails: { cacheReadTokens: 900_000 },
         },
-        "model-deepseek-v4-pro",
+        "model-deepseek-v4-pro-0813",
       );
 
       // 100k uncached input + 900k cache reads + 100k output.
       expect(
-        tracker.computeCostDollars("model-deepseek-v4-pro", "model-grok-4.6"),
+        tracker.computeCostDollars(
+          "model-deepseek-v4-pro-0813",
+          "model-grok-4.6",
+        ),
       ).toBeCloseTo(0.1337625);
     });
 
@@ -452,8 +732,8 @@ describe("UsageTracker", () => {
       expect(tracker.computeCostDollars("model-default")).toBe(0.75);
     });
 
-    it("should use token-based model cost + nonModelCost when modelProviderCost is 0 but providerCost is positive from sandbox/tool spend (post-resetModelLeg scenario)", () => {
-      // Simulate the state after resetModelLeg() has stripped the primary
+    it("should use token-based model cost + nonModelCost when modelProviderCost is 0 but providerCost is positive from sandbox/tool spend (post-prepareModelRetry scenario)", () => {
+      // Simulate the state after prepareModelRetry() has stripped the primary
       // leg's model cost and the fallback leg ran without reporting raw.cost.
       tracker.accumulateStep({ inputTokens: 1_000_000, outputTokens: 0 });
       tracker.providerCost = 0.25; // nonModelCost baked in
@@ -681,11 +961,13 @@ describe("UsageTracker", () => {
           resetTime: new Date(),
           limit: 250000,
           pointsDeducted: 100,
+          extraUsageAdmissionOperationId: "admission-123",
         },
       });
 
       expect(localMockLog).toHaveBeenCalledWith({
         usageSettlementId: expect.any(String),
+        admissionOperationId: "admission-123",
         userId: "user-123",
         organizationId: undefined,
         chatId: undefined,
@@ -710,6 +992,157 @@ describe("UsageTracker", () => {
         modelCostDollars: 0.01,
         nonModelCostDollars: 0,
         costSource: "provider",
+        // An absent override is a normal Auto write without a fallback.
+        modelSelection: { selected: "auto", initial_model: "model-config" },
+      });
+    });
+
+    it("stores the accepted mode and the runner's fallback without changing the billed model", () => {
+      const localMockLog = jest.fn();
+      let IsolatedTracker: typeof UsageTracker;
+      jest.isolateModules(() => {
+        jest.doMock("@/lib/db/actions", () => ({
+          logUsageRecord: localMockLog,
+        }));
+        IsolatedTracker = require("../usage-tracker").UsageTracker;
+      });
+      const t = new IsolatedTracker!();
+      t.accumulateStep({ inputTokens: 10, outputTokens: 5, raw: { cost: 1 } });
+
+      t.log({
+        userId: "user-123",
+        selectedModel: "agent-model-max",
+        selectedModelOverride: "hackerai-max",
+        responseModel: "x-ai/grok-4.1-fast",
+        configuredModelId: "x-ai/grok-4.6",
+        rateLimitInfo: { remaining: 0, resetTime: new Date(), limit: 0 },
+        modelFallback: {
+          model: "x-ai/grok-4.1-fast",
+          awaitingServedModel: false,
+        },
+      });
+
+      expect(localMockLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: "x-ai/grok-4.1-fast",
+          modelSelection: {
+            selected: "hackerai-max",
+            initial_model: "x-ai/grok-4.6",
+            fallback_model: "x-ai/grok-4.1-fast",
+          },
+        }),
+      );
+    });
+
+    it("omits a selection it cannot validate instead of guessing one", () => {
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: "model-custom",
+          initialModel: "model-config",
+        }),
+      ).toBeUndefined();
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: null,
+          initialModel: "model-config",
+        }),
+      ).toEqual({ selected: "auto", initial_model: "model-config" });
+    });
+
+    it("does not report normal Auto routing to another model as a fallback", () => {
+      let observed = observeServedModelFallback(undefined, {
+        servedModel: "deepseek/deepseek-v4-flash",
+        confirmedProviderFallback: false,
+      });
+      observed = observeServedModelFallback(observed, {
+        servedModel: "z-ai/glm-5.3",
+        confirmedProviderFallback: false,
+      });
+
+      expect(observed).toBeUndefined();
+      expect(
+        createUsageModelSelection({
+          selectedModelOverride: undefined,
+          initialModel: "deepseek/deepseek-v4-flash",
+          fallbackModel: observed?.model,
+        }),
+      ).not.toHaveProperty("fallback_model");
+    });
+
+    it("records an explicit alternate request and refines it with the served model", () => {
+      const requested = "x-ai/grok-4.1-fast";
+      let observed = recordRequestedModelFallback(undefined, requested);
+      expect(observed).toEqual({ model: requested, awaitingServedModel: true });
+
+      // A step with no served ID keeps the requested route.
+      observed = observeServedModelFallback(observed, {
+        confirmedProviderFallback: false,
+      });
+      expect(observed?.model).toBe(requested);
+
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.1-fast-20261101",
+        confirmedProviderFallback: false,
+      });
+      // Later normal steps on the fallback route keep the record.
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.1-fast-20261102",
+        confirmedProviderFallback: false,
+      });
+      expect(observed).toEqual({
+        model: "x-ai/grok-4.1-fast-20261101",
+        awaitingServedModel: false,
+      });
+    });
+
+    it("keeps a confirmed provider fallback after later primary steps", () => {
+      let observed = observeServedModelFallback(undefined, {
+        servedModel: "x-ai/grok-4.1-fast",
+        confirmedProviderFallback: true,
+      });
+      observed = observeServedModelFallback(observed, {
+        servedModel: "x-ai/grok-4.6",
+        confirmedProviderFallback: false,
+      });
+
+      expect(observed?.model).toBe("x-ai/grok-4.1-fast");
+    });
+
+    it("resolves only after the ledger write and returns its failure status", async () => {
+      let finishWrite!: (value: unknown) => void;
+      const pendingWrite = new Promise((resolve) => {
+        finishWrite = resolve;
+      });
+      const localMockLog = jest.fn(() => pendingWrite);
+      let IsolatedTracker: typeof UsageTracker;
+      jest.isolateModules(() => {
+        jest.doMock("@/lib/db/actions", () => ({
+          logUsageRecord: localMockLog,
+        }));
+        IsolatedTracker = require("../usage-tracker").UsageTracker;
+      });
+      const t = new IsolatedTracker!();
+      t.accumulateStep({ inputTokens: 10, outputTokens: 5, raw: { cost: 1 } });
+
+      let settled = false;
+      const logged = t
+        .log({
+          userId: "user-123",
+          selectedModel: "model-default",
+          configuredModelId: "model-config",
+          rateLimitInfo: { remaining: 0, resetTime: new Date(), limit: 0 },
+        })
+        .then((result) => {
+          settled = true;
+          return result;
+        });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      finishWrite({ status: "failed", failureCategory: "write_failed" });
+      await expect(logged).resolves.toEqual({
+        status: "failed",
+        failureCategory: "write_failed",
       });
     });
 
@@ -805,6 +1238,49 @@ describe("UsageTracker", () => {
       expect(usage.costSource).toBe("provider");
     });
 
+    it("discards only a refused recovery leg, keeping the disconnected leg before it billed", () => {
+      // xAI streamed work, then disconnected; its usage continues on Bedrock.
+      // Its reported total differs from input + output and must survive.
+      tracker.accumulateStep({
+        inputTokens: 1_000,
+        outputTokens: 200,
+        totalTokens: 1_250,
+        raw: { cost: 0.02 },
+      });
+      tracker.providerCost += 0.05;
+      tracker.nonModelCost = 0.05;
+      tracker.beginModelLeg();
+      // Bedrock compacted, ran one step (corrected later), then was refused.
+      tracker.accumulateSummarization({
+        inputTokens: 300,
+        outputTokens: 30,
+        cost: 0.003,
+      });
+      const bedrockStep = tracker.accumulateStep({
+        inputTokens: 2_000,
+        outputTokens: 0,
+        inputTokenDetails: { cacheReadTokens: 500 },
+        raw: { cost: 0.01 },
+      });
+      tracker.setAuthoritativeModelCostForStep(bedrockStep, 0.04);
+      tracker.discardModelLeg();
+      // DeepSeek completes the response.
+      tracker.accumulateStep({
+        inputTokens: 1_500,
+        outputTokens: 100,
+        raw: { cost: 0.001 },
+      });
+
+      expect(tracker.inputTokens).toBe(1_000 + 300 + 1_500);
+      expect(tracker.outputTokens).toBe(200 + 30 + 100);
+      expect(tracker.totalTokens).toBe(1_250 + 330 + 1_600);
+      expect(tracker.cacheReadTokens).toBe(0);
+      expect(tracker.modelProviderCost).toBeCloseTo(0.021);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(
+        0.02 + 0.003 + 0.001 + 0.05,
+      );
+    });
+
     it("keeps non-model spend after fallback reset and bills fallback authoritative metadata cost", () => {
       tracker.accumulateStep({
         inputTokens: 500_000,
@@ -813,7 +1289,7 @@ describe("UsageTracker", () => {
       });
       tracker.providerCost += 0.05;
       tracker.nonModelCost = 0.05;
-      tracker.resetModelLeg();
+      tracker.prepareModelRetry();
 
       const fallbackStepCostIndex = tracker.accumulateStep({
         inputTokens: 12,
@@ -863,7 +1339,7 @@ describe("UsageTracker", () => {
         raw: { cost: 0.25 },
       });
 
-      tracker.resetModelLeg();
+      tracker.prepareModelRetry();
 
       expect(tracker.inputTokens).toBe(200);
       expect(tracker.outputTokens).toBe(40);

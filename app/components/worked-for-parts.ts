@@ -1,5 +1,6 @@
 import type { ChatMessage } from "@/types";
 import type { FilePart } from "@/types/file";
+import { AGENT_STEER_PART_TYPE } from "@/lib/chat/agent-steer";
 
 type MessagePart = ChatMessage["parts"][number];
 
@@ -22,12 +23,19 @@ const TRAILING_METADATA_PART_TYPES = new Set([
 
 const EXPANDABLE_WORK_PART_TYPES = new Set(["data-terminal"]);
 
+export type IndexedMessagePart = { part: MessagePart; partIndex: number };
+
 export type WorkedForParts = {
   fileParts: FilePart[];
   nonFileParts: MessagePart[];
+  /** Work shown in Worked for; excludes saved results. */
   workParts: MessagePart[];
   workPartIndexes: number[];
   trailingTextParts: MessagePart[];
+  /** Index of the first trailing text part among non-file parts. */
+  trailingTextOffset: number;
+  /** Saved hunt results and read reports, with their message indexes. */
+  savedResults: IndexedMessagePart[];
 };
 
 export type AgentWorkActivity = {
@@ -81,6 +89,8 @@ const shouldProjectWorkPart = (part: MessagePart) => {
     type === "text" ||
     type === "reasoning" ||
     type === "data-summarization" ||
+    // A follow-up the Agent read mid-run, shown where it read it.
+    type === AGENT_STEER_PART_TYPE ||
     Boolean(type?.startsWith("tool-"))
   );
 };
@@ -361,6 +371,8 @@ const toolSummaryCategory = (
       }
       return "tool";
     }
+    case "tool-file_write":
+    case "tool-file_edit":
     case "tool-write_file":
     case "tool-search_replace":
     case "tool-multi_edit":
@@ -383,6 +395,7 @@ const toolSummaryCategory = (
     case "tool-list_notes":
     case "tool-update_note":
     case "tool-delete_note":
+    case "tool-get_note":
       return "notes";
     case "tool-list_requests":
     case "tool-view_request":
@@ -730,6 +743,35 @@ export function projectAgentWorkParts(
   };
 }
 
+/**
+ * A hunt completion the backend confirmed as saved. Its result card is a
+ * receipt the user checks against the Agent's prose, so it renders outside
+ * collapsed work. Pending and failed completions stay in the work as usual.
+ */
+export const isSavedHuntResultPart = (part: MessagePart) => {
+  const candidate = part as {
+    type?: string;
+    state?: string;
+    output?: { success?: unknown; result?: { success?: unknown } };
+  };
+  if (
+    candidate.type !== "tool-complete_finding_hunt" ||
+    candidate.state !== "output-available"
+  )
+    return false;
+  const result = candidate.output?.result ?? candidate.output;
+  return result?.success === true && !toolPartHasKnownFailure(part);
+};
+
+/**
+ * Saved receipts shown outside collapsed work: confirmed hunt results and a
+ * successfully read report, whose card carries the Download PDF action the
+ * Agent points to. Created, updated and listed reports keep their place.
+ */
+export const isSavedResultPart = (part: MessagePart) =>
+  isSavedHuntResultPart(part) ||
+  (getPartType(part) === "tool-get_report" && reportToolSucceeded(part));
+
 export function splitWorkedForParts(
   parts: ChatMessage["parts"],
 ): WorkedForParts {
@@ -765,13 +807,19 @@ export function splitWorkedForParts(
     }
   }
 
+  const work: IndexedMessagePart[] = [];
+  const savedResults: IndexedMessagePart[] = [];
+  for (const indexed of indexedNonFileParts.slice(0, trailingStart)) {
+    (isSavedResultPart(indexed.part) ? savedResults : work).push(indexed);
+  }
+
   return {
     fileParts,
     nonFileParts,
-    workParts: nonFileParts.slice(0, trailingStart),
-    workPartIndexes: indexedNonFileParts
-      .slice(0, trailingStart)
-      .map(({ partIndex }) => partIndex),
+    workParts: work.map(({ part }) => part),
+    workPartIndexes: work.map(({ partIndex }) => partIndex),
     trailingTextParts: nonFileParts.slice(trailingStart, trailingEnd),
+    trailingTextOffset: trailingStart,
+    savedResults,
   };
 }

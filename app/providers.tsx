@@ -2,8 +2,16 @@
 
 import { useAuth } from "@workos-inc/authkit-nextjs/components";
 import type { PostHogConfig } from "posthog-js";
-import { useEffect, useRef } from "react";
+import { isAbuseTelemetry, isAbuseReportingPath } from "@/lib/abuse/privacy";
+import { usePathname } from "next/navigation";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { useGlobalState } from "./contexts/GlobalState";
+import { startUnhandledRejectionDiagnostics } from "@/lib/posthog/unhandled-rejection-diagnostics";
+import { clearMessageNavigatorDiagnostics } from "@/lib/posthog/message-navigator-diagnostics";
+import {
+  clearReactBoundaryCatches,
+  startReactBoundaryDiagnostics,
+} from "@/lib/posthog/react-boundary-diagnostics";
 import {
   enrichFrontendExceptionEvent,
   sanitizeFrontendExceptionUrlProperties,
@@ -11,6 +19,8 @@ import {
 } from "@/lib/posthog/expected-frontend-exceptions";
 import {
   confirmAuthenticatedAnalyticsUserId,
+  getIdentifiedAnalyticsUserId,
+  getPermittedAnalyticsUserId,
   getPostHogClient,
   loadPostHogClient,
   setAuthenticatedAnalyticsUserId,
@@ -24,7 +34,28 @@ import {
   type FirstTouchAttribution,
 } from "@/lib/analytics/acquisition";
 
+import { sanitizeAgentCancellationEvent } from "@/lib/analytics/agent-cancellation-privacy";
+import { sanitizeDiffViewEvent } from "@/lib/analytics/diff-view-privacy";
+import { sanitizeWorkspaceFilesEvent } from "@/lib/analytics/workspace-files-privacy";
+import { sanitizeContextFeedbackEvent } from "@/lib/analytics/context-feedback-privacy";
+import {
+  sanitizeDesktopAckEvent,
+  sanitizeDesktopStreamCancelEvent,
+} from "@/lib/analytics/desktop-ack-privacy";
+import {
+  applyDesktopRuntimeIdentity,
+  startDesktopRuntimeIdentityLookup,
+} from "@/lib/analytics/desktop-runtime-identity";
+import {
+  DESKTOP_STREAM_CANCEL_NONCONFIRMATION_EVENT,
+  desktopStreamCancelCaptureUrl,
+  sendDesktopStreamCancelOnce,
+} from "@/lib/analytics/desktop-stream-cancel-diagnostic";
 import { sanitizeChatPerformanceEvent } from "@/lib/analytics/chat-performance-privacy";
+import { sanitizeServerActionClientContextEvent } from "@/lib/analytics/server-action-privacy";
+import { sanitizeFileActionAuthDiagnosticEvent } from "@/lib/analytics/file-auth-diagnostics";
+import { sanitizeAgentHttp413DiagnosticEvent } from "@/lib/analytics/agent-start-privacy";
+import { sanitizeDesktopOperationReadinessEvent } from "@/lib/analytics/desktop-operation-readiness";
 import {
   captureXReferralVisit,
   clearXReferralDedupe,
@@ -32,6 +63,14 @@ import {
   sanitizeXReferralEvent,
   X_REFERRAL_EVENT,
 } from "@/lib/analytics/x-referral";
+
+import {
+  captureInfluencerVisit,
+  clearInfluencerVisit,
+  pendingInfluencerVisit,
+  sanitizeInfluencerVisit,
+} from "@/lib/influencers/browser-visits";
+import { INFLUENCER_VISIT_EVENT } from "@/lib/influencers/visit-handoff";
 
 let lastIdentifiedSignature: string | null = null;
 
@@ -46,15 +85,18 @@ function isEnglishLocale(locale: string | null | undefined) {
   }
 }
 
+/** Configure consent-gated analytics and clean up per-account observers. */
 export function PostHogProvider({
   analyticsAllowed,
   children,
   consentRequired = false,
+  consentDeclined = false,
   firstTouchAttribution = null,
 }: {
   analyticsAllowed: boolean;
   children: React.ReactNode;
   consentRequired?: boolean;
+  consentDeclined?: boolean;
   firstTouchAttribution?: FirstTouchAttribution | null;
 }) {
   const { subscription } = useGlobalState();
@@ -65,10 +107,68 @@ export function PostHogProvider({
   const userLastName = user?.lastName;
   const userLocale = user?.locale;
   const referralHandled = useRef(false);
+  const pathname = usePathname();
+  const privatePage = isAbuseReportingPath(pathname ?? "");
+  const privateReplaySession = useRef(false);
+  // Latest committed owner for the server action, file action, Agent HTTP 413
+  // (start and partial save), Desktop operation readiness, Desktop stream
+  // cancel nonconfirmation, navigator and React boundary diagnostics. A previously
+  // installed before_send can run after a commit that withdraws consent, signs
+  // out, switches account or enters a private page, but before the passive
+  // effect below resets analytics identity.
+  const serverActionDiagnosticOwner = useRef<string | null>(null);
+  const desktopStreamCancelSignal = useRef<AbortSignal | null>(null);
+
+  useLayoutEffect(() => {
+    serverActionDiagnosticOwner.current =
+      analyticsAllowed && !privatePage && userId ? userId : null;
+    const cancelRequests = serverActionDiagnosticOwner.current
+      ? new AbortController()
+      : null;
+    desktopStreamCancelSignal.current = cancelRequests?.signal ?? null;
+    return () => {
+      serverActionDiagnosticOwner.current = null;
+      desktopStreamCancelSignal.current = null;
+      cancelRequests?.abort();
+      // A later return to the same owner must not revive an older observation.
+      clearMessageNavigatorDiagnostics();
+      clearReactBoundaryCatches();
+    };
+  }, [analyticsAllowed, privatePage, userId]);
 
   useEffect(() => {
     const posthogKey = process.env.NEXT_PUBLIC_POSTHOG_KEY;
     if (!posthogKey) return;
+    // Local-only and bounded: resolve before the SDK can report startup errors.
+    void startDesktopRuntimeIdentityLookup();
+
+    const replayBlockKey = "hackerai_abuse_replay_blocked";
+    const blockReplay = () => {
+      privateReplaySession.current = true;
+      try {
+        window.sessionStorage.setItem(replayBlockKey, "1");
+      } catch {
+        /* In-memory protection remains. */
+      }
+    };
+    try {
+      privateReplaySession.current ||=
+        window.sessionStorage.getItem(replayBlockKey) === "1";
+    } catch {
+      /* Storage may be unavailable. */
+    }
+    if (privatePage) {
+      blockReplay();
+      setAuthenticatedAnalyticsUserId(null);
+      const loaded = getPostHogClient();
+      loaded?.stopSessionRecording();
+      loaded?.set_config({
+        disable_session_recording: true,
+        capture_exceptions: false,
+        before_send: () => null,
+      });
+      return;
+    }
 
     const shouldTrack = Boolean(userId) && analyticsAllowed;
     setAuthenticatedAnalyticsUserId(shouldTrack ? userId! : null);
@@ -94,20 +194,35 @@ export function PostHogProvider({
         }
         if (!analyticsAllowed) posthog.opt_out_capturing();
       }
-      if (!analyticsAllowed) clearXReferralDedupe();
-      if (!analyticsAllowed || referralHandled.current || !isXReferralLanding())
+      if (!analyticsAllowed) {
+        clearXReferralDedupe();
+        if (consentDeclined) clearInfluencerVisit();
+      }
+      if (
+        !analyticsAllowed ||
+        (!pendingInfluencerVisit() &&
+          (referralHandled.current || !isXReferralLanding()))
+      )
         return;
     }
 
     let cancelled = false;
+    let stopRejectionDiagnostics: (() => void) | undefined;
+    let stopReactBoundaryDiagnostics: (() => void) | undefined;
 
     void loadPostHogClient()
-      .then((posthog) => {
-        if (cancelled) return;
+      .then(async (posthog) => {
+        await startDesktopRuntimeIdentityLookup();
+        if (
+          cancelled ||
+          (userId && serverActionDiagnosticOwner.current !== userId)
+        )
+          return;
 
+        const apiHost =
+          process.env.NEXT_PUBLIC_POSTHOG_HOST ?? "https://us.i.posthog.com";
         const config = {
-          api_host:
-            process.env.NEXT_PUBLIC_POSTHOG_HOST ?? "https://us.i.posthog.com",
+          api_host: apiHost,
           capture_pageview: false,
           capture_pageleave: false,
           autocapture: false,
@@ -128,6 +243,16 @@ export function PostHogProvider({
             if (!event) {
               return null;
             }
+            if (isAbuseTelemetry(window.location.pathname, event.properties)) {
+              blockReplay();
+              return null;
+            }
+            // rrweb snapshots can flush after navigation without an originating
+            // URL. Keep replay off for the rest of this tab session, including reload.
+            if (event.event === "$snapshot" && privateReplaySession.current)
+              return null;
+            if (event.event === INFLUENCER_VISIT_EVENT)
+              return sanitizeInfluencerVisit(event);
             if (event.event === X_REFERRAL_EVENT) {
               return sanitizeXReferralEvent(event);
             }
@@ -135,14 +260,99 @@ export function PostHogProvider({
             // incidental component events and SDK autocapture out of the stream.
             if (!userId) return null;
 
-            const sanitizedEvent = sanitizeChatPerformanceEvent(
-              sanitizeFrontendExceptionUrlProperties(event),
+            const committedDiagnosticOwner = () => {
+              const owner = getPermittedAnalyticsUserId();
+              return owner === userId &&
+                owner === serverActionDiagnosticOwner.current &&
+                getIdentifiedAnalyticsUserId() === owner
+                ? owner
+                : null;
+            };
+            const committedDiagnosticExpectation = () => ({
+              owner: committedDiagnosticOwner(),
+              token: posthogKey,
+            });
+            const sanitizedEvent = sanitizeDesktopStreamCancelEvent(
+              sanitizeDesktopOperationReadinessEvent(
+                sanitizeAgentHttp413DiagnosticEvent(
+                  sanitizeFileActionAuthDiagnosticEvent(
+                    sanitizeServerActionClientContextEvent(
+                      sanitizeContextFeedbackEvent(
+                        sanitizeChatPerformanceEvent(
+                          sanitizeDesktopAckEvent(
+                            sanitizeAgentCancellationEvent(
+                              sanitizeDiffViewEvent(
+                                sanitizeFrontendExceptionUrlProperties(event),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      committedDiagnosticExpectation,
+                    ),
+                    committedDiagnosticExpectation,
+                  ),
+                  committedDiagnosticExpectation,
+                ),
+                committedDiagnosticExpectation,
+              ),
+              committedDiagnosticExpectation,
             );
-            if (shouldDropExpectedFrontendException(sanitizedEvent)) {
+            if (
+              !sanitizedEvent ||
+              shouldDropExpectedFrontendException(sanitizedEvent)
+            ) {
               return null;
             }
 
-            return enrichFrontendExceptionEvent(sanitizedEvent);
+            let navigatorDiagnosticOwner: string | null = null;
+            let reactBoundaryDiagnosticOwner: string | null = null;
+            if (sanitizedEvent.event === "$exception") {
+              try {
+                navigatorDiagnosticOwner = committedDiagnosticOwner();
+                reactBoundaryDiagnosticOwner = navigatorDiagnosticOwner;
+              } catch {
+                // Fail closed; the exception itself is still retained.
+              }
+            }
+            // Last, so no event-specific projection can strip Desktop identity.
+            const finalEvent = applyDesktopRuntimeIdentity(
+              sanitizeWorkspaceFilesEvent(
+                enrichFrontendExceptionEvent(sanitizedEvent, {
+                  navigatorDiagnosticOwner,
+                  reactBoundaryDiagnosticOwner,
+                }),
+              ),
+            );
+            if (
+              finalEvent.event !== DESKTOP_STREAM_CANCEL_NONCONFIRMATION_EVENT
+            )
+              return finalEvent;
+            // The SDK can batch and retry, even after consent changes. Start
+            // exactly one request now, while this owner is still committed,
+            // and never hand the event to the SDK queue.
+            try {
+              const owner = committedDiagnosticOwner();
+              const url = desktopStreamCancelCaptureUrl(apiHost);
+              const signal = desktopStreamCancelSignal.current;
+              if (
+                owner &&
+                signal &&
+                url &&
+                posthogKey &&
+                finalEvent.properties?.distinct_id === owner &&
+                !isAbuseReportingPath(window.location.pathname)
+              )
+                sendDesktopStreamCancelOnce(
+                  finalEvent,
+                  url,
+                  posthogKey,
+                  signal,
+                );
+            } catch {
+              // Best effort: a failed dispatch is never retried.
+            }
+            return null;
           },
         } satisfies Partial<PostHogConfig>;
 
@@ -162,6 +372,8 @@ export function PostHogProvider({
         if (posthog.has_opted_out_capturing()) {
           posthog.opt_in_capturing({ captureEventName: false });
         }
+
+        captureInfluencerVisit(posthog);
 
         if (!userId) {
           posthog.stopSessionRecording();
@@ -223,6 +435,8 @@ export function PostHogProvider({
         }
 
         confirmAuthenticatedAnalyticsUserId(userId!);
+        stopRejectionDiagnostics = startUnhandledRejectionDiagnostics();
+        stopReactBoundaryDiagnostics = startReactBoundaryDiagnostics();
         if (!referralHandled.current) {
           referralHandled.current = captureXReferralVisit(posthog);
         }
@@ -230,6 +444,7 @@ export function PostHogProvider({
         const replayLocale =
           userLocale == null ? window.navigator.language : userLocale;
         const shouldRecordSession =
+          !privateReplaySession.current &&
           !consentRequired &&
           subscription !== "free" &&
           isEnglishLocale(replayLocale);
@@ -247,10 +462,14 @@ export function PostHogProvider({
 
     return () => {
       cancelled = true;
+      stopRejectionDiagnostics?.();
+      stopReactBoundaryDiagnostics?.();
     };
   }, [
     analyticsAllowed,
+    privatePage,
     consentRequired,
+    consentDeclined,
     firstTouchAttribution,
     subscription,
     userEmail,

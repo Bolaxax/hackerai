@@ -10,12 +10,14 @@ import {
   getRetryFallbackModel,
   getFallbackSlugs,
   resolveServedModelForCostAccounting,
+  isAutoModelSelectionForRetry,
 } from "@/lib/api/chat-stream-helpers";
 import {
   resolveAgentModelForImageToolResults,
   resolveAgentModelAfterSummarization,
 } from "@/lib/api/agent-stream-runner";
 import { calculateRawTokenCost } from "@/lib/rate-limit/token-bucket";
+import { selectModel } from "@/lib/chat/chat-processor";
 
 const base = {
   userId: "paid-user",
@@ -31,6 +33,103 @@ const client = (variant: unknown) => ({
 });
 
 describe("paid 1017 routing", () => {
+  it.each([false, true])(
+    "pins Max text, uploads and image tool results to native Kimi K3.1 Pro high (direct vision=%s)",
+    (directGlmVisionEnabled) => {
+      const attachmentModel = selectModel(
+        "agent",
+        "ultra",
+        "hackerai-max",
+        true,
+        false,
+        { directGlmVisionEnabled },
+      );
+      const textModel = selectModel("agent", "ultra", "hackerai-max");
+      expect(textModel).toBe("model-kimi-k3.1-pro");
+      const toolImageModel = resolveAgentModelForImageToolResults(
+        textModel,
+        "agent",
+        true,
+        "hackerai-max",
+        false,
+        directGlmVisionEnabled,
+        "ultra",
+      );
+      for (const modelKey of [attachmentModel, toolImageModel]) {
+        expect(myProvider.languageModel(modelKey).modelId).toBe(
+          "moonshotai/kimi-k3.1-pro",
+        );
+        expect(supportsMultimodalToolResults(modelKey)).toBe(true);
+        const options = buildProviderOptions(
+          true,
+          "max-user",
+          modelKey,
+          "agent",
+          {
+            selectedModelOverride: "hackerai-max",
+            hasMultimodalToolResults: true,
+            reasoningOverride: { enabled: true, effort: "low" },
+          },
+        );
+        expect(options.openrouter.reasoning).toEqual({
+          enabled: true,
+          effort: "high",
+        });
+        expect(options.openrouter.models).toBeUndefined();
+        expect(
+          isAutoModelSelectionForRetry({
+            selectedModel: modelKey,
+            selectedModelOverride: "hackerai-max",
+          }),
+        ).toBe(true);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "preserves Max recovery routes after image tool results (direct vision=%s)",
+    (directGlmVisionEnabled) => {
+      for (const modelKey of [
+        DEEPSEEK_1017_MODEL_KEY,
+        "model-grok-4.6",
+        "model-kimi-k3",
+        "model-inference-cyber",
+      ]) {
+        expect(
+          resolveAgentModelForImageToolResults(
+            modelKey,
+            "agent",
+            true,
+            "hackerai-max",
+            false,
+            directGlmVisionEnabled,
+            "ultra",
+          ),
+        ).toBe(modelKey);
+      }
+    },
+  );
+
+  it("preserves legacy Max GLM text and summarized-image routes", () => {
+    expect(
+      resolveAgentModelForImageToolResults(
+        "model-glm-5.3",
+        "agent",
+        false,
+        "hackerai-max",
+      ),
+    ).toBe("model-glm-5.3");
+    expect(
+      resolveAgentModelForImageToolResults(
+        "model-glm-5.3",
+        "agent",
+        true,
+        "hackerai-max",
+        true,
+      ),
+    ).toBe("model-glm-5.3");
+  });
+
   it.each(["pro", "pro-plus", "ultra", "team"] as const)(
     "ships exact 1017 high for %s Auto and Pro without PostHog",
     async (subscription) => {
@@ -91,7 +190,7 @@ describe("paid 1017 routing", () => {
     { selectedModelOverride: "hackerai-standard" as const },
     { selectedModelOverride: "hackerai-max" as const },
     { selectedModel: "model-glm-5.3" },
-    { selectedModel: "model-abliterated" },
+    { selectedModel: "model-inference-cyber" },
     { selectedModel: "model-deepseek-v4-pro-0813" },
   ])("preserves excluded requests %j", (overrides) => {
     const request = { ...base, ...overrides };

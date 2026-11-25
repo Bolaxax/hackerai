@@ -9,7 +9,16 @@ import {
   getSafeToolErrorText,
   isToolInputValidationError as isToolInputValidationErrorValue,
 } from "@/lib/chat/tool-error-display";
-import type { AgentAutoReviewLifecycleStatus, SidebarTerminal } from "@/types";
+import type {
+  AgentAutoReviewLifecycleStatus,
+  SidebarTerminal,
+  SidebarTerminalCommandSource,
+} from "@/types";
+import {
+  isUserStoppedToolError,
+  LOCAL_CONNECTION_LOST_TOOL_ERROR_TEXT,
+} from "@/lib/chat/tool-abort-utils";
+import { CLOUD_UNAVAILABLE_AGENT_GUIDANCE } from "@/lib/ai/tools/utils/cloud-unavailability-message";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,12 +33,22 @@ export type TerminalExecutionPhase = NonNullable<
 export function getTerminalExecutionPhase({
   toolState,
   autoReviewStatus,
+  errorText,
+  isRunActive,
 }: {
   toolState?: string;
   autoReviewStatus?: AgentAutoReviewLifecycleStatus;
+  errorText?: string;
+  isRunActive?: boolean;
 }): TerminalExecutionPhase | undefined {
-  if (toolState === "output-error") return "failed";
+  if (toolState === "output-error") {
+    if (errorText === LOCAL_CONNECTION_LOST_TOOL_ERROR_TEXT)
+      return "interrupted";
+    return isUserStoppedToolError(errorText) ? "stopped" : "failed";
+  }
   if (toolState === "output-available") return "completed";
+  if (toolState === "input-available" && isRunActive === false)
+    return "interrupted";
   if (
     toolState === "approval-requested" ||
     autoReviewStatus === "needs_approval"
@@ -58,6 +77,8 @@ export interface ShellToolOutput {
     stdout?: string;
     stderr?: string;
     error?: string;
+    exitCode?: number | null;
+    exited?: { exitCode: number | null };
     sessionSnapshot?: string;
     rawSnapshot?: string;
   };
@@ -66,6 +87,18 @@ export interface ShellToolOutput {
   pid?: number;
   session?: string;
   error?: boolean | string;
+}
+
+export function getShellExitCode(
+  output: ShellToolOutput | undefined,
+): number | undefined {
+  const exitCode =
+    output?.result?.exitCode ??
+    output?.result?.exited?.exitCode ??
+    output?.exitCode;
+  return typeof exitCode === "number" && Number.isInteger(exitCode)
+    ? exitCode
+    : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +134,7 @@ export function getShellActionLabel(opts: {
   interactive?: boolean;
   /** Legacy run_terminal_cmd: input.is_background — true runs detached. */
   isBackground?: boolean;
+  exitCode?: number | null;
 }): string {
   const {
     isShellTool,
@@ -108,7 +142,18 @@ export function getShellActionLabel(opts: {
     isActive = false,
     interactive,
     isBackground,
+    exitCode,
   } = opts;
+
+  if (
+    !isActive &&
+    action !== "kill" &&
+    typeof exitCode === "number" &&
+    Number.isInteger(exitCode) &&
+    exitCode !== 0
+  ) {
+    return `Exited with code ${exitCode}`;
+  }
 
   if (!isShellTool) {
     // For interactive / background, the verb is the action label and the
@@ -148,6 +193,8 @@ export function getTerminalFailureAction(
   errorText?: string,
   action?: string,
 ): string {
+  if (errorText === LOCAL_CONNECTION_LOST_TOOL_ERROR_TEXT)
+    return "Command interrupted";
   if (action === "wait") return "Couldn’t check command output";
   return isToolInputValidationError(errorText)
     ? "Invalid command"
@@ -331,6 +378,16 @@ const AGENT_ONLY_TERMINAL_MESSAGE_REPLACEMENTS = new Map([
   ],
 ]);
 
+const stripCloudUnavailableGuidance = (output: string): string => {
+  const trimmed = output.trimEnd();
+  const guidance = CLOUD_UNAVAILABLE_AGENT_GUIDANCE.find((suffix) =>
+    trimmed.endsWith(suffix),
+  );
+  return guidance
+    ? trimmed.slice(0, -guidance.length) + output.slice(trimmed.length)
+    : output;
+};
+
 /**
  * Removes platform-authored recovery guidance before terminal output is shown
  * in the Computer sidebar. The persisted/model-facing tool result is unchanged.
@@ -361,7 +418,7 @@ export function stripAgentOnlyTerminalGuidance(output: string): string {
     userFacingOutput = userFacingOutput.replace(suffix, "");
   }
 
-  return userFacingOutput;
+  return stripCloudUnavailableGuidance(userFacingOutput);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +495,15 @@ export function computeShellTerminalBlock(
     ? getShellDisplayTarget(shellInput) || displayCommand
     : displayCommand;
 
+  // A tool can return successfully even when the command exits nonzero.
+  // Use structured process results, never text printed by the command.
+  const exitCode = getShellExitCode(shellOutput);
+  const hasFailedExit =
+    hasResult &&
+    shellAction !== "kill" &&
+    exitCode !== undefined &&
+    exitCode !== 0;
+
   // Brief-only label: drop the verb prefix ("Sent input", "Viewed", "Killed",
   // "Executed") and let the model's brief stand alone. Applied to:
   //   - interactive PTY actions (always — the verb is too generic without it)
@@ -445,21 +511,25 @@ export function computeShellTerminalBlock(
   //     run, so the user still sees the live command while it's executing.
   const briefText = shellInput?.brief || "";
   const useBriefOnly =
+    !hasFailedExit &&
     !!briefText &&
     ((isShellTool && isInteractiveAction) ||
       (!isInteractiveAction && hasResult));
   const blockAction = (isActive: boolean) =>
-    !isActive && errorText
-      ? getTerminalFailureAction(errorText, shellAction)
-      : useBriefOnly
-        ? briefText
-        : getShellActionLabel({
-            isShellTool,
-            action: shellAction,
-            isActive,
-            interactive: !isShellTool ? legacyInteractive : undefined,
-            isBackground: !isShellTool ? legacyIsBackground : undefined,
-          });
+    executionPhase === "interrupted"
+      ? "Command interrupted"
+      : !isActive && errorText
+        ? getTerminalFailureAction(errorText, shellAction)
+        : useBriefOnly
+          ? briefText
+          : getShellActionLabel({
+              isShellTool,
+              action: shellAction,
+              isActive,
+              interactive: !isShellTool ? legacyInteractive : undefined,
+              isBackground: !isShellTool ? legacyIsBackground : undefined,
+              exitCode: hasResult ? exitCode : undefined,
+            });
   const blockTarget = useBriefOnly ? undefined : displayTarget;
 
   // sessionSnapshot is xterm-headless-cleaned — prefer it when present; fall
@@ -489,14 +559,28 @@ export function computeShellTerminalBlock(
   const shellPid = shellInput?.pid ?? shellOutput?.pid;
   const shellSession = shellInput?.session ?? shellOutput?.session;
 
+  // The sidebar text and the input field it came from are chosen together:
+  // an interactive brief wins over its command, then command, then brief.
+  // Labels (action names, failure text) carry no source.
+  let commandSource: SidebarTerminalCommandSource | undefined;
+  if (isInteractiveAction && shellInput?.brief) {
+    commandSource = "interactive_brief";
+  } else if (isShellTool ? shellInput?.command : legacyCommand) {
+    commandSource = "command";
+  } else if (isShellTool && shellInput?.brief) {
+    commandSource = "brief";
+  }
+
   const sidebarContent: SidebarTerminal | null =
     !displayCommand && !isInteractiveAction
       ? null
       : {
           command: isInteractiveAction ? displayTarget : displayCommand,
+          ...(commandSource && { commandSource }),
           output: stripAgentOnlyTerminalGuidance(finalOutput),
           isExecuting,
           executionPhase,
+          exitCode: hasResult ? exitCode : undefined,
           isBackground: !isShellTool ? legacyIsBackground : undefined,
           isInteractive: !isShellTool ? legacyInteractive : undefined,
           toolCallId,

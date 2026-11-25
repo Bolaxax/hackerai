@@ -1,5 +1,104 @@
+import type {
+  DesktopFileFailure,
+  DesktopFileReceiverDiagnostic,
+} from "@/lib/centrifugo/desktop-file-errors";
+
+export type NativePathResolutionFailure =
+  | "missing_utility"
+  | "shell_syntax"
+  | "permission"
+  | "command_failed"
+  | "empty_output"
+  | "output_control"
+  | "non_absolute_output";
+
+export type NativePathReceiverMode =
+  `${"desktop" | "local" | "unknown"}_${"isolated" | "shared"}`;
+
+/** Retain only a finite conversion hint; the original public message is stable. */
+export class NativePathResolutionError extends Error {
+  constructor(
+    readonly failure: NativePathResolutionFailure,
+    readonly commandContext?: {
+      commandId?: string;
+      receiverMode: NativePathReceiverMode;
+    },
+  ) {
+    super("Failed to resolve the Windows file path through Git Bash");
+  }
+}
+
 export const LOCAL_COMMAND_RELAY_UNSUBSCRIBED_ERROR_CODE =
   "LOCAL_COMMAND_RELAY_UNSUBSCRIBED" as const;
+
+export type LocalFileRequestFailure =
+  | "unavailable"
+  | "aborted"
+  | "timeout"
+  | "native_error"
+  | "subscription_error"
+  | "relay_unsubscribed"
+  | "readiness_timeout"
+  // A dispatch error does not establish whether the client received the request.
+  | "dispatch_error";
+
+/** Records the local failure origin without classifying private error text. */
+export class LocalFileRequestError extends Error {
+  constructor(
+    readonly failure: LocalFileRequestFailure,
+    message: string,
+    readonly fileFailure?: DesktopFileFailure,
+    // Only from a matched same-request file_error; diagnostics, not a decision input.
+    readonly receiverDiagnostic?: DesktopFileReceiverDiagnostic,
+  ) {
+    super(message);
+  }
+}
+
+export function getLocalFileRequestFailure(
+  error: unknown,
+): LocalFileRequestFailure | "unknown" {
+  if (error instanceof LocalFileRequestError) {
+    switch (error.failure) {
+      case "unavailable":
+      case "aborted":
+      case "timeout":
+      case "native_error":
+      case "subscription_error":
+      case "relay_unsubscribed":
+      case "readiness_timeout":
+      case "dispatch_error":
+        return error.failure;
+    }
+  }
+  return "unknown";
+}
+
+/** Transport evidence used to retry only commands that never reached publication. */
+export class LocalCommandDispatchError extends Error {
+  readonly code = "LOCAL_COMMAND_DISPATCH_ERROR";
+
+  constructor(
+    cause: unknown,
+    readonly dispatched: boolean,
+    readonly retryable: boolean = false,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "LocalCommandDispatchError";
+  }
+}
+
+export const isLocalCommandDispatchError = (
+  error: unknown,
+): error is LocalCommandDispatchError =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  error.code === "LOCAL_COMMAND_DISPATCH_ERROR" &&
+  "dispatched" in error &&
+  typeof error.dispatched === "boolean" &&
+  "retryable" in error &&
+  typeof error.retryable === "boolean";
 
 /** Signals that relay presence rejected a command before it was published. */
 export class LocalCommandRelayUnsubscribedError extends Error {

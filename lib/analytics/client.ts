@@ -10,6 +10,11 @@ import {
   upgradeCtaImpressionInsertId,
 } from "@/lib/analytics/paid-funnel";
 import { POSTHOG_SESSION_ID_HEADER } from "@/lib/analytics/request-context";
+import { withDesktopRuntimeIdentity } from "@/lib/analytics/desktop-runtime-identity";
+import {
+  DESKTOP_STREAM_CANCEL_NONCONFIRMATION_EVENT,
+  DESKTOP_STREAM_CANCEL_NONCONFIRMATION_VERSION,
+} from "@/lib/analytics/desktop-stream-cancel-diagnostic";
 
 type ClientAnalyticsProperties = Record<string, unknown>;
 
@@ -43,6 +48,11 @@ export function getIdentifiedAnalyticsUserId() {
   return identifiedAnalyticsUserId === authenticatedAnalyticsUserId
     ? identifiedAnalyticsUserId
     : null;
+}
+
+/** Consent-permitted queue owner, including while SDK identification is pending. */
+export function getPermittedAnalyticsUserId() {
+  return authenticatedAnalyticsUserId;
 }
 
 function notifyAuthenticatedAnalyticsListeners() {
@@ -82,6 +92,7 @@ function getReadyPostHogClient() {
   return posthogClient?.__loaded ? posthogClient : null;
 }
 
+/** Preserve capture semantics while attributing selected diagnostics to their loaded bundle. */
 function captureWithPostHogClient(
   posthog: PostHogClient,
   event: string,
@@ -89,6 +100,31 @@ function captureWithPostHogClient(
   options?: PostHogCaptureOptions,
 ) {
   try {
+    const buildCommit = process.env.NEXT_PUBLIC_HACKERAI_BUILD_COMMIT;
+    if (
+      (event === "desktop_file_bridge_probe_failed" ||
+        ((event === "sandbox_connection_terminated" ||
+          event === "desktop_bridge_relay_state_changed") &&
+          properties.native_auth_diagnostic_version === 1) ||
+        (event === "react_boundary_failure_context" &&
+          properties.version === 1) ||
+        (event === "file_action_auth_diagnostic" &&
+          properties.file_action_auth_diagnostic_version === 1) ||
+        (event === DESKTOP_STREAM_CANCEL_NONCONFIRMATION_EVENT &&
+          properties.version ===
+            DESKTOP_STREAM_CANCEL_NONCONFIRMATION_VERSION)) &&
+      buildCommit &&
+      /^[a-f0-9]{40}$/i.test(buildCommit)
+    ) {
+      // A native version or auth policy marker does not identify the loaded bundle.
+      // This build-time commit describes that bundle, not the native binary.
+      properties = {
+        ...properties,
+        hackerai_frontend_build_commit: buildCommit.toLowerCase(),
+      };
+    }
+    // Inside the native app every event carries the measured runtime identity.
+    properties = withDesktopRuntimeIdentity(event, properties);
     if (options) {
       posthog.capture(event, properties, options);
     } else {

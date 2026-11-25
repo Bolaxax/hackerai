@@ -27,6 +27,13 @@ export function createRuntimeSettlementWatchdog({
   const arm = (runtimeBudgetExceededAt = Date.now()) => {
     if (armed || disposed) return;
     armed = true;
+    // The event timestamp stays wall-clock, but the reported duration uses a
+    // monotonic clock so host clock adjustments cannot distort it.
+    const stalledBeforeArmMs = Math.max(
+      0,
+      Date.now() - runtimeBudgetExceededAt,
+    );
+    const armedAt = performance.now();
     timeoutId = setTimeout(() => {
       timeoutId = undefined;
       if (disposed) return;
@@ -34,7 +41,8 @@ export function createRuntimeSettlementWatchdog({
         void Promise.resolve(
           onStalled({
             runtimeBudgetExceededAt,
-            stalledForMs: Math.max(0, Date.now() - runtimeBudgetExceededAt),
+            stalledForMs:
+              stalledBeforeArmMs + Math.max(0, performance.now() - armedAt),
           }),
         ).catch(() => {
           // Diagnostic emission must never change task settlement behavior.
@@ -68,7 +76,7 @@ export function createActiveRuntimeBudget({
   onExceeded: () => void;
 }): ActiveRuntimeBudget {
   let elapsedBeforeSegmentMs = Math.max(0, initialElapsedMs);
-  let segmentStartedAt = Date.now();
+  let segmentStartedAt = performance.now();
   let paused = false;
   let disposed = false;
   let exceeded = false;
@@ -76,9 +84,7 @@ export function createActiveRuntimeBudget({
 
   const getElapsedTimeMs = () =>
     elapsedBeforeSegmentMs +
-    (paused || disposed || exceeded
-      ? 0
-      : Math.max(0, Date.now() - segmentStartedAt));
+    (paused || disposed || exceeded ? 0 : performance.now() - segmentStartedAt);
 
   const clearTimer = () => {
     if (timeoutId === undefined) return;
@@ -109,7 +115,7 @@ export function createActiveRuntimeBudget({
 
   const resume = () => {
     if (disposed || !paused || exceeded) return;
-    segmentStartedAt = Date.now();
+    segmentStartedAt = performance.now();
     paused = false;
     schedule();
   };

@@ -23,12 +23,29 @@ import { resetExtraUsageResumeRetryGuardForTests } from "@/lib/chat/extra-usage-
 
 let mockSubscription: "free" | "pro" = "pro";
 const mockSetSelectedModel = jest.fn();
+const mockInitializeNewChat = jest.fn();
+const mockRouterPush = jest.fn();
+
+jest.mock("next/navigation", () => ({
+  ...jest.requireActual<object>("next/navigation"),
+  useRouter: () => ({ push: mockRouterPush }),
+}));
+
+jest.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => false }));
 
 jest.mock("@/app/contexts/GlobalState", () => ({
   GlobalStateProvider: ({ children }: { children: ReactNode }) => children,
   useGlobalState: () => ({
     subscription: mockSubscription,
     setSelectedModel: mockSetSelectedModel,
+    initializeNewChat: mockInitializeNewChat,
+  }),
+  useGlobalStateActions: () => ({
+    closeSidebar: jest.fn(),
+    initializeNewChat: mockInitializeNewChat,
+    setActiveProjectId: jest.fn(),
+    setChatSidebarOpen: jest.fn(),
+    setSandboxPreference: jest.fn(),
   }),
 }));
 
@@ -83,7 +100,52 @@ describe("MessageErrorState", () => {
     jest.restoreAllMocks();
   });
 
-  it("does not offer same-payload retry for provider content blocks", () => {
+  it.each([false, true])(
+    "renders a region conflict (serialized=%s) as an explicit choice without replaying the prompt",
+    async (serialized) => {
+      const originalFetch = global.fetch;
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          status: "selection_required",
+          token: "a".repeat(64),
+          choices: [
+            { id: "us-existing", region: "us-east-1", lastStartedAt: null },
+            { id: "eu-existing", region: "eu-central-1", lastStartedAt: null },
+          ],
+        }),
+      }) as typeof fetch;
+      const onRetry = jest.fn();
+      try {
+        const error = new ChatSDKError(
+          "bad_request:sandbox",
+          "Choose your workspace",
+          { cloud_workspace_region_selection_required: true },
+        );
+        render(
+          <MessageErrorState
+            error={
+              serialized
+                ? new Error(serializeChatSDKErrorForStream(error))
+                : error
+            }
+            onRetry={onRetry}
+            onReconnect={jest.fn()}
+          />,
+        );
+        expect(
+          await screen.findByRole("radio", { name: /Europe workspace/ }),
+        ).toBeEnabled();
+        expect(
+          screen.queryByRole("button", { name: "Retry" }),
+        ).not.toBeInTheDocument();
+        expect(onRetry).not.toHaveBeenCalled();
+      } finally {
+        global.fetch = originalFetch;
+      }
+    },
+  );
+  it("opens a new task route when a provider block prevents retry", () => {
     const error = new ChatSDKError(
       "forbidden:stream",
       "The model provider blocked this request because the conversation content was flagged by its safety system. Edit your last message or remove sensitive or raw tool output, then try again.",
@@ -111,9 +173,9 @@ describe("MessageErrorState", () => {
       screen.getByText(/Retrying with the same conversation/i),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^retry$/i })).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /new task/i }),
-    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /new task/i }));
+    expect(mockInitializeNewChat).toHaveBeenCalledTimes(1);
+    expect(mockRouterPush).toHaveBeenCalledWith("/");
   });
 
   it("offers a fresh retry for a serialized offline computer error without resuming its finished stream", () => {
@@ -142,6 +204,34 @@ describe("MessageErrorState", () => {
     fireEvent.click(screen.getByRole("button", { name: /^retry$/i }));
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(onReconnect).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes reattaching to the existing run from a new retry after a network drop", () => {
+    const onRetry = jest.fn();
+    const onReconnect = jest.fn();
+    render(
+      <TestWrapper>
+        <MessageErrorState
+          error={new TypeError("Failed to fetch")}
+          onRetry={onRetry}
+          onReconnect={onReconnect}
+          mode="agent"
+        />
+      </TestWrapper>,
+    );
+
+    const reconnect = screen.getByRole("button", { name: /^reconnect$/i });
+    const retry = screen.getByRole("button", { name: /^retry$/i });
+    expect(reconnect).toHaveAccessibleDescription(
+      /Reconnect returns to this stream.*Retry checks for an active Agent run, then continues saved work if that run ended/,
+    );
+    expect(retry).toHaveAccessibleDescription(
+      /Retry checks for an active Agent run/,
+    );
+
+    fireEvent.click(reconnect);
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
   });
 
   it("keeps retry available for ordinary errors", () => {
@@ -186,6 +276,32 @@ describe("MessageErrorState", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "View Usage" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Upgrade Plan" })).toBeNull();
+  });
+
+  it("explains a spending-cap block without showing the subscription reset countdown", () => {
+    const error = new ChatSDKError(
+      "rate_limit:chat",
+      "Server message with the subscription renewal date.",
+      {
+        capReason: "extra_usage_cap",
+        resetTimestamp: Date.now() + 86_400_000,
+      },
+    );
+
+    render(
+      <TestWrapper>
+        <MessageErrorState error={error} onRetry={jest.fn()} />
+      </TestWrapper>,
+    );
+
+    expect(
+      screen.getByText(/buying credits won't raise the limit/i),
+    ).toBeVisible();
+    expect(screen.getByText(/start of next month \(UTC\)/i)).toBeVisible();
+    expect(screen.queryByText(/Server message/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Resets in/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Increase Limit" }));
+    expect(openSettingsDialog).toHaveBeenCalledWith("Extra Usage");
   });
 
   it("shows a focused Add Credits plus free Ask CTA when allowance is available", async () => {

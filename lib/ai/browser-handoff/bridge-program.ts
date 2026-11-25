@@ -1,0 +1,386 @@
+const BRIDGE_CLOSE_CODES = [
+  1000, 1001, 1002, 1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013,
+  1014, 1015,
+] as const;
+const BRIDGE_PHASES = [
+  "connecting",
+  "awaiting_frame",
+  "message_received",
+] as const;
+
+// Public Node/Undici reasons only; unknown error messages never leave the helper.
+const BRIDGE_ERROR_REASON_LABELS = {
+  "Received network error or non-101 status code.": "network_or_handshake",
+  "Connection was closed before it was established.": "network_or_handshake",
+  "Server did not respond with sent protocols.": "handshake_headers",
+  'Server did not set Upgrade header to "websocket".': "handshake_headers",
+  'Server did not set Connection header to "upgrade".': "handshake_headers",
+  "Incorrect hash received in Sec-WebSocket-Accept header.":
+    "handshake_headers",
+  "Sec-WebSocket-Extensions header does not match.": "handshake_headers",
+  "Protocol was not set in the opening handshake.": "handshake_headers",
+  "Invalid opcode received": "protocol_opcode",
+  "Frame cannot be masked": "protocol_masked",
+  "Expected RSV1 to be clear.": "protocol_reserved_bits",
+  "RSV1, RSV2, RSV3 must be clear": "protocol_reserved_bits",
+  "Invalid frame type was fragmented.": "protocol_fragmentation",
+  "Expected continuation frame": "protocol_fragmentation",
+  "Fragmented frame exceeded 125 bytes.": "protocol_fragmentation",
+  "Control frame either too large or fragmented": "protocol_fragmentation",
+  "Unexpected continuation frame": "protocol_fragmentation",
+  "Received payload length > 2^31 bytes.": "protocol_payload",
+  "Received invalid UTF-8 in text frame.": "protocol_utf8",
+  "Received close frame with a 1-byte body.": "protocol_close",
+} as const;
+const BRIDGE_ERROR_REASONS = [
+  ...new Set(Object.values(BRIDGE_ERROR_REASON_LABELS)),
+  "other",
+  "unreadable",
+] as const;
+const BRIDGE_NONFRAME_MESSAGE_CAP = 16;
+/**
+ * Frame exit with no output: the daemon's stream claimed no attached browser,
+ * the same claim stream_status admission and the relay already treat as closed.
+ */
+export const BROWSER_BRIDGE_CLOSED_EXIT = 7;
+// The daemon's own protocol claims, not verified browser health.
+const BRIDGE_STATUS_CLAIM = ["true", "false", "other", "not_observed"] as const;
+const BRIDGE_STATUS_MESSAGE_CAP = 3;
+// Coarse time from socket open to the latest status message.
+const BRIDGE_STATUS_SINCE_OPEN = [
+  "lt1s",
+  "lt3s",
+  "lt5s",
+  "ge5s",
+  "not_observed",
+] as const;
+
+export type BrowserBridgeFailureContext = {
+  capture_bridge_diagnostic_version?: 1 | 2 | 3 | 4 | 5 | 6;
+  capture_bridge_failure?: "error" | "early_close" | "deadline";
+  capture_bridge_phase?: (typeof BRIDGE_PHASES)[number];
+  capture_bridge_close_code?:
+    (typeof BRIDGE_CLOSE_CODES)[number] | "none" | "other";
+  capture_bridge_error_reason?: (typeof BRIDGE_ERROR_REASONS)[number];
+  capture_bridge_node_major?: number | "other";
+  capture_bridge_nonframe_message_count?: number;
+  capture_bridge_status_message_connected?: (typeof BRIDGE_STATUS_CLAIM)[number];
+  capture_bridge_status_message_screencasting?: (typeof BRIDGE_STATUS_CLAIM)[number];
+  capture_bridge_status_message_first_screencasting?: (typeof BRIDGE_STATUS_CLAIM)[number];
+  capture_bridge_status_message_count?: number;
+  capture_bridge_status_message_latest_since_open?: (typeof BRIDGE_STATUS_SINCE_OPEN)[number];
+};
+
+const oneOf = <T extends string>(
+  values: readonly T[],
+  value: unknown,
+): value is T => (values as readonly unknown[]).includes(value);
+
+/**
+ * v6's closed status detail: the first screencasting claim, a capped status
+ * count and the latest status's coarse time since open. Nothing unless the
+ * values are a combination the helper can emit.
+ */
+function v6StatusDetail(
+  tuple: readonly unknown[],
+): BrowserBridgeFailureContext | undefined {
+  const [, , , , count, connected, screencasting, first, statuses, sinceOpen] =
+    tuple;
+  if (
+    !oneOf(BRIDGE_STATUS_CLAIM, first) ||
+    !oneOf(BRIDGE_STATUS_SINCE_OPEN, sinceOpen) ||
+    typeof statuses !== "number" ||
+    typeof count !== "number" ||
+    !Number.isInteger(statuses) ||
+    statuses < 0 ||
+    statuses > BRIDGE_STATUS_MESSAGE_CAP ||
+    // Every status message is also a non-frame message.
+    statuses > count
+  )
+    return undefined;
+  // No status leaves every status field unobserved; any status sets them all.
+  const observed = statuses > 0;
+  if (
+    [connected, screencasting, first, sinceOpen].some(
+      (value) => (value !== "not_observed") !== observed,
+    ) ||
+    // A single status is both the first and the latest claim.
+    (statuses === 1 && first !== screencasting) ||
+    // A latest strict false claim would have won exit 7 before the deadline.
+    connected === "false"
+  )
+    return undefined;
+  return {
+    capture_bridge_status_message_first_screencasting: first,
+    capture_bridge_status_message_count: statuses,
+    capture_bridge_status_message_latest_since_open: sinceOpen,
+  };
+}
+
+/** Read bounded packets tied to their failure exit; never frames, stderr or getters. */
+export function browserBridgeFailureContext(
+  result: unknown,
+): BrowserBridgeFailureContext {
+  try {
+    if (!result || typeof result !== "object") return {};
+    const exitCode = Object.getOwnPropertyDescriptor(result, "exitCode")?.value;
+    if (exitCode !== 3 && exitCode !== 6) return {};
+    const stdout = Object.getOwnPropertyDescriptor(result, "stdout")?.value;
+    if (typeof stdout !== "string" || stdout.length > 128) return {};
+    const tuple = JSON.parse(stdout)?.bridge_failure;
+    if (!Array.isArray(tuple)) return {};
+    if (exitCode === 3) {
+      const count = tuple[4];
+      const version =
+        (tuple.length === 6 && tuple[0] === 4) ||
+        (tuple.length === 7 && tuple[0] === 5) ||
+        (tuple.length === 10 && tuple[0] === 6)
+          ? tuple[0]
+          : undefined;
+      const screencasting = version === 4 ? undefined : tuple[6];
+      // v6 appends its detail after the unchanged v5 positions.
+      const detail = version === 6 ? v6StatusDetail(tuple) : {};
+      if (
+        version !== undefined &&
+        detail !== undefined &&
+        (version === 4 ||
+          // One status message sets both claims, so both are observed or neither.
+          (BRIDGE_STATUS_CLAIM.includes(screencasting) &&
+            (screencasting === "not_observed") ===
+              (tuple[5] === "not_observed"))) &&
+        tuple[1] === "deadline" &&
+        BRIDGE_PHASES.includes(tuple[2]) &&
+        tuple[3] === "none" &&
+        Number.isInteger(count) &&
+        count >= 0 &&
+        count <= BRIDGE_NONFRAME_MESSAGE_CAP &&
+        BRIDGE_STATUS_CLAIM.includes(tuple[5]) &&
+        // Any parsed message moves the helper to message_received.
+        (tuple[2] === "message_received"
+          ? count >= 1
+          : count === 0 && tuple[5] === "not_observed")
+      )
+        return {
+          capture_bridge_diagnostic_version: version,
+          capture_bridge_failure: "deadline",
+          capture_bridge_phase: tuple[2],
+          capture_bridge_close_code: "none",
+          capture_bridge_nonframe_message_count: count,
+          capture_bridge_status_message_connected: tuple[5],
+          ...(version === 4
+            ? {}
+            : { capture_bridge_status_message_screencasting: screencasting }),
+          ...detail,
+        };
+      if (
+        tuple.length === 4 &&
+        tuple[0] === 3 &&
+        tuple[1] === "deadline" &&
+        BRIDGE_PHASES.includes(tuple[2]) &&
+        tuple[3] === "none"
+      )
+        return {
+          capture_bridge_diagnostic_version: 3,
+          capture_bridge_failure: "deadline",
+          capture_bridge_phase: tuple[2],
+          capture_bridge_close_code: "none",
+        };
+      return {};
+    }
+    const legacy = tuple.length === 4 && tuple[0] === 1;
+    const reasonPacket =
+      tuple.length === 6 &&
+      tuple[0] === 2 &&
+      tuple[1] === "error" &&
+      tuple[3] === "none" &&
+      BRIDGE_ERROR_REASONS.includes(tuple[4]) &&
+      (tuple[5] === "other" ||
+        (Number.isInteger(tuple[5]) && tuple[5] >= 1 && tuple[5] <= 255));
+    if (
+      (legacy || reasonPacket) &&
+      (tuple[1] === "error" || tuple[1] === "early_close") &&
+      BRIDGE_PHASES.includes(tuple[2]) &&
+      (tuple[1] === "error"
+        ? tuple[3] === "none"
+        : tuple[3] === "other" || BRIDGE_CLOSE_CODES.includes(tuple[3]))
+    )
+      return {
+        capture_bridge_diagnostic_version: legacy ? 1 : 2,
+        capture_bridge_failure: tuple[1],
+        capture_bridge_phase: tuple[2],
+        capture_bridge_close_code: tuple[3],
+        ...(reasonPacket
+          ? {
+              capture_bridge_error_reason: tuple[4],
+              capture_bridge_node_major: tuple[5],
+            }
+          : {}),
+      };
+  } catch {
+    // Optional diagnostics cannot replace the original capture failure.
+  }
+  return {};
+}
+
+// Executed inside the existing cloud sandbox. The stream WebSocket is bound to
+// localhost there; only a single validated frame or input batch crosses the
+// authenticated E2B command connection. Never send this port to a client.
+export const BROWSER_BRIDGE_PROGRAM = String.raw`
+const port = Number(process.argv[1]);
+const mode = process.argv[2];
+if (!Number.isInteger(port) || port < 1 || port > 65535 ||
+    (mode !== 'frame' && mode !== 'input') || typeof WebSocket !== 'function') {
+  process.exit(2);
+}
+let done = false;
+let phase = 'connecting';
+let nonFrameMessages = 0;
+let lastStatus = 'not_observed';
+let lastScreencasting = 'not_observed';
+let firstScreencasting = 'not_observed';
+let statusMessages = 0;
+let lastStatusSinceOpen = 'not_observed';
+let openedAt = Date.now();
+const closeCodes = ${JSON.stringify(BRIDGE_CLOSE_CODES)};
+const errorReasons = ${JSON.stringify(BRIDGE_ERROR_REASON_LABELS)};
+const finish = (code, value) => {
+  if (done) return;
+  done = true;
+  if (code === 0) {
+    // A pipe write can still be pending when exit runs, truncating the result.
+    // Report success only once stdout accepted all of it; the watchdog stays
+    // armed so a reader that never drains ends as exit 3. A failed write exits
+    // 1 here, before stdout can emit an unhandled error report.
+    try {
+      process.stdout.write(JSON.stringify(value), error => {
+        if (error) { process.exit(1); return; }
+        clearTimeout(timer);
+        setTimeout(() => process.exit(0), 20);
+      });
+    } catch { process.exit(1); return; }
+  } else {
+    clearTimeout(timer);
+    // Failure packets are optional diagnostics and never delay a failure exit.
+    if (value !== undefined) {
+      try { process.stdout.write(JSON.stringify(value)); } catch {}
+    }
+    setTimeout(() => process.exit(code), 20);
+  }
+  try { socket.close(); } catch {}
+};
+const timer = setTimeout(() => {
+  // Success output is still draining: no deadline packet may follow it.
+  if (done) { process.exit(3); return; }
+  finish(3, mode === 'frame'
+    ? { bridge_failure: [6, 'deadline', phase, 'none', nonFrameMessages, lastStatus,
+        lastScreencasting, firstScreencasting, statusMessages, lastStatusSinceOpen] }
+    : undefined);
+}, 6500);
+let payload = '';
+let socket;
+if (mode === 'input') {
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => {
+    payload += chunk;
+    if (payload.length > 8192) finish(4);
+  });
+  process.stdin.on('end', connect);
+} else {
+  connect();
+}
+function connect() {
+  if (done) return;
+  socket = new WebSocket('ws://127.0.0.1:' + port);
+  socket.addEventListener('open', () => {
+    phase = 'awaiting_frame';
+    openedAt = Date.now();
+    if (mode !== 'input') return;
+    try {
+      const events = JSON.parse(payload);
+      if (!Array.isArray(events) || events.length < 1 || events.length > 64) {
+        finish(4); return;
+      }
+      for (const event of events) socket.send(JSON.stringify(event));
+      setTimeout(() => finish(0, { ok: true }), 120);
+    } catch { finish(4); }
+  });
+  socket.addEventListener('message', event => {
+    if (mode !== 'frame') return;
+    phase = 'message_received';
+    try {
+      const message = JSON.parse(String(event.data));
+      if (message.type !== 'frame') {
+        // Closed summary only; never the raw type or any message contents.
+        if (nonFrameMessages < ${BRIDGE_NONFRAME_MESSAGE_CAP}) nonFrameMessages += 1;
+        if (message.type === 'status') {
+          // Independent fields; an omitted field resets to other, never false.
+          lastStatus = message.connected === true ? 'true'
+            : message.connected === false ? 'false' : 'other';
+          lastScreencasting = message.screencasting === true ? 'true'
+            : message.screencasting === false ? 'false' : 'other';
+          // Observed claims and timing only: a later status can also follow
+          // recording, so none of these marks screencast start or a frame.
+          if (statusMessages === 0) firstScreencasting = lastScreencasting;
+          if (statusMessages < ${BRIDGE_STATUS_MESSAGE_CAP}) statusMessages += 1;
+          const sinceOpen = Date.now() - openedAt;
+          lastStatusSinceOpen = sinceOpen < 1000 ? 'lt1s' : sinceOpen < 3000 ? 'lt3s'
+            : sinceOpen < 5000 ? 'lt5s' : 'ge5s';
+          // Only a strict false; the first outcome wins over any later frame.
+          if (message.connected === false) finish(${BROWSER_BRIDGE_CLOSED_EXIT});
+        }
+        return;
+      }
+      if (typeof message.data !== 'string' || message.data.length > 900000) {
+        finish(5); return;
+      }
+      const metadata = message.metadata || {};
+      const capturedAt = Number(metadata.timestamp);
+      finish(0, {
+        data: message.data,
+        width: Number(metadata.deviceWidth) || 0,
+        height: Number(metadata.deviceHeight) || 0,
+        // Older producers can omit this value. Keep unknown age explicit;
+        // takeover and resume request a separate fresh screenshot.
+        capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : 0,
+      });
+    } catch { finish(5); }
+  });
+  socket.addEventListener('error', event => {
+    if (done) return;
+    if (mode !== 'frame') { finish(6); return; }
+    let reason = 'other';
+    let nodeMajor = 'other';
+    try {
+      const error = event.error;
+      const message = error && typeof error === 'object'
+        ? Object.getOwnPropertyDescriptor(error, 'message')?.value : undefined;
+      if (typeof message === 'string' && message.length <= 256 &&
+          Object.prototype.hasOwnProperty.call(errorReasons, message)) {
+        reason = errorReasons[message];
+      }
+    } catch { reason = 'unreadable'; }
+    try {
+      const version = process.versions?.node;
+      const major = typeof version === 'string' && /^\d{1,3}\./.test(version)
+        ? Number(version.split('.')[0]) : 0;
+      if (major >= 1 && major <= 255) nodeMajor = major;
+    } catch {}
+    finish(6, { bridge_failure: [2, 'error', phase, 'none', reason, nodeMajor] });
+  });
+  socket.addEventListener('close', event => {
+    if (done) return;
+    let code = 'other';
+    try { if (closeCodes.includes(event.code)) code = event.code; } catch {}
+    finish(6, mode === 'frame'
+      ? { bridge_failure: [1, 'early_close', phase, code] } : undefined);
+  });
+}
+`;
+
+const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+export function browserBridgeCommand(port: number, mode: "frame" | "input") {
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error("Invalid private browser stream port");
+  return `node -e ${quote(BROWSER_BRIDGE_PROGRAM)} ${port} ${mode}`;
+}

@@ -3,7 +3,9 @@ import {
   getReportToolInputSchema,
   updateVulnerabilityReportToolInputSchema,
   createAgentToolSchemaSet,
+  createFileEditToolSchema,
   createFileToolSchema,
+  createFileWriteToolSchema,
   createGetTerminalFilesToolSchema,
   createInteractTerminalSessionToolSchema,
   createOpenUrlToolSchema,
@@ -311,6 +313,14 @@ describe("agent tool schema descriptions", () => {
       "a detached PID is not a reusable terminal session",
     );
     expect(fullAccessDescription).toContain("append ` | cat` to the command");
+    expect(fullAccessDescription).toContain(
+      "Use separate calls for critical install, database configuration, and service startup steps",
+    );
+    expect(fullAccessDescription).toContain(
+      "check `result.status` and `result.exitCode`, then verify the actual postcondition",
+    );
+    expect(fullAccessDescription).toContain("can mask an earlier failure");
+    expect(fullAccessDescription).not.toContain("npm install && npm start");
 
     const approvalGatedTool = createRunTerminalCmdToolSchema({
       approvalGated: true,
@@ -338,6 +348,24 @@ describe("agent tool schema descriptions", () => {
     expect(approvalGatedDescription).not.toContain(
       "append ` | cat` to the command",
     );
+    expect(approvalGatedDescription).not.toContain(
+      "can mask an earlier failure",
+    );
+    for (const description of [
+      fullAccessDescription,
+      approvalGatedDescription,
+    ]) {
+      expect(description).toContain(
+        "start it with `is_background` false and a short initial `timeout`",
+      );
+      expect(description).toContain("check readiness in a separate call");
+      expect(description).toContain(
+        "Do not use `nohup` or a shell `&` when you need a reusable session",
+      );
+      expect(description).toContain(
+        "a detached PID is not a reusable terminal session",
+      );
+    }
     expect(getInputShape(approvalGatedTool)).toHaveProperty("justification");
     expect(getInputShape(approvalGatedTool)).toHaveProperty("prefix_rule");
     expect(getInputShape(approvalGatedTool).justification).toHaveProperty(
@@ -354,6 +382,30 @@ describe("agent tool schema descriptions", () => {
     expect(getInputShape(runTerminalCmdTool)).not.toHaveProperty("prefix_rule");
   });
 
+  test("cloud guidance starts services in the background instead of run-scoped sessions", () => {
+    const cloudTool = createRunTerminalCmdToolSchema({
+      cloudBackgroundServices: true,
+    });
+    const cloud = getDescription(cloudTool);
+    // Interactive and timed-out sessions are closed at run end, so a cloud
+    // dev server started that way would die between turns.
+    expect(cloud).toContain(
+      "Start long-lived services (dev servers, databases, labs, listeners) with `is_background` true",
+    );
+    expect(cloud).toContain("read output from the log file");
+    expect(cloud).toContain("stop a service with `kill -- -<pid>`");
+    expect(cloud).toContain("At most 5 background processes can run at once");
+    expect(cloud).not.toContain(
+      "start it with `is_background` false and a short initial `timeout`",
+    );
+    expect(getInputShape(cloudTool).is_background).toHaveProperty(
+      "description",
+      expect.stringContaining("written to the returned logPath"),
+    );
+    // Desktop ignores is_background today, so local wording is unchanged.
+    expect(getDescription(runTerminalCmdTool)).not.toContain("logPath");
+  });
+
   test("file approval wording is only included for approval-gated schemas", () => {
     const fullAccessTool = createFileToolSchema({ supportsView: true });
     const approvalGatedTool = createFileToolSchema({
@@ -363,7 +415,7 @@ describe("agent tool schema descriptions", () => {
 
     expect(getDescription(fullAccessTool)).not.toContain("approval-gated");
     expect(getDescription(approvalGatedTool)).toContain(
-      "Write, append, and edit actions are approval-gated.",
+      "File mutations are approval-gated.",
     );
     expect(getDescription(fullAccessTool)).toContain(
       "automatically routes subsequent Agent steps to a vision-capable model",
@@ -397,9 +449,11 @@ describe("agent tool schema descriptions", () => {
     };
 
     expect(actionSchema.safeParse("view").success).toBe(true);
-    expect(createAgentToolSchemaSet({ mode: "ask" })).not.toHaveProperty(
-      "file",
-    );
+    for (const name of ["file", "file_edit", "file_write"]) {
+      expect(createAgentToolSchemaSet({ mode: "ask" })).not.toHaveProperty(
+        name,
+      );
+    }
   });
 
   test("passes the active model into every brief-bearing tool schema", () => {
@@ -410,6 +464,8 @@ describe("agent tool schema descriptions", () => {
       }),
       get_terminal_files: createGetTerminalFilesToolSchema({ modelName }),
       file: createFileToolSchema({ supportsView: true, modelName }),
+      file_edit: createFileEditToolSchema({ modelName }),
+      file_write: createFileWriteToolSchema({ modelName }),
       web_search: createWebSearchToolSchema({ modelName }),
       open_url: createOpenUrlToolSchema({ modelName }),
     });
@@ -421,6 +477,8 @@ describe("agent tool schema descriptions", () => {
       "interact_terminal_session",
       "get_terminal_files",
       "file",
+      "file_edit",
+      "file_write",
       "web_search",
       "open_url",
     ] as const) {

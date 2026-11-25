@@ -3,6 +3,9 @@ export const DESKTOP_COMMAND_DELIVERY_GRACE_MS = 30_000;
 
 export interface CommandMessage {
   type: "command";
+  authorizationId?: string;
+  /** Opt-in; old clients ignore this and retain legacy stream behavior. */
+  outputProtocol?: "ack-v1";
   commandId: string;
   command: string;
   /** Optional process stdin. Base64 keeps arbitrary terminal bytes JSON-safe. */
@@ -32,6 +35,7 @@ export interface CommandCancelResultMessage {
 
 export interface StdoutMessage {
   type: "stdout";
+  outputProtocol?: "ack-v1";
   commandId: string;
   data: string;
   sequence?: number;
@@ -39,6 +43,7 @@ export interface StdoutMessage {
 
 export interface StderrMessage {
   type: "stderr";
+  outputProtocol?: "ack-v1";
   commandId: string;
   data: string;
   sequence?: number;
@@ -46,6 +51,7 @@ export interface StderrMessage {
 
 export interface ExitMessage {
   type: "exit";
+  outputProtocol?: "ack-v1";
   commandId: string;
   exitCode: number;
   pid?: number;
@@ -54,6 +60,7 @@ export interface ExitMessage {
 
 export interface ErrorMessage {
   type: "error";
+  outputProtocol?: "ack-v1";
   commandId: string;
   message: string;
   sequence?: number;
@@ -63,6 +70,7 @@ export interface ErrorMessage {
 
 export interface FileStatMessage {
   type: "file_stat";
+  authorizationId?: string;
   requestId: string;
   path: string;
   targetConnectionId: string;
@@ -70,6 +78,7 @@ export interface FileStatMessage {
 
 export interface FileReadMessage {
   type: "file_read";
+  authorizationId?: string;
   requestId: string;
   path: string;
   range?: [number, number];
@@ -80,6 +89,7 @@ export interface FileReadMessage {
 
 export interface FileWriteMessage {
   type: "file_write";
+  authorizationId?: string;
   requestId: string;
   path: string;
   content: string;
@@ -90,6 +100,7 @@ export interface FileWriteMessage {
 
 export interface FileAppendMessage {
   type: "file_append";
+  authorizationId?: string;
   requestId: string;
   path: string;
   content: string;
@@ -100,6 +111,7 @@ export interface FileAppendMessage {
 
 export interface FileRemoveMessage {
   type: "file_remove";
+  authorizationId?: string;
   requestId: string;
   path: string;
   targetConnectionId: string;
@@ -107,6 +119,7 @@ export interface FileRemoveMessage {
 
 export interface FileListMessage {
   type: "file_list";
+  authorizationId?: string;
   requestId: string;
   path: string;
   targetConnectionId: string;
@@ -123,6 +136,10 @@ export interface FileErrorMessage {
   type: "file_error";
   requestId: string;
   message: string;
+  /** Optional bounded cause from newer Desktop bridges. */
+  fileFailure?: import("./desktop-file-errors").DesktopFileFailure;
+  /** Optional closed stage/adapter observation on file_stat failures only. */
+  receiverDiagnostic?: import("./desktop-file-errors").DesktopFileReceiverDiagnostic;
 }
 
 export interface FileStatResultMessage {
@@ -155,6 +172,7 @@ export interface FileListResultMessage {
 
 export interface PtyCreateMessage {
   type: "pty_create";
+  authorizationId?: string;
   sessionId: string;
   command: string;
   cols?: number;
@@ -166,6 +184,7 @@ export interface PtyCreateMessage {
 
 export interface PtyInputMessage {
   type: "pty_input";
+  authorizationId?: string;
   sessionId: string;
   data: string;
   targetConnectionId: string;
@@ -173,6 +192,7 @@ export interface PtyInputMessage {
 
 export interface PtyResizeMessage {
   type: "pty_resize";
+  authorizationId?: string;
   sessionId: string;
   cols: number;
   rows: number;
@@ -181,6 +201,7 @@ export interface PtyResizeMessage {
 
 export interface PtyKillMessage {
   type: "pty_kill";
+  authorizationId?: string;
   sessionId: string;
   targetConnectionId: string;
 }
@@ -211,8 +232,15 @@ export interface PtyErrorMessage {
   message: string;
 }
 
+export interface CommandOutputUnavailableMessage {
+  type: "command_output_unavailable";
+  commandId: string;
+  message: string;
+}
+
 /** Command-only response subset — used by one-shot command execution. */
 export type CommandResponseMessage =
+  | CommandOutputUnavailableMessage
   | CommandMessage
   | CommandCancelMessage
   | CommandCancelResultMessage

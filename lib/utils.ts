@@ -19,6 +19,8 @@ export interface MessageRecord {
   mode?: ChatMode;
   generation_started_at?: number;
   generation_time_ms?: number;
+  goal?: { sent?: boolean; achievedElapsedMs?: number };
+  user_stopped?: boolean;
   fileDetails?: Array<{
     fileId: Id<"files">;
     name: string;
@@ -33,14 +35,28 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** Read-only view of a non-OK response; the body stays with the error parser. */
+export type HttpErrorResponseMetadata = Readonly<
+  Pick<Response, "status" | "headers">
+>;
+
 export async function fetchWithErrorHandlers(
   input: RequestInfo | URL,
   init?: RequestInit,
+  options?: {
+    /** Synchronous diagnostic hook; it can never change the thrown error. */
+    onHttpErrorResponse?: (response: HttpErrorResponseMetadata) => void;
+  },
 ) {
   try {
     const response = await fetch(input, init);
 
     if (!response.ok) {
+      try {
+        options?.onHttpErrorResponse?.(response);
+      } catch {
+        // Diagnostics must never replace the original error or its status.
+      }
       let errorBody: unknown;
       try {
         errorBody = await response.clone().json();
@@ -67,7 +83,9 @@ export async function fetchWithErrorHandlers(
         errorRecord?.metadata && typeof errorRecord.metadata === "object"
           ? (errorRecord.metadata as Record<string, unknown>)
           : undefined;
-      throw new ChatSDKError(code, cause, metadata);
+      const error = new ChatSDKError(code, cause, metadata);
+      error.statusCode = response.status;
+      throw error;
     }
 
     return response;
@@ -100,11 +118,15 @@ export function convertToUIMessages(messages: MessageRecord[]): ChatMessage[] {
     ),
     sourceMessageId: message.source_message_id,
     metadata:
+      message.goal ||
       message.feedback ||
       message.mode ||
+      message.user_stopped === true ||
       typeof message.generation_started_at === "number" ||
       typeof message.generation_time_ms === "number"
         ? {
+            ...(message.user_stopped === true ? { userStopped: true } : {}),
+            ...(message.goal ? { goal: message.goal } : {}),
             ...(message.feedback
               ? { feedbackType: message.feedback.feedbackType }
               : {}),

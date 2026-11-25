@@ -1,0 +1,931 @@
+import { goalElapsedMs } from "../../lib/goals/timing";
+import { BROWSER_SESSION_MAX_LIFETIME_MS } from "../../lib/ai/browser-handoff/constants";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from "@jest/globals";
+
+jest.mock("../lib/serviceFunctions", () => ({
+  mutation: (config: unknown) => config,
+  query: (config: unknown) => config,
+}));
+jest.mock("convex/values", () => ({
+  v: new Proxy({}, { get: () => () => ({}) }),
+}));
+jest.mock("../lib/utils", () => ({ validateServiceKey: () => undefined }));
+
+const browser =
+  require("../browserHandoffs") as typeof import("../browserHandoffs");
+type Row = Record<string, unknown> & { _id: string };
+
+function fixture() {
+  const rows: Record<string, Row[]> = {
+    chats: [
+      {
+        _id: "chat-row",
+        id: "chat",
+        user_id: "owner",
+        active_trigger_run_id: "run-parent",
+      },
+    ],
+    subagent_runs: [
+      {
+        _id: "child-row",
+        subagent_id: "child",
+        user_id: "owner",
+        chat_id: "chat",
+        trigger_run_id: "run-child",
+        status: "running",
+      },
+    ],
+    browser_handoffs: [],
+    agent_goals: [],
+    messages: [],
+  };
+  const ctx = {
+    auth: { getUserIdentity: async () => ({ subject: "owner" }) },
+    db: {
+      query: (table: string) => ({
+        withIndex: (
+          _name: string,
+          select: (q: {
+            eq: (field: string, value: unknown) => unknown;
+          }) => unknown,
+        ) => {
+          const equals: Record<string, unknown> = {};
+          const q = {
+            eq(field: string, value: unknown) {
+              equals[field] = value;
+              return q;
+            },
+          };
+          select(q);
+          const selected = () =>
+            rows[table].filter((row) =>
+              Object.entries(equals).every(
+                ([field, value]) => row[field] === value,
+              ),
+            );
+          return {
+            first: async () => selected()[0] ?? null,
+            order: (_direction: string) => ({
+              first: async () => selected().at(-1) ?? null,
+              take: async (count: number) => selected().slice(-count).reverse(),
+            }),
+          };
+        },
+      }),
+      insert: async (table: string, value: Record<string, unknown>) => {
+        rows[table].push({ _id: `row-${rows[table].length + 1}`, ...value });
+      },
+      patch: async (id: string, value: Record<string, unknown>) => {
+        const row = Object.values(rows)
+          .flat()
+          .find((entry) => entry._id === id);
+        if (!row) throw new Error("missing row");
+        Object.assign(row, value);
+      },
+    },
+  };
+  const scope = {
+    serviceKey: "key",
+    userId: "owner",
+    sessionId: "a".repeat(32),
+  };
+  const register = (
+    agentId = "parent",
+    runId = "run-parent",
+    sessionId = scope.sessionId,
+    lifetimeMs = 60_000,
+  ) =>
+    browser.registerForBackend.handler(ctx as never, {
+      serviceKey: "key",
+      sessionId,
+      userId: "owner",
+      chatId: "chat",
+      runId,
+      agentId,
+      sandboxId: "sandbox",
+      directory: "/dev/shm/hackerai-browser-0123456789abcdef01234567",
+      expiresAt: Date.now() + lifetimeMs,
+    });
+  return { rows, ctx, scope, register };
+}
+
+describe("browser handoff ownership", () => {
+  beforeEach(() => {
+    jest.useRealTimers();
+  });
+
+  it("keeps a requested handoff waiting after failed takeover, and clears it only on resume", async () => {
+    const { ctx, rows, register, scope } = fixture();
+    await register();
+    const row = rows.browser_handoffs[0];
+    const request = { ...scope, expectedUpdatedAt: row.updated_at as number };
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, request),
+    ).toBe(true);
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, request),
+    ).toBe(true);
+    expect(row.state).toBe("waiting");
+    const grant = "g".repeat(32);
+    expect(
+      await browser.beginTakeoverForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+      }),
+    ).toBe(true);
+    await browser.abortTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+      paused: false,
+    });
+    expect(row.state).toBe("waiting");
+    await browser.beginTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+    });
+    await browser.finishTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+      browserSessionName: "default",
+    });
+    await browser.beginResumeForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+    });
+    await browser.abortResumeForBackend.handler(ctx as never, scope);
+    expect(row.state).toBe("recovery");
+    expect(row.waiting_for_handoff).toBe(true);
+    await browser.beginResumeForBackend.handler(ctx as never, scope);
+    await browser.saveExitNoteForBackend.handler(ctx as never, {
+      ...scope,
+      requestId: "12345678-1234-1234-1234-123456789012",
+      note: "",
+    });
+    await browser.finishResumeForBackend.handler(ctx as never, scope);
+    expect(row.state).toBe("agent");
+    expect(row.waiting_for_handoff).toBeUndefined();
+    expect(rows.messages).toHaveLength(1);
+    expect(rows.messages[0].is_hidden).toBe(true);
+    // A late first handoff request must not park the Agent again after exit.
+    const repeatedRequest = {
+      ...scope,
+      expectedUpdatedAt: row.updated_at as number,
+    };
+    expect(
+      await browser.requestWaitForBackend.handler(
+        ctx as never,
+        repeatedRequest,
+      ),
+    ).toBe(true);
+    expect(row.state).toBe("agent");
+    expect(row.waiting_for_handoff).toBeUndefined();
+
+    // A genuinely requested second takeover still has a dedicated wait.
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, {
+        ...repeatedRequest,
+        requestAnotherTakeover: true,
+      }),
+    ).toBe(true);
+    expect(row.state).toBe("waiting");
+  });
+
+  it("rejects stale, foreign and expired handoff wait requests", async () => {
+    const { ctx, rows, register, scope } = fixture();
+    await register();
+    const row = rows.browser_handoffs[0];
+    const request = {
+      ...scope,
+      expectedUpdatedAt: (row.updated_at as number) - 1,
+    };
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, request),
+    ).toBe(false);
+    request.expectedUpdatedAt = row.updated_at as number;
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, {
+        ...request,
+        userId: "other",
+      }),
+    ).toBe(false);
+    row.state = "human";
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, request),
+    ).toBe(false);
+    row.state = "agent";
+    row.expires_at = Date.now() - 1;
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, request),
+    ).toBe(false);
+    expect(row.state).toBe("agent");
+  });
+
+  it("accepts the six-hour run lifetime and rejects deadlines beyond its grace", async () => {
+    jest.useFakeTimers();
+    const { register } = fixture();
+    expect(
+      await register(
+        "parent",
+        "run-parent",
+        "a".repeat(32),
+        BROWSER_SESSION_MAX_LIFETIME_MS,
+      ),
+    ).toBe(true);
+    expect(
+      await register(
+        "parent",
+        "run-parent",
+        "b".repeat(32),
+        BROWSER_SESSION_MAX_LIFETIME_MS + 1,
+      ),
+    ).toBe(false);
+    expect(await register("parent", "run-parent", "c".repeat(32), 0)).toBe(
+      false,
+    );
+    jest.useRealTimers();
+  });
+
+  it("registers only the active owner and keeps sandbox details private", async () => {
+    const { ctx, rows, register, scope } = fixture();
+    expect(await register()).toBe(true);
+    const publicRow = await browser.getForUser.handler(ctx as never, {
+      chatId: "chat",
+      agentId: "parent",
+    });
+    expect(publicRow?.sessionId).toBe(scope.sessionId);
+    expect(JSON.stringify(publicRow)).not.toMatch(/sandbox|directory|dev\/shm/);
+    expect(
+      await browser.getForBackend.handler(ctx as never, {
+        ...scope,
+        userId: "other",
+      }),
+    ).toBeNull();
+    rows.chats[0].active_trigger_run_id = "other-run";
+    expect(await browser.getForBackend.handler(ctx as never, scope)).toBeNull();
+    expect(await register("parent", "old-run", "b".repeat(32))).toBe(false);
+  });
+
+  it("isolates child and parent run records", async () => {
+    const { ctx, rows, register, scope } = fixture();
+    expect(await register()).toBe(true);
+    expect(await register("child", "run-child", "c".repeat(32))).toBe(true);
+    expect(rows.browser_handoffs).toHaveLength(2);
+    rows.subagent_runs[0].status = "canceled";
+    expect(
+      await browser.getForBackend.handler(ctx as never, {
+        ...scope,
+        sessionId: "c".repeat(32),
+      }),
+    ).toBeNull();
+    expect(
+      await browser.getForBackend.handler(ctx as never, scope),
+    ).not.toBeNull();
+  });
+
+  it("reports the completed-takeover receipt even when its private message is unavailable", async () => {
+    const { ctx, rows, register, scope } = fixture();
+    await register();
+    expect(
+      await browser.getForBackend.handler(ctx as never, scope),
+    ).toMatchObject({
+      hasCompletedTakeover: false,
+    });
+    rows.browser_handoffs[0].exit_note_ids = ["removed-note"];
+    expect(
+      await browser.getExitNotesForBackend.handler(ctx as never, scope),
+    ).toEqual([]);
+    expect(
+      await browser.getForBackend.handler(ctx as never, scope),
+    ).toMatchObject({
+      hasCompletedTakeover: true,
+    });
+    const row = rows.browser_handoffs[0];
+    expect(
+      await browser.requestWaitForBackend.handler(ctx as never, {
+        ...scope,
+        expectedUpdatedAt: row.updated_at as number,
+      }),
+    ).toBe(true);
+    expect(row.state).toBe("agent");
+    expect(
+      JSON.stringify(
+        await browser.getForUser.handler(ctx as never, {
+          chatId: "chat",
+          agentId: "parent",
+        }),
+      ),
+    ).not.toContain("hasCompletedTakeover");
+  });
+
+  it("rejects replayed and expired control grants while keeping recovery paused", async () => {
+    const { ctx, register, scope } = fixture();
+    await register();
+    const grant = "g".repeat(43);
+    expect(
+      await browser.beginTakeoverForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+      }),
+    ).toBe(true);
+    expect(
+      await browser.finishTakeoverForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+        browserSessionName: "alice",
+      }),
+    ).toBe(true);
+    expect(
+      await browser.assertGrantForBackend.handler(ctx as never, {
+        ...scope,
+        grant: "wrong".repeat(10),
+        renew: true,
+      }),
+    ).toBe(false);
+    expect(
+      await browser.assertGrantForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+        renew: true,
+      }),
+    ).toBe(true);
+    expect(
+      await browser.releaseForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+      }),
+    ).toBe(true);
+    expect(
+      await browser.assertGrantForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+        renew: false,
+      }),
+    ).toBe(false);
+    expect(
+      (await browser.getForBackend.handler(ctx as never, scope))?.state,
+    ).toBe("recovery");
+  });
+
+  it("cannot resume while input is in flight and revokes input before Agent release", async () => {
+    const { ctx, register, scope } = fixture();
+    await register();
+    const grant = "g".repeat(43);
+    await browser.beginTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+    });
+    await browser.finishTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant,
+      browserSessionName: "alice",
+    });
+    expect(
+      await browser.beginInputForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+        inputId: "input-123456789012345",
+      }),
+    ).toBe(true);
+    expect(
+      await browser.beginResumeForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+      }),
+    ).toBe(false);
+    await browser.finishInputForBackend.handler(ctx as never, {
+      ...scope,
+      inputId: "input-123456789012345",
+    });
+    expect(
+      await browser.beginResumeForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+      }),
+    ).toBe(true);
+    expect(
+      await browser.assertGrantForBackend.handler(ctx as never, {
+        ...scope,
+        grant,
+        renew: false,
+      }),
+    ).toBe(false);
+    expect(
+      await browser.finishResumeForBackend.handler(ctx as never, scope),
+    ).toBe(true);
+    expect(
+      (await browser.getForBackend.handler(ctx as never, scope))?.state,
+    ).toBe("agent");
+  });
+});
+
+it.each([2, 10])(
+  "a delayed registration cannot close the current browser after %i sessions",
+  async (count) => {
+    const { ctx, rows, scope, register } = fixture();
+    await register();
+    for (let i = 1; i < count; i++) {
+      await register("parent", "run-parent", i.toString(16).padStart(32, "0"));
+    }
+    const current = rows.browser_handoffs.at(-1)!;
+    current.state = "human";
+    current.grant = "current-controller";
+    current.grant_expires_at = Date.now() + 60_000;
+    const before = JSON.stringify(rows.browser_handoffs);
+    expect(await register()).toBe(false);
+    expect(JSON.stringify(rows.browser_handoffs)).toBe(before);
+    expect(
+      await register("parent", "run-parent", current.session_id as string),
+    ).toBe(true);
+    expect(JSON.stringify(rows.browser_handoffs)).toBe(before);
+    expect(
+      await browser.getForBackend.handler(ctx as never, {
+        ...scope,
+        sessionId: current.session_id,
+      }),
+    ).toMatchObject({ state: "human" });
+  },
+);
+
+it("saves exit context once, exposes it to the owning runner, and retains it after cleanup", async () => {
+  const { ctx, rows, scope, register } = fixture();
+  await register();
+  rows.browser_handoffs[0].state = "resuming";
+  const args = {
+    ...scope,
+    requestId: "11111111-1111-4111-8111-111111111111",
+    note: "I signed in.",
+  };
+  const saved = await browser.saveExitNoteForBackend.handler(
+    ctx as never,
+    args,
+  );
+  expect(saved.text).toBe("Continue after browser takeover.");
+  expect(rows.messages[0]).toMatchObject({
+    is_hidden: true,
+    is_browser_handoff: true,
+    content: "I've finished browser takeover.\n\nI signed in.",
+  });
+  expect(rows.messages).toHaveLength(1);
+  expect(
+    await browser.getExitNotesForBackend.handler(ctx as never, scope),
+  ).toEqual([{ id: saved.id, text: rows.messages[0].content }]);
+  await browser.closeForBackend.handler(ctx as never, {
+    serviceKey: "key",
+    sessionId: scope.sessionId,
+  });
+  const retry = await browser.saveExitNoteForBackend.handler(
+    ctx as never,
+    args,
+  );
+  expect(retry).toEqual({ ...saved, runActive: false });
+  expect(rows.messages).toHaveLength(1);
+  expect(await browser.getForBackend.handler(ctx as never, scope)).toBeNull();
+  expect(
+    await browser.getForBackend.handler(ctx as never, {
+      ...scope,
+      allowEnded: true,
+    }),
+  ).toMatchObject({ runActive: false });
+});
+
+it("accepts an empty note after completion while rejecting another user or a replaced session", async () => {
+  const { ctx, rows, scope, register } = fixture();
+  await register();
+  rows.browser_handoffs[0].state = "closed";
+  const args = {
+    ...scope,
+    requestId: "11111111-1111-4111-8111-111111111111",
+    note: "  ",
+  };
+  expect(
+    await browser.saveExitNoteForBackend.handler(ctx as never, args),
+  ).toMatchObject({
+    runActive: false,
+    text: "Continue after browser takeover.",
+  });
+  await expect(
+    browser.saveExitNoteForBackend.handler(ctx as never, {
+      ...args,
+      userId: "someone-else",
+    }),
+  ).rejects.toThrow();
+  await register("parent", "run-parent", "b".repeat(32));
+  await expect(
+    browser.saveExitNoteForBackend.handler(ctx as never, args),
+  ).rejects.toThrow();
+  expect(rows.messages).toHaveLength(1);
+});
+
+it("cannot create an exit message for a running session without the resume claim", async () => {
+  const { ctx, rows, scope, register } = fixture();
+  await register();
+  await expect(
+    browser.saveExitNoteForBackend.handler(ctx as never, {
+      ...scope,
+      requestId: "11111111-1111-4111-8111-111111111111",
+      note: "skip the claim",
+    }),
+  ).rejects.toThrow("claim resume");
+  expect(rows.messages).toHaveLength(0);
+});
+
+it.each(["parent", "child"])(
+  "retains %s exit notes after browser replacement without restoring old control",
+  async (agentId) => {
+    const { ctx, rows, scope, register } = fixture();
+    const runId = agentId === "parent" ? "run-parent" : "run-child";
+    await register(agentId, runId);
+    rows.browser_handoffs[0].state = "resuming";
+    const saved = await browser.saveExitNoteForBackend.handler(ctx as never, {
+      ...scope,
+      requestId: "11111111-1111-4111-8111-111111111111",
+      note: "STOP! Only inspect /LAB?X=YES&Y=no. café 日本語 😀",
+    });
+    await register(agentId, runId, "b".repeat(32));
+    expect(await browser.getForBackend.handler(ctx as never, scope)).toBeNull();
+    expect(
+      await browser.getExitNotesForBackend.handler(ctx as never, scope),
+    ).toEqual([{ id: saved.id, text: rows.messages[0].content }]);
+    expect(
+      await browser.getExitNotesForBackend.handler(ctx as never, {
+        ...scope,
+        userId: "other",
+      }),
+    ).toEqual([]);
+    rows.chats[0].deletion_started_at = Date.now();
+    expect(
+      await browser.getExitNotesForBackend.handler(ctx as never, scope),
+    ).toEqual([]);
+    delete rows.chats[0].deletion_started_at;
+    if (agentId === "parent") rows.chats[0].active_trigger_run_id = "next-run";
+    else rows.subagent_runs[0].status = "completed";
+    expect(
+      await browser.getExitNotesForBackend.handler(ctx as never, scope),
+    ).toEqual([]);
+  },
+);
+
+it("rejects a takeover when subagent finalization wins the race", async () => {
+  const { ctx, rows, scope, register } = fixture();
+  await register("child", "run-child");
+  rows.subagent_runs[0].status = "finalizing";
+  await expect(
+    browser.beginTakeoverForBackend.handler(ctx as never, {
+      ...scope,
+      grant: "g".repeat(32),
+    }),
+  ).resolves.toBe(false);
+  expect(rows.browser_handoffs[0].state).toBe("agent");
+});
+
+it.each([" \n\t", "A.b@C-d! \n日本語 😀", "A".repeat(4000)])(
+  "preserves note text and idempotency at input boundaries (%#)",
+  async (note) => {
+    const { ctx, rows, scope, register } = fixture();
+    await register();
+    rows.browser_handoffs[0].state = "resuming";
+    const args = {
+      ...scope,
+      requestId: "11111111-1111-4111-8111-111111111111",
+      note,
+    };
+    const saved = await browser.saveExitNoteForBackend.handler(
+      ctx as never,
+      args,
+    );
+    expect(saved.text).toBe("Continue after browser takeover.");
+    expect(rows.messages[0].content).toBe(
+      note.trim()
+        ? `I've finished browser takeover.\n\n${note.trim()}`
+        : "I've finished browser takeover. No additional details to add; please continue the task.",
+    );
+    const retry = await browser.saveExitNoteForBackend.handler(ctx as never, {
+      ...args,
+      note: "Changed after a lost response",
+    });
+    expect(retry).toEqual(saved);
+    expect(rows.messages).toHaveLength(1);
+    await expect(
+      browser.saveExitNoteForBackend.handler(ctx as never, {
+        ...args,
+        requestId: "22222222-2222-4222-8222-222222222222",
+        note: "A".repeat(4001),
+      }),
+    ).rejects.toThrow("Invalid handoff note");
+    expect(rows.messages).toHaveLength(1);
+  },
+);
+
+it.each([
+  [29_999, false, false],
+  [30_000, false, true],
+  [30_001, false, true],
+  [30_001, true, false],
+])(
+  "recovers a resume claim aged %i ms with input pending=%s: %s",
+  async (age, inputPending, expected) => {
+    jest.useFakeTimers();
+    try {
+      const { ctx, rows, register, scope } = fixture();
+      await register();
+      Object.assign(rows.browser_handoffs[0], {
+        state: "resuming",
+        updated_at: Date.now() - Number(age),
+        input_expires_at: inputPending ? Date.now() + 1000 : undefined,
+      });
+      expect(
+        await browser.beginTakeoverForBackend.handler(ctx as never, {
+          ...scope,
+          grant: "g".repeat(43),
+        }),
+      ).toBe(expected);
+      expect(rows.browser_handoffs[0].state).toBe(
+        expected ? "claiming" : "resuming",
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  },
+);
+
+describe("abandoned parent handoff deadline", () => {
+  const MINUTES_30 = 30 * 60_000;
+  const T = 1_800_000_000_000;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(T);
+  });
+  afterEach(() => jest.useRealTimers());
+
+  async function waiting(agentId = "parent", runId = "run-parent") {
+    const f = fixture();
+    await f.register(agentId, runId, f.scope.sessionId, 2 * 60 * 60_000);
+    const row = f.rows.browser_handoffs[0];
+    expect(
+      await browser.requestWaitForBackend.handler(f.ctx as never, {
+        ...f.scope,
+        expectedUpdatedAt: row.updated_at as number,
+      }),
+    ).toBe(true);
+    return { ...f, row };
+  }
+  const abandon = (f: Awaited<ReturnType<typeof waiting>>) =>
+    browser.abandonForBackend.handler(f.ctx as never, f.scope);
+
+  it.each([
+    ["an unclaimed wait", { state: "waiting" }, T + MINUTES_30],
+    ["an explicit recovery", { state: "recovery" }, T + MINUTES_30],
+    [
+      "an expired human grant",
+      { state: "human", grant_expires_at: T + 20_000 },
+      T + 20_000 + MINUTES_30,
+    ],
+    [
+      "an expired claim",
+      { state: "claiming", grant_expires_at: T + 5_000 },
+      T + 5_000 + MINUTES_30,
+    ],
+    [
+      "an older expired grant without its expiry",
+      { state: "human", grant_expires_at: undefined },
+      T + MINUTES_30,
+    ],
+    ["a stalled resume", { state: "resuming" }, T + 30_000 + MINUTES_30],
+    [
+      "an active human grant",
+      { state: "human", grant_expires_at: T + 60 * 60_000 },
+      undefined,
+    ],
+    ["a resume within its lease", { state: "resuming" }, undefined],
+    ["Agent work", { state: "agent" }, undefined],
+  ])("reports the backend deadline for %s", async (_name, fields, expected) => {
+    const f = await waiting();
+    Object.assign(f.row, { updated_at: T, ...fields });
+    // Read after a grant/lease could have lapsed, so the effective state is used.
+    jest.setSystemTime(
+      fields.state === "resuming" && expected === undefined
+        ? T + 29_999
+        : T + 60_000,
+    );
+    expect(
+      (await browser.getForBackend.handler(f.ctx as never, f.scope))
+        ?.abandonAfter,
+    ).toBe(expected);
+  });
+
+  it("never gives a child run a deadline or lets it be closed", async () => {
+    const f = await waiting("child", "run-child");
+    jest.setSystemTime(T + 2 * MINUTES_30);
+    expect(
+      await browser.getForBackend.handler(f.ctx as never, f.scope),
+    ).not.toHaveProperty("abandonAfter");
+    expect(await abandon(f)).toBeNull();
+    expect(f.row.state).toBe("waiting");
+  });
+
+  it("closes the owned row once at its deadline, fences control and keeps an idempotent receipt", async () => {
+    const f = await waiting();
+    jest.setSystemTime(T + MINUTES_30 - 1);
+    expect(await abandon(f)).toBe("not_due");
+    expect(f.row.state).toBe("waiting");
+
+    jest.setSystemTime(T + MINUTES_30);
+    expect(await abandon(f)).toBe("abandoned");
+    expect(f.row).toMatchObject({
+      state: "closed",
+      abandoned_at: T + MINUTES_30,
+      grant: undefined,
+      grant_expires_at: undefined,
+    });
+
+    // A lost response or concurrent gate retries against the same owned row.
+    jest.setSystemTime(T + MINUTES_30 + 5_000);
+    expect(await abandon(f)).toBe("abandoned");
+    expect(f.row.abandoned_at).toBe(T + MINUTES_30);
+
+    const grant = "g".repeat(32);
+    expect(
+      await browser.beginTakeoverForBackend.handler(f.ctx as never, {
+        ...f.scope,
+        grant,
+      }),
+    ).toBe(false);
+    expect(
+      await browser.beginResumeForBackend.handler(f.ctx as never, f.scope),
+    ).toBe(false);
+    expect(
+      await browser.finishResumeForBackend.handler(f.ctx as never, f.scope),
+    ).toBe(false);
+    expect(await browser.getForBackend.handler(f.ctx as never, f.scope)).toBe(
+      null,
+    );
+
+    // Normal run cleanup closes again without erasing the receipt.
+    await browser.closeForBackend.handler(f.ctx as never, {
+      serviceKey: "key",
+      sessionId: f.scope.sessionId,
+    });
+    expect(f.row.abandoned_at).toBe(T + MINUTES_30);
+    // A replacement run never inherits the previous run's receipt.
+    f.rows.chats[0].active_trigger_run_id = "run-next";
+    expect(await abandon(f)).toBeNull();
+  });
+
+  it.each(["takeover", "resume"] as const)(
+    "lets a %s that commits before the close defeat the deadline",
+    async (winner) => {
+      const f = await waiting();
+      const grant = "g".repeat(32);
+      if (winner === "resume") {
+        f.row.state = "recovery";
+        f.row.updated_at = T;
+      }
+      jest.setSystemTime(T + MINUTES_30);
+      expect(
+        winner === "takeover"
+          ? await browser.beginTakeoverForBackend.handler(f.ctx as never, {
+              ...f.scope,
+              grant,
+            })
+          : await browser.beginResumeForBackend.handler(
+              f.ctx as never,
+              f.scope,
+            ),
+      ).toBe(true);
+      expect(await abandon(f)).toBe("not_due");
+      expect(f.row.state).toBe(winner === "takeover" ? "claiming" : "resuming");
+      expect(f.row.abandoned_at).toBeUndefined();
+      if (winner === "resume") {
+        // Only a stalled resume becomes eligible again, after its own lease.
+        jest.setSystemTime(T + MINUTES_30 + 30_000 + MINUTES_30 - 1);
+        expect(await abandon(f)).toBe("not_due");
+        jest.setSystemTime(T + MINUTES_30 + 30_000 + MINUTES_30);
+        expect(await abandon(f)).toBe("abandoned");
+      }
+    },
+  );
+
+  it("cannot close a session replaced by a newer browser in the same run", async () => {
+    const f = await waiting();
+    await f.register("parent", "run-parent", "b".repeat(32));
+    jest.setSystemTime(T + 2 * MINUTES_30);
+    expect(await abandon(f)).toBeNull();
+    expect(f.row.abandoned_at).toBeUndefined();
+  });
+});
+
+describe("Goal time during human browser input", () => {
+  it("freezes a Goal through handoff, grant recovery and explicit resume", async () => {
+    const f = fixture();
+    const now = jest.spyOn(Date, "now").mockReturnValue(1000);
+    const goal: any = {
+      _id: "goal-row",
+      chatId: "chat",
+      userId: "owner",
+      activeRunId: "run-parent",
+      state: "running",
+      elapsedMs: 2000,
+      activeSince: 1000,
+      updatedAt: 1000,
+    };
+    f.rows.agent_goals.push(goal);
+    try {
+      await f.register("parent", "run-parent", f.scope.sessionId, 600000);
+      now.mockReturnValue(4000);
+      expect(
+        await browser.requestWaitForBackend.handler(f.ctx as any, {
+          ...f.scope,
+          expectedUpdatedAt: 1000,
+        }),
+      ).toBe(true);
+      expect(goalElapsedMs(goal, 64000)).toBe(5000);
+      now.mockReturnValue(64000);
+      expect(
+        await browser.requestWaitForBackend.handler(f.ctx as any, {
+          ...f.scope,
+          expectedUpdatedAt: 1000,
+        }),
+      ).toBe(true);
+      const grant = "g".repeat(32);
+      expect(
+        await browser.beginTakeoverForBackend.handler(f.ctx as any, {
+          ...f.scope,
+          grant,
+        }),
+      ).toBe(true);
+      expect(
+        await browser.finishTakeoverForBackend.handler(f.ctx as any, {
+          ...f.scope,
+          grant,
+          browserSessionName: "default",
+        }),
+      ).toBe(true);
+      expect(
+        await browser.releaseForBackend.handler(f.ctx as any, {
+          ...f.scope,
+          grant,
+        }),
+      ).toBe(true);
+      expect(goalElapsedMs(goal, 124000)).toBe(5000);
+      now.mockReturnValue(124000);
+      expect(
+        await browser.beginResumeForBackend.handler(f.ctx as any, f.scope),
+      ).toBe(true);
+      expect(
+        await browser.finishResumeForBackend.handler(f.ctx as any, f.scope),
+      ).toBe(true);
+      expect(goalElapsedMs(goal, 126000)).toBe(7000);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("does not restart Goal time when browser control returns while a chat reply is pending", async () => {
+    const f = fixture();
+    const now = jest.spyOn(Date, "now").mockReturnValue(1000);
+    const goal: any = {
+      _id: "goal-row",
+      chatId: "chat",
+      userId: "owner",
+      activeRunId: "run-parent",
+      state: "running",
+      elapsedMs: 2000,
+      activeSince: undefined,
+      updatedAt: 1000,
+    };
+    f.rows.agent_goals.push(goal);
+    f.rows.chats[0].active_agent_user_wait = {
+      runId: "run-parent",
+      toolCallId: "reply",
+    };
+    try {
+      await f.register("parent", "run-parent", f.scope.sessionId, 600000);
+      const grant = "g".repeat(32);
+      await browser.beginTakeoverForBackend.handler(f.ctx as any, {
+        ...f.scope,
+        grant,
+      });
+      await browser.finishTakeoverForBackend.handler(f.ctx as any, {
+        ...f.scope,
+        grant,
+        browserSessionName: "default",
+      });
+      now.mockReturnValue(64000);
+      await browser.beginResumeForBackend.handler(f.ctx as any, {
+        ...f.scope,
+        grant,
+      });
+      await browser.finishResumeForBackend.handler(f.ctx as any, f.scope);
+      expect(goalElapsedMs(goal, 124000)).toBe(2000);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});

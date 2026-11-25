@@ -1,3 +1,5 @@
+import type { StructuredSummaryFailureKind } from "./structured-summary";
+
 export const STARTUP_COMPACTION_VARIANT =
   "glm53_flash_deepseek_v41_glm53_v1" as const;
 export const STARTUP_COMPACTION_FALLBACK_MODELS = [
@@ -7,10 +9,15 @@ export const STARTUP_COMPACTION_FALLBACK_MODELS = [
 
 export type StartupCompactionVariant =
   | typeof STARTUP_COMPACTION_VARIANT
+  | "inference_abliteration_fallback_v1"
+  | "max_inference_context_v1"
+  | "pro_inference_context_v1"
   | "abliteration_glm53_fallback_v1"
   | "moderation_glm53_abliteration_recovery_v2"
   | "max_large_v2_context_v1"
-  | "pro_large_v2_context_v1";
+  | "pro_large_v2_context_v1"
+  | "paid_480k_large_v2_context_v1"
+  | "paid_480k_inference_context_v1";
 export type StartupCompactionAttempt = {
   variant: StartupCompactionVariant;
   fallbackUsed: boolean;
@@ -27,6 +34,8 @@ export class InvalidCompactionSummaryError extends Error {
       | "non_stop_finish"
       | "missing_sections"
       | "invalid_summary" = "invalid_summary",
+    /** Set only when a nonempty stop-finished structured response was rejected. */
+    readonly structuredFailureKind?: StructuredSummaryFailureKind,
   ) {
     super("Compaction returned an empty or incomplete summary");
     this.name = "InvalidCompactionSummaryError";

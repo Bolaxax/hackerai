@@ -12,8 +12,12 @@ import { createGetTerminalFiles } from "../get-terminal-files";
 import { uploadSandboxFileToConvex } from "../utils/sandbox-file-uploader";
 import type { ToolContext } from "@/types";
 import { phLogger } from "@/lib/posthog/server";
-import { LocalCommandRelayUnsubscribedError } from "../utils/local-sandbox-errors";
+import {
+  LocalCommandRelayUnsubscribedError,
+  LocalFileRequestError,
+} from "../utils/local-sandbox-errors";
 import { trackForegroundCommand } from "../utils/foreground-commands";
+import { SandboxFileNotFoundError } from "../utils/sandbox-file-errors";
 
 const mockUploadSandboxFileToConvex =
   uploadSandboxFileToConvex as jest.MockedFunction<
@@ -61,6 +65,7 @@ function makeContext(overrides: Partial<ToolContext> = {}): ToolContext {
 async function runTool(
   tool: ReturnType<typeof createGetTerminalFiles>,
   input: Record<string, unknown>,
+  abortSignal?: AbortSignal,
 ) {
   const execute = (
     tool as unknown as {
@@ -69,7 +74,7 @@ async function runTool(
   ).execute;
   return execute(input, {
     toolCallId: "call-1",
-    abortSignal: undefined,
+    abortSignal,
     messages: [],
   });
 }
@@ -79,18 +84,184 @@ describe("get_terminal_files", () => {
     jest.clearAllMocks();
   });
 
+  it.each(["upload_url", "transfer", "file_registration"] as const)(
+    "does not substitute a same-named Cloud file after a %s failure",
+    async (phase) => {
+      const context = makeContext();
+      jest
+        .mocked(context.sandboxManager.getSandboxInfo)
+        .mockReturnValue({ type: "cloud" });
+      mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
+        if (args.fullPath === "/home/user/report.txt") {
+          args.onPhase?.(phase);
+          throw new Error("The requested file could not be delivered");
+        }
+        return {
+          fileId: "different-file" as never,
+          url: "https://example.invalid/different-file",
+          name: "report.txt",
+          mediaType: "text/plain",
+          sizeBytes: 5,
+          tokens: 0,
+        };
+      });
+
+      const result = await runTool(createGetTerminalFiles(context), {
+        files: ["report.txt"],
+      });
+      expect(result).toMatchObject({
+        files: [],
+        deliveryReceipts: [],
+        failedFiles: [{ path: "report.txt" }],
+      });
+      expect(context.fileAccumulator.add).not.toHaveBeenCalled();
+      expect(
+        mockUploadSandboxFileToConvex.mock.calls.map(([args]) => args.fullPath),
+      ).toEqual(["/home/user/report.txt"]);
+    },
+  );
+
+  it("retains the acquired Desktop type when manager state changes before a failed delivery", async () => {
+    const context = makeContext();
+    const desktop = {
+      sandboxKind: "centrifugo",
+      getConnectionInfo: () => ({
+        isDesktop: true,
+        name: "PRIVATE connection",
+      }),
+    };
+    jest
+      .mocked(context.sandboxManager.getSandbox)
+      .mockResolvedValue({ sandbox: desktop } as never);
+    jest
+      .mocked(context.sandboxManager.getSandboxInfo)
+      .mockReturnValue({ type: "cloud" });
+    mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
+      args.onPhase?.("file_metadata");
+      args.onNativeStatFailure?.("stat_failed");
+      throw new Error("PRIVATE file failure");
+    });
+
+    const result = await runTool(createGetTerminalFiles(context), {
+      files: ["/PRIVATE/file"],
+    });
+    expect(result).toMatchObject({
+      files: [],
+      failedFiles: [{ path: "/PRIVATE/file" }],
+    });
+    expect(mockUploadSandboxFileToConvex).toHaveBeenCalledWith(
+      expect.objectContaining({ sandbox: desktop }),
+    );
+    const [, fields] = jest.mocked(phLogger.event).mock.calls.at(-1)!;
+    expect(fields).toMatchObject({
+      abort_signal_aborted: null,
+      sandbox_type: "cloud",
+      observed_sandbox_type_version: 1,
+      observed_sandbox_types: ["desktop"],
+      failed_file_count: 1,
+      failure_phase_counts: { file_metadata: 1 },
+    });
+    expect(JSON.stringify(fields)).not.toContain("PRIVATE");
+  });
+
+  it("keeps a stored file successful when adapter observation throws", async () => {
+    const context = makeContext();
+    jest.mocked(context.sandboxManager.getSandbox).mockResolvedValue({
+      sandbox: {
+        sandboxKind: "centrifugo",
+        getConnectionInfo: () => {
+          throw new Error("PRIVATE identity failure");
+        },
+      },
+    } as never);
+    mockUploadSandboxFileToConvex.mockResolvedValue({
+      fileId: "stored-file" as never,
+      url: "https://files.example/private",
+      tokens: 0,
+      name: "private.txt",
+      mediaType: "text/plain",
+      sizeBytes: 1,
+    });
+    const result = await runTool(createGetTerminalFiles(context), {
+      files: ["/private.txt"],
+    });
+    expect(result).toMatchObject({
+      files: [{ path: "/private.txt" }],
+      failedFiles: [],
+    });
+    expect(phLogger.event).toHaveBeenLastCalledWith(
+      "agent_file_delivery_completed",
+      expect.objectContaining({
+        delivered_file_count: 1,
+        observed_sandbox_types: [],
+      }),
+    );
+    expect(
+      JSON.stringify(jest.mocked(phLogger.event).mock.calls),
+    ).not.toContain("PRIVATE");
+  });
+
+  it("observes the adapter reacquired after a foreground command finishes", async () => {
+    const context = makeContext();
+    const desktop = {
+      sandboxKind: "centrifugo",
+      getConnectionInfo: () => ({ isDesktop: true }),
+    };
+    const getSandbox = jest.mocked(context.sandboxManager.getSandbox);
+    getSandbox
+      .mockResolvedValueOnce({ sandbox: { id: "cloud" } } as never)
+      .mockResolvedValueOnce({ sandbox: desktop } as never);
+    mockUploadSandboxFileToConvex.mockResolvedValue({
+      fileId: "stored-file" as never,
+      url: "https://files.example/private",
+      tokens: 0,
+      name: "private.txt",
+      mediaType: "text/plain",
+      sizeBytes: 1,
+    });
+    let finish!: () => void;
+    const command = trackForegroundCommand(
+      context,
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    try {
+      const delivery = runTool(createGetTerminalFiles(context), {
+        files: ["/private.txt"],
+      });
+      await getSandbox.mock.results[0].value;
+      expect(mockUploadSandboxFileToConvex).not.toHaveBeenCalled();
+      finish();
+      expect(await delivery).toMatchObject({ failedFiles: [] });
+      expect(mockUploadSandboxFileToConvex).toHaveBeenCalledWith(
+        expect.objectContaining({ sandbox: desktop }),
+      );
+      expect(phLogger.event).toHaveBeenLastCalledWith(
+        "agent_file_delivery_completed",
+        expect.objectContaining({
+          observed_sandbox_types: ["cloud", "desktop"],
+        }),
+      );
+    } finally {
+      finish();
+      await command;
+    }
+  });
+
   it("counts final failed files by phase without counting recovered candidate paths", async () => {
     const privateMessage = "private-target-and-signed-upload-url";
     mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
       if (args.fullPath === "/home/user/recovered.txt") {
         args.onNativeStatFailure?.("file_missing");
         args.onPhase?.("file_metadata");
-        throw new Error(privateMessage);
+        throw new SandboxFileNotFoundError(privateMessage);
       }
       if (args.fullPath.endsWith("missing.txt")) {
         args.onNativeStatFailure?.("file_missing");
         args.onPhase?.("file_metadata");
-        throw new Error(privateMessage);
+        throw new SandboxFileNotFoundError(privateMessage);
       }
       if (args.fullPath === "/failed-upload.txt") {
         args.onPhase?.("transfer");
@@ -109,9 +280,11 @@ describe("get_terminal_files", () => {
     jest
       .mocked(context.sandboxManager.getSandboxInfo)
       .mockReturnValue({ type: "cloud" });
-    const result = await runTool(createGetTerminalFiles(context), {
-      files: ["recovered.txt", "missing.txt", "/failed-upload.txt"],
-    });
+    const result = await runTool(
+      createGetTerminalFiles(context),
+      { files: ["recovered.txt", "missing.txt", "/failed-upload.txt"] },
+      new AbortController().signal,
+    );
 
     expect(result).toMatchObject({
       files: [{ path: "recovered.txt" }],
@@ -120,15 +293,75 @@ describe("get_terminal_files", () => {
     expect(logger.warn).not.toHaveBeenCalled();
     const [, fields] = jest.mocked(phLogger.event).mock.calls.at(-1)!;
     expect(fields).toMatchObject({
+      abort_signal_aborted: false,
       delivered_file_count: 1,
       failed_file_count: 2,
       file_delivery_diagnostic_version: 1,
       failure_phase_counts: { file_metadata: 1, transfer: 1 },
       metadata_failure_diagnostic_version: 1,
       metadata_failure_reason_counts: { native_file_missing: 1 },
+      transfer_failure_diagnostic_version: 1,
+      transfer_failure_reason_counts: { unknown: 1 },
     });
     expect(JSON.stringify(fields)).not.toMatch(
       /private-target|signed-upload|missing\.txt|failed-upload\.txt|recovered\.txt/,
+    );
+  });
+
+  it("counts terminal transfer reasons once per requested entry and rejects private reason values", async () => {
+    const privateText = "private-path-signed-url";
+    mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
+      args.onPhase?.(
+        args.fullPath.endsWith("metadata.txt") ? "file_metadata" : "transfer",
+      );
+      if (args.fullPath === "/home/user/recovered.txt") {
+        throw new LocalFileRequestError("timeout", privateText);
+      }
+      if (args.fullPath === "recovered.txt") {
+        return {
+          fileId: "stored" as never,
+          name: "recovered.txt",
+          mediaType: "text/plain",
+          sizeBytes: 1,
+          url: "https://files.example/private",
+          tokens: 0,
+        };
+      }
+      if (args.fullPath.endsWith("invalid.txt")) {
+        throw new LocalFileRequestError(privateText as never, privateText);
+      }
+      throw new LocalFileRequestError("readiness_timeout", privateText);
+    });
+    const context = makeContext();
+    jest
+      .mocked(context.sandboxManager.getSandboxInfo)
+      .mockReturnValue({ type: "cloud" });
+    const result = await runTool(createGetTerminalFiles(context), {
+      files: ["recovered.txt", "timeout.txt", "invalid.txt", "metadata.txt"],
+    });
+    expect(result).toMatchObject({
+      files: [],
+      failedFiles: [
+        { path: "recovered.txt" },
+        { path: "timeout.txt" },
+        { path: "invalid.txt" },
+        { path: "metadata.txt" },
+      ],
+    });
+    const [, fields] = jest.mocked(phLogger.event).mock.calls.at(-1)!;
+    expect(fields).toMatchObject({
+      delivered_file_count: 0,
+      failed_file_count: 4,
+      failure_phase_counts: { transfer: 3, file_metadata: 1 },
+      transfer_failure_diagnostic_version: 1,
+      transfer_failure_reason_counts: {
+        timeout: 1,
+        readiness_timeout: 1,
+        unknown: 1,
+      },
+    });
+    expect(JSON.stringify(fields)).not.toMatch(
+      /private-path|signed-url|recovered\.txt|timeout\.txt|invalid\.txt|metadata\.txt/,
     );
   });
 
@@ -148,6 +381,8 @@ describe("get_terminal_files", () => {
       (args.onNativeStatFailure as ((value: string) => void) | undefined)?.(
         reason,
       );
+      if (reason === "file_missing")
+        throw new SandboxFileNotFoundError("PRIVATE file");
       throw new Error("PRIVATE file error");
     });
     await runTool(createGetTerminalFiles(context), {
@@ -183,6 +418,7 @@ describe("get_terminal_files", () => {
       expect.objectContaining({
         failed_file_count: 2,
         failure_phase_counts: { sandbox_setup: 2 },
+        observed_sandbox_types: [],
       }),
     );
   });
@@ -492,7 +728,9 @@ describe("get_terminal_files", () => {
 
   it("keeps Cloud fallback paths and records the path that actually uploaded", async () => {
     mockUploadSandboxFileToConvex
-      .mockRejectedValueOnce(new Error("File not found"))
+      .mockRejectedValueOnce(
+        new SandboxFileNotFoundError("/home/user/report.zip"),
+      )
       .mockResolvedValueOnce({
         url: "https://files.example/report.zip",
         fileId: "file_report" as never,
@@ -737,6 +975,268 @@ describe("get_terminal_files", () => {
         relay_recovery_succeeded: true,
         delivered_file_count: 1,
         metadata_failure_reason_counts: {},
+        observed_sandbox_types: ["remote-connection"],
+      }),
+    );
+  });
+  it.each([
+    ["native", true, 4],
+    ["native", false, 3],
+    ["command", true, 4],
+    ["command", false, 3],
+  ] as const)(
+    "budgets %s recovery across files and candidate paths (reconnect succeeds: %s)",
+    async (kind, reconnects, uploads) => {
+      const stale = {
+        sandboxKind: "centrifugo",
+        getConnectionId: () => "old",
+      };
+      const replacement = {
+        sandboxKind: "centrifugo",
+        getConnectionId: () => "new",
+      };
+      const recoverLocalConnection = jest.fn(async () => {
+        if (!reconnects) throw new Error("No live same-machine successor");
+        return { sandbox: replacement };
+      });
+      const base = makeContext();
+      const context = makeContext({
+        sandboxManager: {
+          ...base.sandboxManager,
+          getSandboxInfo: jest.fn(() => ({ type: "cloud" })),
+          getSandbox: jest
+            .fn()
+            .mockResolvedValueOnce({ sandbox: stale })
+            .mockResolvedValue({ sandbox: replacement }),
+          recoverLocalConnection,
+        },
+      });
+      mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
+        args.onPhase?.("file_metadata");
+        args.onNativeStatFailure?.("stat_failed");
+        throw kind === "native"
+          ? new LocalFileRequestError("relay_unsubscribed", "Relay absent")
+          : new LocalCommandRelayUnsubscribedError("old");
+      });
+
+      const result = await runTool(createGetTerminalFiles(context), {
+        files: ["one.txt", "two.txt", "three.txt"],
+      });
+      expect(result).toMatchObject({
+        files: [],
+        failedFiles: [
+          { path: "one.txt" },
+          { path: "two.txt" },
+          { path: "three.txt" },
+        ],
+      });
+      expect(recoverLocalConnection).toHaveBeenCalledTimes(1);
+      expect(recoverLocalConnection).toHaveBeenCalledWith(
+        "old",
+        "command_relay_unsubscribed",
+      );
+      expect(mockUploadSandboxFileToConvex).toHaveBeenCalledTimes(uploads);
+      expect(phLogger.event).toHaveBeenLastCalledWith(
+        "agent_file_delivery_completed",
+        expect.objectContaining({
+          delivered_file_count: 0,
+          failed_file_count: 3,
+          relay_recovery_attempted: true,
+          relay_recovery_succeeded: reconnects,
+        }),
+      );
+    },
+  );
+
+  it.each([
+    ["file_metadata", new LocalFileRequestError("timeout", "Timed out")],
+    [
+      "file_metadata",
+      new LocalFileRequestError("readiness_timeout", "Not ready"),
+    ],
+    [
+      "file_metadata",
+      new LocalFileRequestError("dispatch_error", "Uncertain dispatch"),
+    ],
+    ["file_metadata", new LocalFileRequestError("aborted", "Canceled")],
+    ["file_metadata", new Error("relay_unsubscribed")],
+    ["file_metadata", { failure: "relay_unsubscribed" }],
+    [
+      "transfer",
+      new LocalFileRequestError("relay_unsubscribed", "Relay absent"),
+    ],
+  ] as const)(
+    "does not recover an ineligible %s failure %#",
+    async (phase, error) => {
+      const base = makeContext();
+      const recoverLocalConnection = jest.fn();
+      const context = makeContext({
+        sandboxManager: {
+          ...base.sandboxManager,
+          getSandbox: jest.fn(async () => ({
+            sandbox: {
+              sandboxKind: "centrifugo",
+              getConnectionId: () => "old",
+            },
+          })) as never,
+          recoverLocalConnection,
+        },
+      });
+      mockUploadSandboxFileToConvex.mockImplementation(async (args) => {
+        args.onPhase?.(phase);
+        throw error;
+      });
+      const result = await runTool(createGetTerminalFiles(context), {
+        files: ["/one.txt"],
+      });
+      expect(result).toMatchObject({
+        files: [],
+        failedFiles: [{ path: "/one.txt" }],
+      });
+      expect(recoverLocalConnection).not.toHaveBeenCalled();
+      expect(mockUploadSandboxFileToConvex).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["before recovery", "during recovery", "during reacquisition"])(
+    "does not replay a file when cancellation arrives %s",
+    async (phase) => {
+      const controller = new AbortController();
+      const base = makeContext();
+      const getSandbox = jest
+        .fn()
+        .mockResolvedValueOnce({
+          sandbox: { sandboxKind: "centrifugo", getConnectionId: () => "old" },
+        })
+        .mockImplementation(async () => {
+          if (phase === "during reacquisition")
+            controller.abort(new Error("Canceled"));
+          return {
+            sandbox: {
+              sandboxKind: "centrifugo",
+              getConnectionId: () => "new",
+            },
+          };
+        });
+      const recoverLocalConnection = jest.fn(async () => {
+        if (phase === "during recovery")
+          controller.abort(new Error("Canceled"));
+        return {
+          sandbox: { sandboxKind: "centrifugo", getConnectionId: () => "new" },
+        };
+      });
+      const context = makeContext({
+        sandboxManager: {
+          ...base.sandboxManager,
+          getSandbox,
+          recoverLocalConnection,
+          getSandboxInfo: jest.fn(() => ({ type: "cloud" })),
+        } as never,
+      });
+      mockUploadSandboxFileToConvex
+        .mockResolvedValueOnce({
+          url: "https://files.example/one.txt",
+          fileId: "stored-first" as never,
+          name: "one.txt",
+          mediaType: "text/plain",
+          tokens: 0,
+          sizeBytes: 1,
+        })
+        .mockImplementation(async (args) => {
+          args.onPhase?.("file_metadata");
+          if (phase === "before recovery")
+            controller.abort(new Error("Canceled"));
+          throw new LocalFileRequestError("relay_unsubscribed", "Relay absent");
+        });
+      const result = await runTool(
+        createGetTerminalFiles(context),
+        { files: ["one.txt", "two.txt", "three.txt"] },
+        controller.signal,
+      );
+      expect(result).toMatchObject({
+        files: [{ path: "one.txt" }],
+        deliveryReceipts: [{ fileId: "stored-first", storageStatus: "stored" }],
+        failedFiles: [{ path: "two.txt" }, { path: "three.txt" }],
+      });
+      expect(recoverLocalConnection).toHaveBeenCalledTimes(
+        phase === "before recovery" ? 0 : 1,
+      );
+      expect(getSandbox).toHaveBeenCalledTimes(
+        phase === "during reacquisition" ? 2 : 1,
+      );
+      expect(mockUploadSandboxFileToConvex).toHaveBeenCalledTimes(2);
+      expect(context.fileAccumulator.add).toHaveBeenCalledTimes(1);
+      expect(phLogger.event).toHaveBeenLastCalledWith(
+        "agent_file_delivery_completed",
+        expect.objectContaining({
+          abort_signal_aborted: true,
+          delivered_file_count: 1,
+          failed_file_count: 2,
+        }),
+      );
+    },
+  );
+  it("retains a durably stored in-flight upload after cancellation without starting another file", async () => {
+    const controller = new AbortController();
+    const context = makeContext();
+    mockUploadSandboxFileToConvex.mockImplementationOnce(async () => {
+      controller.abort(new Error("Canceled"));
+      return {
+        url: "https://files.example/one.txt",
+        fileId: "stored-first" as never,
+        name: "one.txt",
+        mediaType: "text/plain",
+        tokens: 0,
+        sizeBytes: 1,
+      };
+    });
+    const result = await runTool(
+      createGetTerminalFiles(context),
+      { files: ["/one.txt", "/two.txt"] },
+      controller.signal,
+    );
+    expect(result).toMatchObject({
+      files: [{ path: "/one.txt" }],
+      deliveryReceipts: [{ fileId: "stored-first", storageStatus: "stored" }],
+      failedFiles: [{ path: "/two.txt" }],
+    });
+    expect(mockUploadSandboxFileToConvex).toHaveBeenCalledTimes(1);
+    expect(context.fileAccumulator.add).toHaveBeenCalledTimes(1);
+    expect(context.writer.write).toHaveBeenCalledTimes(1);
+    expect(phLogger.event).toHaveBeenLastCalledWith(
+      "agent_file_delivery_completed",
+      expect.objectContaining({
+        abort_signal_aborted: true,
+        delivered_file_count: 1,
+        failed_file_count: 1,
+        failure_phase_counts: { unknown: 1 },
+      }),
+    );
+  });
+
+  it("does not acquire a sandbox for a delivery canceled before execution", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("Canceled"));
+    const context = makeContext();
+    const result = await runTool(
+      createGetTerminalFiles(context),
+      {
+        files: ["/one.txt", "/two.txt"],
+      },
+      controller.signal,
+    );
+    expect(result).toMatchObject({
+      files: [],
+      failedFiles: [{ path: "/one.txt" }, { path: "/two.txt" }],
+    });
+    expect(context.sandboxManager.getSandbox).not.toHaveBeenCalled();
+    expect(mockUploadSandboxFileToConvex).not.toHaveBeenCalled();
+    expect(phLogger.event).toHaveBeenLastCalledWith(
+      "agent_file_delivery_completed",
+      expect.objectContaining({
+        abort_signal_aborted: true,
+        delivered_file_count: 0,
+        failed_file_count: 2,
       }),
     );
   });
@@ -784,7 +1284,11 @@ describe("get_terminal_files", () => {
   });
 
   it("does not retry local files on a cloud sandbox after relay recovery", async () => {
-    const stale = { sandboxKind: "centrifugo", getConnectionId: () => "old" };
+    const stale = {
+      sandboxKind: "centrifugo",
+      getConnectionId: () => "old",
+      getConnectionInfo: () => ({ isDesktop: true }),
+    };
     const cloud = { id: "cloud" };
     const base = makeContext();
     const context = makeContext({
@@ -807,5 +1311,13 @@ describe("get_terminal_files", () => {
       "selected local sandbox changed",
     );
     expect(mockUploadSandboxFileToConvex).toHaveBeenCalledTimes(1);
+    expect(phLogger.event).toHaveBeenLastCalledWith(
+      "agent_file_delivery_completed",
+      expect.objectContaining({
+        observed_sandbox_types: ["desktop", "cloud"],
+        failed_file_count: 1,
+        relay_recovery_succeeded: false,
+      }),
+    );
   });
 });

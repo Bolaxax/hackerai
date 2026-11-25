@@ -78,6 +78,156 @@ describe("splitWorkedForParts", () => {
   });
 });
 
+describe("saved hunt results", () => {
+  const completion = (extra: Record<string, unknown> = {}) =>
+    part("tool-complete_finding_hunt", {
+      toolCallId: "complete-1",
+      state: "output-available",
+      input: { finding_id: "finding-1" },
+      output: {
+        success: true,
+        hunt_id: "h1",
+        counts: {
+          reproduced: 1,
+          ruled_out: 0,
+          inconclusive: 0,
+          not_examined: 0,
+        },
+      },
+      ...extra,
+    });
+
+  it("keeps a saved completion out of the work, with its original index", () => {
+    const file = part("file", { url: "https://example.com/file.txt" });
+    const step = part("step-start");
+    const start = part("tool-start_finding_hunt", {
+      toolCallId: "start-1",
+      state: "output-available",
+      output: { success: true },
+    });
+    const saved = completion();
+    const text = part("text", { text: "final answer" });
+    const parts = [file, step, start, saved, text];
+
+    const result = splitWorkedForParts(parts);
+
+    expect(result.savedResults).toEqual([{ part: saved, partIndex: 3 }]);
+    expect(result.workParts).toEqual([step, start]);
+    expect(result.workPartIndexes).toEqual([1, 2]);
+    expect(result.trailingTextParts).toEqual([text]);
+    // Final text keeps the offset it had before results were separated.
+    expect(result.trailingTextOffset).toBe(3);
+    // Neither projection shows it, so it renders exactly once elsewhere.
+    const projection = projectAgentWorkParts(parts, result.workPartIndexes);
+    expect(projection.activities.map(({ part: p }) => p)).toEqual([start]);
+    const items = projectAgentWorkTimelineItems({
+      activities: projection.activities,
+      messageSettled: true,
+      parts,
+      workPartIndexes: result.workPartIndexes,
+    });
+    expect(JSON.stringify(items)).not.toContain("complete-1");
+  });
+
+  it("treats a legacy wrapped success the same and keeps results without final text", () => {
+    const saved = completion({
+      output: { result: { success: true, hunt_id: "h1", counts: {} } },
+    });
+    const result = splitWorkedForParts([saved]);
+    expect(result.savedResults).toEqual([{ part: saved, partIndex: 0 }]);
+    expect(result.workParts).toEqual([]);
+    expect(result.trailingTextParts).toEqual([]);
+  });
+
+  it.each([
+    ["pending", { state: "input-available", output: undefined }],
+    ["refused", { output: { success: false, error: "conflict" } }],
+    ["errored", { state: "output-error", errorText: "failed" }],
+  ])("leaves a %s completion in the work", (_label, extra) => {
+    const unsaved = completion(extra);
+    const text = part("text", { text: "final answer" });
+    const result = splitWorkedForParts([unsaved, text]);
+    expect(result.savedResults).toEqual([]);
+    expect(result.workParts).toEqual([unsaved]);
+    expect(result.workPartIndexes).toEqual([0]);
+  });
+});
+
+describe("saved report reads", () => {
+  const receipt = {
+    finding_id: "finding-1",
+    title: "Help panel exposure",
+    target: "demo.example.test",
+    severity: "medium",
+    cvss_score: 5.3,
+  };
+  const reportPart = (type: string, extra: Record<string, unknown> = {}) =>
+    part(type, {
+      toolCallId: `${type}-1`,
+      state: "output-available",
+      output:
+        type === "tool-get_report"
+          ? { success: true, report: receipt }
+          : type === "tool-list_reports"
+            ? { success: true, reports: [receipt] }
+            : { success: true, ...receipt },
+      ...extra,
+    });
+
+  it("lifts a successful get_report out of the work exactly once, keeping indexes", () => {
+    const shell = part("tool-shell", {
+      toolCallId: "shell-1",
+      state: "output-available",
+      output: { exitCode: 0 },
+    });
+    const read = reportPart("tool-get_report");
+    const text = part("text", { text: "Use Download PDF on the card." });
+    const parts = [part("step-start"), shell, read, text];
+
+    const result = splitWorkedForParts(parts);
+
+    expect(result.savedResults).toEqual([{ part: read, partIndex: 2 }]);
+    expect(result.workPartIndexes).toEqual([0, 1]);
+    expect(result.trailingTextOffset).toBe(3);
+    const projection = projectAgentWorkParts(parts, result.workPartIndexes);
+    expect(projection.activities.map(({ part: p }) => p)).toEqual([shell]);
+    const items = projectAgentWorkTimelineItems({
+      activities: projection.activities,
+      messageSettled: true,
+      parts,
+      workPartIndexes: result.workPartIndexes,
+    });
+    expect(JSON.stringify(items)).not.toContain("tool-get_report-1");
+  });
+
+  it.each([
+    [
+      "pending",
+      "tool-get_report",
+      { state: "input-available", output: undefined },
+    ],
+    [
+      "not found",
+      "tool-get_report",
+      { output: { success: false, error: "not_found", message: "x" } },
+    ],
+    ["errored", "tool-get_report", { state: "output-error", errorText: "x" }],
+    [
+      "malformed",
+      "tool-get_report",
+      { output: { success: true, report: { finding_id: "finding-1" } } },
+    ],
+    ["created", "tool-create_vulnerability_report", {}],
+    ["updated", "tool-update_vulnerability_report", {}],
+    ["listed", "tool-list_reports", {}],
+  ])("keeps a %s report tool in its existing place", (_label, type, extra) => {
+    const kept = reportPart(type, extra);
+    const result = splitWorkedForParts([kept, part("text", { text: "done" })]);
+    expect(result.savedResults).toEqual([]);
+    expect(result.workParts).toEqual([kept]);
+  });
+});
+
 describe("isExpandableWorkedForPart", () => {
   it("treats tool parts and rendered tool output as expandable work", () => {
     expect(isExpandableWorkedForPart(part("tool-shell"))).toBe(true);
@@ -445,6 +595,10 @@ describe("projectAgentWorkTimelineItems", () => {
       ["tool-file", { input: { action: "write" } }, "edit"],
       ["tool-file", { input: { action: "append" } }, "edit"],
       ["tool-file", { input: { action: "edit" } }, "edit"],
+      ["tool-file_write", { input: { action: "write" } }, "edit"],
+      ["tool-file_write", { input: { action: "append" } }, "edit"],
+      ["tool-file_write", { input: {} }, "edit"],
+      ["tool-file_edit", { input: {} }, "edit"],
       ["tool-write_file", {}, "edit"],
       ["tool-search_replace", {}, "edit"],
       ["tool-multi_edit", {}, "edit"],
@@ -627,5 +781,44 @@ describe("completed report activity labels", () => {
     ).toBe(
       "Created a finding, attempted to create a finding, updated a finding, ran a command",
     );
+  });
+});
+
+describe("steer parts in Agent work", () => {
+  it("keeps a read steer in the timeline between the tools it separated", () => {
+    const first = part("tool-shell", {
+      toolCallId: "call-1",
+      state: "output-available",
+    });
+    const steer = part("data-agent-steer", {
+      id: "steer-1",
+      data: { id: "steer-1", text: "Use staging" },
+    });
+    const second = part("tool-shell", {
+      toolCallId: "call-2",
+      state: "output-available",
+    });
+    const parts = [
+      part("step-start"),
+      first,
+      steer,
+      part("step-start"),
+      second,
+      part("text", { text: "done" }),
+    ];
+    const { workPartIndexes } = splitWorkedForParts(parts);
+    const projection = projectAgentWorkParts(parts, workPartIndexes);
+    expect(projection.activities.map(({ part: p }) => p)).toEqual([
+      first,
+      steer,
+      second,
+    ]);
+    const items = projectAgentWorkTimelineItems({
+      activities: projection.activities,
+      messageSettled: true,
+      parts,
+      workPartIndexes,
+    });
+    expect(JSON.stringify(items)).toContain("Use staging");
   });
 });
