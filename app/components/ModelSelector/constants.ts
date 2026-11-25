@@ -29,6 +29,7 @@ export const AGENT_MODEL_OPTIONS: ModelOption[] = [
     id: "hackerai-max",
     label: "HackerAI Max",
     description: "Maximum intelligence for complex work",
+    poweredBy: "Kimi K3.1 Pro · Max reasoning",
     thinking: true,
   },
 ];

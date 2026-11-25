@@ -67,6 +67,11 @@ interface ModelSelectorProps {
 const AUTO_MODEL_DESCRIPTION =
   "Balanced quality and speed, recommended for most tasks";
 
+// Matches selectModel: free Auto runs GLM 5.3 Flash; paid Auto text runs
+// DeepSeek V4.1 Flash 1017 (image turns may use a vision route).
+const getAutoPoweredBy = (subscription?: SubscriptionTier): string =>
+  subscription === "free" ? "GLM 5.3 Flash" : "DeepSeek V4.1 Flash 1017";
+
 const isMaxModel = (model: SelectedModel): boolean => model === "hackerai-max";
 
 const canUnlockMaxWithExtraUsage = (subscription: SubscriptionTier): boolean =>
@@ -149,10 +154,12 @@ const AutoOptionButton = ({
   isSelected,
   onSelect,
   mobile = false,
+  subscription,
 }: {
   isSelected: boolean;
   onSelect: () => void;
   mobile?: boolean;
+  subscription?: SubscriptionTier;
 }) => (
   <button
     type="button"
@@ -172,6 +179,9 @@ const AutoOptionButton = ({
       </span>
       <p className="text-xs text-muted-foreground leading-snug mt-0.5">
         {AUTO_MODEL_DESCRIPTION}
+      </p>
+      <p className="text-[11px] text-muted-foreground/80 leading-snug mt-0.5">
+        Powered by {getAutoPoweredBy(subscription)}
       </p>
     </div>
     {isSelected ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
@@ -330,6 +340,7 @@ const ModelOptionList = ({
           isSelected={isAuto}
           onSelect={onAutoSelect}
           mobile={mobile}
+          subscription={subscription}
         />
         <div className="my-1 border-b border-border/50" />
       </>
