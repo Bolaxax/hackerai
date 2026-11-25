@@ -60,6 +60,7 @@ import {
 import { createSubagentProviderHistory } from "@/lib/ai/subagents/provider-history";
 import {
   SUBAGENT_MAX_ACTIVE_SECONDS,
+  SUBAGENT_REASONING_EFFORT,
   SUBAGENT_MAX_DURATION_SECONDS,
   SUBAGENT_MAX_STEPS,
   SUBAGENT_RESULT_DEADLINE_SECONDS,
@@ -1289,7 +1290,7 @@ export const subagentTask = task({
             const getCacheOptions = (modelName: string) => {
               const requestedModelSlug =
                 provider.languageModel(modelName).modelId;
-              return buildPromptCacheOptions(
+              const cacheOptions = buildPromptCacheOptions(
                 requestedModelSlug,
                 createOpenRouterCacheSessionId({
                   chatId: row.subagent_id,
@@ -1297,6 +1298,17 @@ export const subagentTask = task({
                   requestedModelSlug,
                 }),
               );
+              // Direct providers get no OpenRouter options at all.
+              if (!cacheOptions.openrouter) return cacheOptions;
+              return {
+                openrouter: {
+                  ...cacheOptions.openrouter,
+                  reasoning: {
+                    enabled: true,
+                    effort: SUBAGENT_REASONING_EFFORT,
+                  },
+                },
+              };
             };
             const getGuardedLanguageModel = (
               modelName: string,

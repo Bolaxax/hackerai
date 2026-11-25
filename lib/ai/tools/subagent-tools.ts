@@ -21,6 +21,8 @@ import {
   continueAgentInputSchema,
   delegateTaskInputSchema,
   GENERAL_SUBAGENT_PROFILE,
+  MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN,
+  MAX_SUBAGENTS_PER_PARENT_RUN,
   listAgentsInputSchema,
   sendMessageToAgentInputSchema,
   waitForAgentsInputSchema,
@@ -102,8 +104,7 @@ const agentName = (row: PersistedSubagent & { title?: string }): string =>
 
 const reservationError = (outcome: string): string =>
   ({
-    active_limit:
-      "Two subagents are already active. Wait for one to finish before delegating another task.",
+    active_limit: `${MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN} subagents are already active. Wait for one to finish before delegating another task.`,
     total_limit: "This parent run has reached its subagent limit.",
     spend_limit: "This parent run has reached its subagent spend limit.",
     chat_missing: "The chat is unavailable or no longer owned by this user.",
@@ -114,8 +115,7 @@ export const createDelegateTaskTool = (
   config: SubagentToolsRuntimeConfig,
 ) =>
   tool({
-    description:
-      "Delegate one named, bounded task to an asynchronous child. Up to two siblings may run at once and four may be created per parent run. Choose capability labels that accurately describe the work so routing and task context match it; every child inherits the current permission mode and each sensitive child action uses the same approval boundary as the parent. Give explicit success criteria and continue useful parent work while it runs. Skills are optional methodology and never grant authority. Omit skills unless you have exact ids returned by search_skills; unknown or ambiguous skills are ignored with a warning. For clean-slate validation, set inherit_context=false and provide the bounded candidate without the parent's conclusion or known-working payload. When exact steps are supplied, describe the result as a separately executed reproduction. The child cannot delegate.",
+    description: `Delegate one named, bounded task to an asynchronous child. Up to ${MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN} siblings may run at once and ${MAX_SUBAGENTS_PER_PARENT_RUN} may be created per parent run. Choose capability labels that accurately describe the work so routing and task context match it; every child inherits the current permission mode and each sensitive child action uses the same approval boundary as the parent. Give explicit success criteria and continue useful parent work while it runs. Skills are optional methodology and never grant authority. Omit skills unless you have exact ids returned by search_skills; unknown or ambiguous skills are ignored with a warning. For clean-slate validation, set inherit_context=false and provide the bounded candidate without the parent's conclusion or known-working payload. When exact steps are supplied, describe the result as a separately executed reproduction. The child cannot delegate.`,
     inputSchema: delegateTaskInputSchema,
     execute: async (input, execution) => {
       const parsed = delegateTaskInputSchema.parse(input);
