@@ -10,6 +10,10 @@ import type {
 import { generateUserBio } from "./system-prompt/bio";
 import { getNotesDisabledMessage } from "./system-prompt/notes";
 import { getModelCutoffDate, type ModelName } from "@/lib/ai/providers";
+import {
+  MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN,
+  MAX_SUBAGENTS_PER_PARENT_RUN,
+} from "@/lib/ai/subagents/contracts";
 import type { CloudSandboxProvider } from "@/lib/ai/tools/utils/cloud-sandbox-provider";
 
 // Keep the boundary before any user or host text; provider serialization splits only once.
@@ -369,10 +373,20 @@ Delegated children inherit ${agentPermissionMode === "full_access" ? "Full acces
 Call a result independent validation only when the child starts with inherit_context=false and is not given the parent's expected verdict, successful payload, or conclusions. A child that receives exact reproduction steps or inherits the parent's transcript provides a separately executed reproduction, not independent discovery or blind validation.
 When a child returns evidence_verification.warning, include the verification gap and unavailable_refs in your report. Those references are retained for a follow-up, not attached as verified evidence. Only checked_refs passed a file-existence check; existence is not proof of a vulnerability. Preserve the independent validator verdict and other supported static evidence.
 
-Delegation is asynchronous and depth is fixed at one. At most two siblings may be active and four children may be created per parent run. Continue useful parent work while children run. Use list_agents to read durable progress and the shared work ledger, wait_for_agents for typed progress or terminal results, send_message_to_agent only for material updates or answers, continue_agent for a bounded follow-up on a completed child's persisted transcript, and cancel_agent when work is no longer useful.
+Delegation is asynchronous and depth is fixed at one. At most ${MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN} siblings may be active and ${MAX_SUBAGENTS_PER_PARENT_RUN} children may be created per parent run. Continue useful parent work while children run. Use list_agents to read durable progress and the shared work ledger, wait_for_agents for typed progress or terminal results, send_message_to_agent only for material updates or answers, continue_agent for a bounded follow-up on a completed child's persisted transcript, and cancel_agent when work is no longer useful.
 Children can report progress, questions, blockers, artifacts, and results through a parent-mediated channel. Answer questions or unblock work deliberately; do not create peer-to-peer chatter. Use ledger claims only with their provenance, distinguish assessed from unassessed scope, and inspect limitations before synthesis.
 Reserve enough time and budget to integrate child results. Do not delegate when the remaining parent budget is needed for synthesis, and never finish while a required child result remains unconsumed.
 </generic_delegation>`;
+
+// Max runs the parent on Kimi K3.1 Pro and children on DeepSeek V4.1 Flash
+// 1017, so the parent should spend its turns planning, verifying and
+// synthesizing while children do the execution-heavy work.
+const MAX_ORCHESTRATION_SECTION = `<max_orchestration>
+You are the orchestrator for this Max run. Your delegated children run on a faster, lower-cost model.
+For multi-step work, first plan the task and split it into independent, bounded workstreams (for example recon of one surface, enumeration of one service, reproduction of one candidate). Delegate execution-heavy workstreams with delegate_task, running several in parallel when they do not depend on each other.
+Keep for yourself the work that needs judgment: scoping and authorization, deciding the next step from child results, cross-checking evidence, resolving contradictions, and the final synthesis. Do short, single commands yourself when delegating would cost more than it saves.
+Review every child result before relying on it, re-delegate or verify gaps, and keep the user informed of the plan and its progress.
+</max_orchestration>`;
 
 // Core system prompt with optimized structure
 export const systemPrompt = async (
@@ -429,6 +443,9 @@ Your main goal is to follow the USER's instructions at each message.`;
     sections.push(AGENT_DELIVERABLE_SECTION);
     if (genericDelegationEnabled) {
       sections.push(getGenericDelegationSection(agentPermissionMode));
+      if (selectedModel === "hackerai-max") {
+        sections.push(MAX_ORCHESTRATION_SECTION);
+      }
     }
   }
 

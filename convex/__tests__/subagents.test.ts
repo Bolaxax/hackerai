@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
 
 import {
+  MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN,
+  MAX_SUBAGENTS_PER_PARENT_RUN,
   SUBAGENT_MAX_DURATION_SECONDS,
   SUBAGENT_WATCHDOG_GRACE_SECONDS,
 } from "../../lib/ai/subagents/contracts";
@@ -368,9 +370,12 @@ describe("subagent reservation", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
-  it("allows two active siblings and blocks the third transactionally", async () => {
+  it("allows the active sibling limit and blocks the next one transactionally", async () => {
     const { ctx, insert } = makeCtx({
-      parentRuns: [{ status: "running" }, { status: "queued" }],
+      parentRuns: Array.from(
+        { length: MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN },
+        (_, index) => ({ status: index % 2 ? "queued" : "running" }),
+      ),
     });
     await expect(reserveForBackend.handler(ctx, args)).resolves.toEqual({
       outcome: "active_limit",
@@ -378,14 +383,13 @@ describe("subagent reservation", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
-  it("caps a parent run at four total children", async () => {
+  it("caps a parent run at the total children limit", async () => {
+    const terminal = ["completed", "failed", "canceled", "timed_out"];
     const { ctx, insert } = makeCtx({
-      parentRuns: [
-        { status: "completed" },
-        { status: "failed" },
-        { status: "canceled" },
-        { status: "timed_out" },
-      ],
+      parentRuns: Array.from(
+        { length: MAX_SUBAGENTS_PER_PARENT_RUN },
+        (_, index) => ({ status: terminal[index % terminal.length] }),
+      ),
     });
     await expect(reserveForBackend.handler(ctx, args)).resolves.toEqual({
       outcome: "total_limit",

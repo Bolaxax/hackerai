@@ -66,8 +66,11 @@ describe("subagent contracts", () => {
   });
 
   it("allows limited sibling parallelism while reserving parent synthesis", () => {
-    expect(MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN).toBe(2);
-    expect(MAX_SUBAGENTS_PER_PARENT_RUN).toBe(4);
+    expect(MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN).toBe(4);
+    expect(MAX_SUBAGENTS_PER_PARENT_RUN).toBe(8);
+    expect(MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN).toBeLessThan(
+      MAX_SUBAGENTS_PER_PARENT_RUN,
+    );
     expect(SUBAGENT_PARENT_SYNTHESIS_RESERVE_DOLLARS).toBeGreaterThan(0);
   });
 

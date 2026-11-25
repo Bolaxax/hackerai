@@ -16,8 +16,12 @@ export const MAX_SUBAGENT_CONTEXT_REFS = 8;
 export const MAX_SUBAGENT_SKILLS = 5;
 export const MAX_SUBAGENT_SUCCESS_CRITERIA = 8;
 export const MAX_SUBAGENT_WAIT_SECONDS = 300;
-export const MAX_SUBAGENTS_PER_PARENT_RUN = 4;
-export const MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN = 2;
+// The parent (Kimi on Max) orchestrates; children do the execution. The
+// per-child and per-parent spend caps below still bound total cost.
+export const MAX_SUBAGENTS_PER_PARENT_RUN = 8;
+export const MAX_ACTIVE_SUBAGENTS_PER_PARENT_RUN = 4;
+/** Children run on DeepSeek V4.1 Flash 1017 with an explicit high effort. */
+export const SUBAGENT_REASONING_EFFORT = "high" as const;
 export const SUBAGENT_MAX_ACTIVE_SECONDS = 15 * 60;
 export const SUBAGENT_RESULT_DEADLINE_SECONDS = 12 * 60;
 export const SUBAGENT_MAX_DURATION_SECONDS = 17 * 60;

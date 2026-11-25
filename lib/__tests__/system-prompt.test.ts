@@ -104,8 +104,9 @@ describe("systemPrompt security instructions", () => {
     expect(enabled).toContain("create_vulnerability_report");
     expect(enabled).not.toContain("security_validation");
     expect(enabled).not.toContain("security_task");
-    expect(enabled).toContain("two siblings may be active");
-    expect(enabled).toContain("four children may be created");
+    expect(enabled).toContain("4 siblings may be active");
+    expect(enabled).toContain("8 children may be created");
+    expect(enabled).not.toContain("<max_orchestration>");
     expect(enabled).toContain("shared work ledger");
     expect(enabled).toContain("continue_agent");
     expect(enabled).toContain(
@@ -113,6 +114,34 @@ describe("systemPrompt security instructions", () => {
     );
     expect(enabled).toContain(
       "provides a separately executed reproduction, not independent discovery or blind validation",
+    );
+  });
+
+  it("makes the Max parent orchestrate delegated children", async () => {
+    const prompt = (
+      selected: "hackerai-max" | "hackerai-pro",
+      delegation = true,
+    ) =>
+      systemPrompt(
+        "user_123",
+        "agent",
+        "ultra",
+        "model-kimi-k3.1-pro",
+        null,
+        null,
+        "full_access",
+        delegation,
+        undefined,
+        selected,
+      );
+
+    const max = await prompt("hackerai-max");
+    expect(max).toContain("<max_orchestration>");
+    expect(max).toContain("delegate_task");
+    expect(await prompt("hackerai-pro")).not.toContain("<max_orchestration>");
+    // Without delegation tools there is nothing to orchestrate.
+    expect(await prompt("hackerai-max", false)).not.toContain(
+      "<max_orchestration>",
     );
   });
 
