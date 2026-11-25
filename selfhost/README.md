@@ -252,16 +252,29 @@ Crie uma API key, de preferência com limite de crédito, e use-a em
 1. Em Settings → Remote Control, gere um token. A UI mostra o comando já com
    `--convex-url https://hackerai-convex.bolaxax.cloud`.
 2. A UI usa `@latest`. Troque pela versão do commit implantado, que é o campo
-   `version` de `packages/local/package.json` (hoje `0.8.6`):
+   `version` de `packages/local/package.json` (hoje `0.8.9`):
 
    ```
-   npx @hackerai/local@0.8.6 --token hsb_... --convex-url https://hackerai-convex.bolaxax.cloud --name "Kali VM"
+   npx @hackerai/local@0.8.9 --token hsb_... --convex-url https://hackerai-convex.bolaxax.cloud --name "Kali VM"
    ```
 
 3. Com o CLI conectado, o seletor escolhe o computador sozinho. Essa escolha
    automática não fica salva entre recargas; escolher manualmente salva no
    navegador. Sem computador conectado, o Agent mostra "Your computer is
    disconnected" e não envia.
+
+### Runner Kali no próprio servidor
+
+`selfhost/kali-runner.compose.yml` cria o app `hackerai-kali-runner` no
+Coolify (build pack Docker Compose, branch `selfhost`). Ele roda o CLI dentro
+de um container Kali isolado: sem socket do Docker, sem volumes do host e sem
+modo privilegiado. Defina `HACKERAI_LOCAL_TOKEN` (token do Remote Control) e,
+se quiser, `HACKERAI_RUNNER_NAME`. O CLI sai após 1 hora sem comandos e o
+`restart: unless-stopped` o reconecta. Ao atualizar `packages/local`, mude
+`HACKERAI_LOCAL_VERSION` no `selfhost/kali-runner/Dockerfile`.
+
+Nunca rode o CLI direto no host do Coolify: os comandos do Agent não têm
+isolamento e alcançariam o Docker, o Coolify e o volume do Convex.
 
 ## Limite mensal
 
