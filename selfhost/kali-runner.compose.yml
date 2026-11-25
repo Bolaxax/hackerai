@@ -11,7 +11,8 @@
 services:
   runner:
     build:
-      context: ./kali-runner
+      # Coolify resolves build contexts from the repository root.
+      context: ./selfhost/kali-runner
     environment:
       - HACKERAI_LOCAL_TOKEN=${HACKERAI_LOCAL_TOKEN}
       - HACKERAI_CONVEX_URL=https://hackerai-convex.bolaxax.cloud
