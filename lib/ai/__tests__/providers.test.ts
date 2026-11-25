@@ -270,11 +270,19 @@ describe("provider registry", () => {
     expect(
       (myProvider.languageModel("fallback-agent-model") as { modelId: string })
         .modelId,
-    ).toBe("x-ai/grok-4.6");
+    ).toBe("x-ai/grok-4.7");
     expect(
       (myProvider.languageModel("fallback-ask-model") as { modelId: string })
         .modelId,
-    ).toBe("x-ai/grok-4.6");
+    ).toBe("x-ai/grok-4.7");
+    expect(
+      (myProvider.languageModel("model-grok-4.7") as { modelId: string })
+        .modelId,
+    ).toBe("x-ai/grok-4.7");
+    expect(
+      (myProvider.languageModel("model-kimi-k3.1-pro") as { modelId: string })
+        .modelId,
+    ).toBe("moonshotai/kimi-k3.1-pro");
     expect(
       (myProvider.languageModel("title-generator-model") as { modelId: string })
         .modelId,
@@ -295,6 +303,12 @@ describe("provider registry", () => {
     expect(getModelDisplayName("model-glm-5.3")).toBe("Z.ai GLM 5.3");
     expect(getModelCutoffDate("model-glm-5.3")).toBeUndefined();
     expect(getModelDisplayName("model-kimi-k3")).toBe("Moonshot Kimi K3");
+    expect(getModelDisplayName("model-kimi-k3.1-pro")).toBe(
+      "Moonshot Kimi K3.1 Pro",
+    );
+    expect(getModelDisplayName("model-grok-4.7")).toBe("xAI Grok 4.7");
+    expect(getModelCutoffDate("model-kimi-k3.1-pro")).toBeUndefined();
+    expect(getModelCutoffDate("model-grok-4.7")).toBeUndefined();
     expect(getModelDisplayName("title-generator-model")).toBe("GLM 5.3 Flash");
   });
 
@@ -304,10 +318,15 @@ describe("provider registry", () => {
     expect(isAnthropicModel("anthropic/claude-opus-4.6")).toBe(true);
   });
 
-  it("resolves Max to Grok 4.6 with native image support", () => {
+  it("resolves Max to Kimi K3.1 Pro with native image support", () => {
     const key = resolveAgentTierToProviderKey("hackerai-max");
-    expect(myProvider.languageModel(key).modelId).toBe("x-ai/grok-4.6");
+    expect(key).toBe("model-kimi-k3.1-pro");
+    expect(myProvider.languageModel(key).modelId).toBe(
+      "moonshotai/kimi-k3.1-pro",
+    );
     expect(supportsMultimodalToolResults(key)).toBe(true);
+    expect(isKimiModel(key)).toBe(true);
+    expect(isAnthropicModel(key)).toBe(false);
   });
 
   it("resolves Standard to the exact native multimodal Flash snapshot", () => {
@@ -715,6 +734,25 @@ describe("makeOpenRouterToolChoiceCompatibleWithXaiReasoning", () => {
     expect(makeOpenRouterToolChoiceCompatibleWithXaiReasoning(body)).toEqual({
       body,
       changed: false,
+    });
+  });
+
+  it("keeps Grok 4.7 mandatory reasoning by promoting a non-xAI fallback", () => {
+    const body = {
+      model: "x-ai/grok-4.7",
+      models: ["z-ai/glm-5.3", "moonshotai/kimi-k3"],
+      reasoning: { enabled: true, effort: "high" },
+      tool_choice: "required",
+    };
+
+    expect(makeOpenRouterToolChoiceCompatibleWithXaiReasoning(body)).toEqual({
+      changed: true,
+      body: {
+        model: "z-ai/glm-5.3",
+        models: ["moonshotai/kimi-k3"],
+        reasoning: { enabled: true, effort: "high" },
+        tool_choice: "required",
+      },
     });
   });
 

@@ -98,7 +98,10 @@ describe("transport recovery provider exclusions", () => {
 // If the registry slug for a model changes, update both places intentionally.
 const GROK_4_5_SLUG = "x-ai/grok-4.5";
 const GROK_SLUG = "x-ai/grok-4.6";
+// Active fallback Grok for Kimi K3 and the fallback-*-model keys.
+const GROK_FALLBACK_SLUG = "x-ai/grok-4.7";
 const KIMI_K3_SLUG = "moonshotai/kimi-k3";
+const KIMI_K3_1_PRO_SLUG = "moonshotai/kimi-k3.1-pro";
 const GLM_SLUG = "z-ai/glm-5.3";
 const GLM_FLASH_SLUG = "z-ai/glm-5.3-flash";
 const DEEPSEEK_VISION_SLUG = "deepseek/deepseek-v4.1-flash-1017";
@@ -429,9 +432,105 @@ describe("buildProviderOptions fallback chain", () => {
       "agent",
     );
     expect(opts.openrouter).toMatchObject({
-      models: [GROK_SLUG],
+      models: [GROK_FALLBACK_SLUG],
       user: "user-1",
     });
+  });
+
+  it("keeps Max Kimi K3.1 Pro on app-side recovery with a high reasoning floor", () => {
+    for (const reasoningOverride of [
+      undefined,
+      { enabled: true, effort: "low" },
+      { enabled: false },
+    ]) {
+      const opts = buildProviderOptions(
+        true,
+        "user-1",
+        "model-kimi-k3.1-pro",
+        "agent",
+        { selectedModelOverride: "hackerai-max", reasoningOverride },
+      );
+      expect(opts.openrouter.reasoning).toEqual({
+        enabled: true,
+        effort: "high",
+      });
+      expect(opts.openrouter.models).toBeUndefined();
+    }
+
+    const raised = buildProviderOptions(
+      true,
+      "user-1",
+      "model-kimi-k3.1-pro",
+      "agent",
+      {
+        selectedModelOverride: "hackerai-max",
+        reasoningOverride: { enabled: true, effort: "max" },
+      },
+    );
+    expect(raised.openrouter.reasoning).toEqual({
+      enabled: true,
+      effort: "max",
+    });
+  });
+
+  it("parses PDFs for Kimi K3.1 Pro, which has no native file input", () => {
+    const opts = buildProviderOptions(
+      true,
+      "user-1",
+      "model-kimi-k3.1-pro",
+      "agent",
+      { selectedModelOverride: "hackerai-max", hasPdfAttachments: true },
+    );
+    expect(opts.openrouter).toMatchObject({
+      plugins: [{ id: "file-parser", pdf: { engine: "mistral-ocr" } }],
+    });
+
+    const grokPdf = buildProviderOptions(
+      true,
+      "user-1",
+      "model-grok-4.7",
+      "agent",
+      { hasPdfAttachments: true },
+    );
+    expect(grokPdf.openrouter).not.toHaveProperty("plugins");
+  });
+
+  it("falls back from Kimi K3.1 Pro Ask through GLM 5.3 then Kimi K3", () => {
+    const opts = buildProviderOptions(
+      false,
+      "user-1",
+      "model-kimi-k3.1-pro",
+      "ask",
+    );
+    expect(opts.openrouter).toMatchObject({
+      reasoning: { enabled: true, effort: "high" },
+      models: [GLM_SLUG, KIMI_K3_SLUG],
+    });
+  });
+
+  it("maps Kimi K3.1 Pro and Grok 4.7 responses to their cost keys", () => {
+    for (const responseModel of [
+      KIMI_K3_1_PRO_SLUG,
+      "moonshotai/kimi-k3.1-pro-20261023",
+    ]) {
+      expect(
+        resolveServedModelForCostAccounting({
+          modelName: "model-glm-5.3",
+          responseModel,
+        }),
+      ).toBe("model-kimi-k3.1-pro");
+    }
+    for (const responseModel of [
+      GROK_FALLBACK_SLUG,
+      "x-ai/grok-4.7-20260916",
+    ]) {
+      expect(
+        resolveServedModelForCostAccounting({
+          modelName: "model-glm-5.3",
+          responseModel,
+        }),
+      ).toBe("model-grok-4.7");
+    }
   });
 
   it("excludes the model that actually returned content-filter from retry fallbacks", () => {
@@ -757,7 +856,7 @@ describe("buildProviderOptions fallback chain", () => {
       enabled: true,
       effort: "max",
     });
-    expect(opts.openrouter.models).toEqual([GROK_SLUG]);
+    expect(opts.openrouter.models).toEqual([GROK_FALLBACK_SLUG]);
   });
 
   it.each([
@@ -877,7 +976,7 @@ describe("buildProviderOptions fallback chain", () => {
     );
     expect(reasoning.openrouter).toMatchObject({
       reasoning: { enabled: true, effort: "high" },
-      models: [GROK_SLUG],
+      models: [GROK_FALLBACK_SLUG],
     });
 
     const grokReasoning = buildProviderOptions(
@@ -900,7 +999,7 @@ describe("buildProviderOptions fallback chain", () => {
     );
     expect(multimodal.openrouter).toMatchObject({
       reasoning: { enabled: true, effort: "high" },
-      models: [GROK_SLUG],
+      models: [GROK_FALLBACK_SLUG],
     });
   });
 });
@@ -1106,7 +1205,16 @@ describe("getRetryFallbackModel", () => {
 
   it("retries Kimi K3 with the active Grok route", () => {
     expect(getRetryFallbackModel("model-kimi-k3", "agent")).toBe(
-      "model-grok-4.6",
+      "model-grok-4.7",
+    );
+  });
+
+  it("retries Ask Kimi K3.1 Pro and Grok 4.7 with GLM 5.3", () => {
+    expect(getRetryFallbackModel("model-kimi-k3.1-pro", "ask")).toBe(
+      "model-glm-5.3",
+    );
+    expect(getRetryFallbackModel("model-grok-4.7", "ask")).toBe(
+      "model-glm-5.3",
     );
   });
 

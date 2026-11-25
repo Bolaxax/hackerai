@@ -140,6 +140,14 @@ const KIMI_K3_PRICING: ModelPricing = {
   cacheRead: 0.3,
   cacheWrite: 3.0,
 };
+// Moonshot first-party OpenRouter rates (2026-11-24); ZDR hosts range from
+// $0.24-$4.40 in and $6.20-$22.00 out. Provider-reported costs stay authoritative.
+const KIMI_K3_1_PRO_PRICING: ModelPricing = {
+  input: 2.0,
+  output: 10.0,
+  cacheRead: 0.2,
+  cacheWrite: 2.0,
+};
 
 /** Model pricing: $/1M tokens per model, including provider cache rates. */
 const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
@@ -153,6 +161,8 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   // Grok 4.6 shares the $2/$6 base rate, with a 2x tier from 200k prompt
   // tokens handled by getModelPricing when the input size is available.
   "model-grok-4.6": GROK_4_6_BASE_PRICING,
+  // Grok 4.7 has the same OpenRouter base and 200k+ tier rates as Grok 4.6.
+  "model-grok-4.7": GROK_4_6_BASE_PRICING,
   [GROK_4_6_BEDROCK_MODEL_KEY]: GROK_4_6_BASE_PRICING,
   "model-grok-4.5": GROK_4_6_BASE_PRICING,
   "model-grok-4.5-pro": GROK_4_6_BASE_PRICING,
@@ -175,11 +185,14 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   "model-glm-5.3-flash-agent": GLM_5_3_FLASH_PRICING,
   // OpenRouter rates: $3.00 in / $15.00 out / $0.30 cached input per 1M tokens.
   "model-kimi-k3": KIMI_K3_PRICING,
+  "model-kimi-k3.1-pro": KIMI_K3_1_PRO_PRICING,
   // Provider response ids can reach accounting before local-key normalization.
   // Historical Grok 4.5 responses retain their original flat pricing.
   "x-ai/grok-4.5": GROK_4_6_BASE_PRICING,
   "x-ai/grok-4.5-20260708": GROK_4_6_BASE_PRICING,
   "x-ai/grok-4.6": GROK_4_6_BASE_PRICING,
+  "x-ai/grok-4.7": GROK_4_6_BASE_PRICING,
+  "x-ai/grok-4.7-20260916": GROK_4_6_BASE_PRICING,
   "deepseek/deepseek-v4-flash": DEEPSEEK_V4_FLASH_PRICING,
   "deepseek/deepseek-v4-flash-20260423": DEEPSEEK_V4_FLASH_PRICING,
   "deepseek/deepseek-v4-flash-0731": DEEPSEEK_V4_FLASH_0731_PRICING,
@@ -197,14 +210,19 @@ const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
   "z-ai/glm-5.3-flash": GLM_5_3_FLASH_PRICING,
   "moonshotai/kimi-k3": KIMI_K3_PRICING,
   "moonshotai/kimi-k3-20260715": KIMI_K3_PRICING,
+  "moonshotai/kimi-k3.1-pro": KIMI_K3_1_PRO_PRICING,
+  "moonshotai/kimi-k3.1-pro-20261023": KIMI_K3_1_PRO_PRICING,
 };
 
 const GROK_4_6_MODEL_IDS = new Set([
   "model-grok-4.6",
+  "model-grok-4.7",
   GROK_4_6_BEDROCK_MODEL_KEY,
   "fallback-agent-model",
   "fallback-ask-model",
   "x-ai/grok-4.6",
+  "x-ai/grok-4.7",
+  "x-ai/grok-4.7-20260916",
 ]);
 
 const getModelPricing = (

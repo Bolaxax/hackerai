@@ -45,6 +45,15 @@ it("bounds the whole transparent fallback route by its smallest member", () => {
   ).toBe(496_000);
 });
 
+it("knows the verified windows of the Kimi K3.1 Pro Max and Grok 4.7 fallback routes", () => {
+  expect(
+    getAgentContextBudget({ ...route, modelId: "moonshotai/kimi-k3.1-pro" }),
+  ).toBe(508_288);
+  expect(getAgentContextBudget({ ...route, modelId: "x-ai/grok-4.7" })).toBe(
+    234_000,
+  );
+});
+
 it.each([
   { enabled: false },
   { enabled: undefined },

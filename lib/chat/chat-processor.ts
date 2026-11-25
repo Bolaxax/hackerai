@@ -44,7 +44,8 @@ export const getMaxStepsForUser = (mode: ChatMode): number => {
  *   Every paid Auto route (Pro, Pro Plus, Ultra, Team) and Agent Pro use
  *   DeepSeek V4.1 Flash. Paid Standard uses the same snapshot with high
  *   reasoning; explicit Pro uses max reasoning, including images.
- *   Entitled Max requests use Grok 4.6 for text, PDFs and native images.
+ *   Entitled Max requests use Kimi K3.1 Pro for text and native images;
+ *   its PDFs go through OpenRouter's file parser.
  *   Pro/Pro+ Auto image turns also use GLM 5.3 Flash; other eligible
  *   image turns use DeepSeek V4.1 Flash vision before fallbacks.
  * @returns Model name to use

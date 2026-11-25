@@ -34,8 +34,11 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isXaiModelSlug = (value: unknown): boolean =>
   typeof value === "string" && value.toLowerCase().startsWith("x-ai/");
 
-const isGrok46ModelSlug = (value: unknown): boolean =>
-  typeof value === "string" && value.toLowerCase().startsWith("x-ai/grok-4.6");
+// Grok 4.6 and 4.7 both declare mandatory reasoning on OpenRouter.
+const isMandatoryReasoningGrokModelSlug = (value: unknown): boolean =>
+  typeof value === "string" &&
+  (value.toLowerCase().startsWith("x-ai/grok-4.6") ||
+    value.toLowerCase().startsWith("x-ai/grok-4.7"));
 
 const isKimiModelSlug = (value: unknown): boolean =>
   typeof value === "string" &&
@@ -325,7 +328,7 @@ export const makeOpenRouterToolChoiceCompatibleWithXaiReasoning = (
     return { body, changed: false };
   }
 
-  if (!isGrok46ModelSlug(body.model)) {
+  if (!isMandatoryReasoningGrokModelSlug(body.model)) {
     return {
       body: {
         ...body,
@@ -342,7 +345,7 @@ export const makeOpenRouterToolChoiceCompatibleWithXaiReasoning = (
       )
     : [];
 
-  // Grok 4.6 requires reasoning, while xAI reasoning does not accept a forced
+  // Grok 4.6 and 4.7 require reasoning, while xAI reasoning does not accept a forced
   // tool choice. Preserve both behaviors by routing this single request to an
   // existing non-xAI fallback. When no compatible route exists, keep Grok's
   // mandatory reasoning and relax only the forced tool choice.
@@ -1395,10 +1398,14 @@ const openrouterUs = createOpenRouter({
 type OpenRouterInstance = typeof openrouter;
 
 export const KIMI_K3_SLUG = "moonshotai/kimi-k3";
+// Max Agent tier. Accepts text and images; PDFs go through the file parser.
+export const KIMI_K3_1_PRO_SLUG = "moonshotai/kimi-k3.1-pro";
 export const GLM_5_3_SLUG = "z-ai/glm-5.3";
 export const GLM_5_3_FLASH_SLUG = "z-ai/glm-5.3-flash";
 export const GROK_4_5_SLUG = "x-ai/grok-4.5";
 export const GROK_4_6_SLUG = "x-ai/grok-4.6";
+// Ask/Agent fallback and summarization retry. Same xAI rates as Grok 4.6.
+export const GROK_4_7_SLUG = "x-ai/grok-4.7";
 // Preserve persisted route keys while pinning every Flash route to this snapshot.
 export const DEEPSEEK_V4_FLASH_VISION_SLUG = DEEPSEEK_1017_SLUG;
 export const MINIMAX_M3_SLUG = "minimax/minimax-m3";
@@ -1440,6 +1447,7 @@ const buildProviderMap = (
     "ask-model-free-deepseek-v41": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
     "agent-model-free": or(freeAgentModelSlug),
     "model-grok-4.6": or(GROK_4_6_SLUG),
+    "model-grok-4.7": or(GROK_4_7_SLUG),
     // Separate internal keys use the same Grok 4.5 provider model while
     // provider reasoning options distinguish Standard from Pro vision.
     "model-grok-4.5": or(GROK_4_5_SLUG),
@@ -1452,8 +1460,9 @@ const buildProviderMap = (
     "model-deepseek-v4-flash-vision": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
     "model-deepseek-v4-flash-vision-pro": or(DEEPSEEK_V4_FLASH_VISION_SLUG),
     "model-kimi-k3": or(KIMI_K3_SLUG),
-    "fallback-agent-model": or(GROK_4_6_SLUG),
-    "fallback-ask-model": or(GROK_4_6_SLUG),
+    "model-kimi-k3.1-pro": or(KIMI_K3_1_PRO_SLUG),
+    "fallback-agent-model": or(GROK_4_7_SLUG),
+    "fallback-ask-model": or(GROK_4_7_SLUG),
     // GLM supports the title schema and requires reasoning to stay enabled.
     "title-generator-model": or(GLM_5_3_FLASH_SLUG),
     // Image understanding for text-only routes. The resulting description is
@@ -1498,6 +1507,7 @@ export const modelDisplayNames: Record<ModelName, string> &
     "Auto, an intelligent model router built by HackerAI",
   "agent-model-free": "Auto, an intelligent model router built by HackerAI",
   "model-grok-4.6": "xAI Grok 4.6",
+  "model-grok-4.7": "xAI Grok 4.7",
   [GROK_4_6_BEDROCK_MODEL_KEY]: "xAI Grok 4.6",
   "model-grok-4.5": "xAI Grok 4.5",
   "model-grok-4.5-pro": "xAI Grok 4.5",
@@ -1510,6 +1520,7 @@ export const modelDisplayNames: Record<ModelName, string> &
   "model-deepseek-v4-flash-vision-pro": "DeepSeek V4.1 Flash",
   [DEEPSEEK_1017_MODEL_KEY]: "DeepSeek V4.1 Flash 1017",
   "model-kimi-k3": "Moonshot Kimi K3",
+  "model-kimi-k3.1-pro": "Moonshot Kimi K3.1 Pro",
   "fallback-agent-model": "Auto, an intelligent model router built by HackerAI",
   "fallback-ask-model": "Auto, an intelligent model router built by HackerAI",
   "title-generator-model": "GLM 5.3 Flash",
@@ -1547,7 +1558,9 @@ export function isDeepSeekModel(modelName: string): boolean {
 export function isKimiModel(modelName: string): boolean {
   const normalized = modelName.toLowerCase();
   return (
-    normalized === "model-kimi-k3" || normalized.includes("moonshotai/kimi")
+    normalized === "model-kimi-k3" ||
+    normalized === "model-kimi-k3.1-pro" ||
+    normalized.includes("moonshotai/kimi")
   );
 }
 
@@ -1557,12 +1570,14 @@ function isGrokModel(modelName: string): boolean {
     normalized === "fallback-agent-model" ||
     normalized === "fallback-ask-model" ||
     normalized === "model-grok-4.6" ||
+    normalized === "model-grok-4.7" ||
     normalized === GROK_4_6_BEDROCK_MODEL_KEY ||
     normalized === "model-grok-4.5" ||
     normalized === "model-grok-4.5-pro" ||
     normalized.includes("x-ai/") ||
     normalized === "grok-4.5" ||
-    normalized === "grok-4.6"
+    normalized === "grok-4.6" ||
+    normalized === "grok-4.7"
   );
 }
 
@@ -1619,7 +1634,7 @@ export function resolveAgentTierToProviderKey(
     case "hackerai-pro":
       return DEEPSEEK_1017_MODEL_KEY;
     case "hackerai-max":
-      return "model-grok-4.6";
+      return "model-kimi-k3.1-pro";
   }
 }
 

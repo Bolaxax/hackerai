@@ -687,10 +687,25 @@ describe("token-bucket", () => {
     );
 
     it.each([
+      "model-kimi-k3.1-pro",
+      "moonshotai/kimi-k3.1-pro",
+      "moonshotai/kimi-k3.1-pro-20261023",
+    ])(
+      "should use Kimi K3.1 Pro pricing for %s ($2.00/$10.00)",
+      (modelName) => {
+        expect(calculateTokenCost(1_000_000, "input", modelName)).toBe(24000);
+        expect(calculateTokenCost(1_000_000, "output", modelName)).toBe(120000);
+      },
+    );
+
+    it.each([
       "x-ai/grok-4.5",
       "x-ai/grok-4.6",
+      "x-ai/grok-4.7",
+      "x-ai/grok-4.7-20260916",
       "x-ai/grok-4.5-20260708",
       "model-grok-4.6",
+      "model-grok-4.7",
       "model-grok-4.5",
       "model-grok-4.5-pro",
       "fallback-agent-model",
@@ -708,6 +723,18 @@ describe("token-bucket", () => {
           modelName: "model-grok-4.6",
         }),
       ).toBeCloseTo(0.459998);
+    });
+
+    it("uses Grok 4.7 doubled pricing from 200k prompt tokens on the fallback route", () => {
+      for (const modelName of ["model-grok-4.7", "fallback-agent-model"]) {
+        expect(
+          calculateRawModelUsageCostDollars({
+            inputTokens: 200_000,
+            outputTokens: 10_000,
+            modelName,
+          }),
+        ).toBeCloseTo(0.92);
+      }
     });
 
     it("uses Grok 4.6 doubled pricing from 200k prompt tokens", () => {

@@ -34,7 +34,7 @@ const client = (variant: unknown) => ({
 
 describe("paid 1017 routing", () => {
   it.each([false, true])(
-    "pins Max text, uploads and image tool results to native Grok 4.6 high (direct vision=%s)",
+    "pins Max text, uploads and image tool results to native Kimi K3.1 Pro high (direct vision=%s)",
     (directGlmVisionEnabled) => {
       const attachmentModel = selectModel(
         "agent",
@@ -45,7 +45,7 @@ describe("paid 1017 routing", () => {
         { directGlmVisionEnabled },
       );
       const textModel = selectModel("agent", "ultra", "hackerai-max");
-      expect(textModel).toBe("model-grok-4.6");
+      expect(textModel).toBe("model-kimi-k3.1-pro");
       const toolImageModel = resolveAgentModelForImageToolResults(
         textModel,
         "agent",
@@ -57,7 +57,7 @@ describe("paid 1017 routing", () => {
       );
       for (const modelKey of [attachmentModel, toolImageModel]) {
         expect(myProvider.languageModel(modelKey).modelId).toBe(
-          "x-ai/grok-4.6",
+          "moonshotai/kimi-k3.1-pro",
         );
         expect(supportsMultimodalToolResults(modelKey)).toBe(true);
         const options = buildProviderOptions(

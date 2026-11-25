@@ -34,8 +34,10 @@ import {
   GLM_5_3_SLUG,
   GROK_4_5_SLUG,
   GROK_4_6_SLUG,
+  GROK_4_7_SLUG,
   getOpenRouterProviderRoutingForModel,
   isAnthropicModel,
+  isKimiModel,
   myProvider,
 } from "@/lib/ai/providers";
 import type { ModelName } from "@/lib/ai/providers";
@@ -777,7 +779,7 @@ export function createAgentCompactionReporter({
  * OpenRouter slugs are resolved at request-build time so this stays in sync
  * with the registry.
  */
-const GROK_4_6_FALLBACK_CHAIN = [
+const GROK_FALLBACK_CHAIN = [
   "model-glm-5.3",
   "model-kimi-k3",
 ] as const satisfies readonly ModelName[];
@@ -820,7 +822,10 @@ const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
   "agent-model-free": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-glm-5.3-flash-agent": GLM_FLASH_AGENT_FALLBACK_CHAIN,
   "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN,
-  "model-grok-4.6": GROK_4_6_FALLBACK_CHAIN,
+  "model-grok-4.6": GROK_FALLBACK_CHAIN,
+  "model-grok-4.7": GROK_FALLBACK_CHAIN,
+  // Max Agent skips transparent fallbacks; Ask and recovery keep 1M routes.
+  "model-kimi-k3.1-pro": PRO_TEXT_FALLBACK_CHAIN,
   "model-grok-4.5": ["model-kimi-k3"],
   "model-grok-4.5-pro": ["model-kimi-k3"],
   "model-glm-5.3": ["model-kimi-k3"],
@@ -829,9 +834,9 @@ const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
   "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
   [DEEPSEEK_1017_MODEL_KEY]: DEEPSEEK_V4_1_FLASH_FALLBACK_CHAIN,
-  "fallback-agent-model": GROK_4_6_FALLBACK_CHAIN,
-  "fallback-ask-model": GROK_4_6_FALLBACK_CHAIN,
-  "model-kimi-k3": ["model-grok-4.6"],
+  "fallback-agent-model": GROK_FALLBACK_CHAIN,
+  "fallback-ask-model": GROK_FALLBACK_CHAIN,
+  "model-kimi-k3": ["model-grok-4.7"],
 };
 
 const AUTO_MODEL_KEYS = new Set<string>([
@@ -843,6 +848,7 @@ const AUTO_MODEL_KEYS = new Set<string>([
 const EXPLICIT_RETRY_MODEL_KEYS = new Set<string>([
   "model-glm-5.3",
   "model-grok-4.6",
+  "model-kimi-k3.1-pro",
 ]);
 const EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS = new Set<string>([
   "model-deepseek-v4-pro-0813",
@@ -887,6 +893,8 @@ const HIGH_REASONING_MODELS = [
   DEEPSEEK_1017_MODEL_KEY,
   "model-grok-4.5-pro",
   "model-grok-4.6",
+  "model-grok-4.7",
+  "model-kimi-k3.1-pro",
   "model-deepseek-v4-pro-0813",
   "model-glm-5.3",
   "model-glm-5.3-flash-pro",
@@ -978,6 +986,8 @@ export function getRetryFallbackModel(
   }
   if (
     modelName === "model-grok-4.6" ||
+    modelName === "model-grok-4.7" ||
+    modelName === "model-kimi-k3.1-pro" ||
     modelName === "model-grok-4.5" ||
     modelName === "fallback-agent-model" ||
     modelName === "fallback-ask-model"
@@ -993,7 +1003,7 @@ export function getRetryFallbackModel(
   ) {
     return "model-deepseek-v4-pro-0813";
   }
-  return "model-grok-4.6";
+  return "model-grok-4.7";
 }
 
 /** Any failure of the active treatment route gets one baseline attempt. */
@@ -1012,7 +1022,7 @@ export function shouldRetryAbliterationError(
 const CONTENT_FILTER_RETRY_CANDIDATES = [
   "model-glm-5.3",
   "model-kimi-k3",
-  "model-grok-4.6",
+  "model-grok-4.7",
 ] as const satisfies readonly ModelName[];
 
 /**
@@ -1115,6 +1125,8 @@ const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "x-ai/grok-4.5": "model-grok-4.5",
   "x-ai/grok-4.5-20260708": "model-grok-4.5",
   "x-ai/grok-4.6": "model-grok-4.6",
+  "x-ai/grok-4.7": "model-grok-4.7",
+  "x-ai/grok-4.7-20260916": "model-grok-4.7",
   "z-ai/glm-5.3": "model-glm-5.3",
   "z-ai/glm-5.3-20260816": "model-glm-5.3",
   [GLM_5_3_FLASH_SLUG]: "model-glm-5.3-flash",
@@ -1123,6 +1135,8 @@ const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
   "deepseek/deepseek-v4.1-flash-20260910": "model-deepseek-v4-flash-vision",
   "moonshotai/kimi-k3": "model-kimi-k3",
   "moonshotai/kimi-k3-20260715": "model-kimi-k3",
+  "moonshotai/kimi-k3.1-pro": "model-kimi-k3.1-pro",
+  "moonshotai/kimi-k3.1-pro-20261023": "model-kimi-k3.1-pro",
 };
 
 function resolveOpenRouterResponseModelCostKey(
@@ -1202,7 +1216,10 @@ export function buildProviderOptions(
       modelName === "ask-model-free-glm" ||
       modelName === "ask-model-free-deepseek-v41");
   const isGrok45 = modelId === GROK_4_5_SLUG;
-  const isGrok46 = modelId === GROK_4_6_SLUG;
+  // Grok 4.7 shares Grok 4.6's mandatory high-reasoning policy.
+  const isGrok46 = modelId === GROK_4_6_SLUG || modelId === GROK_4_7_SLUG;
+  // Kimi has no native file input, so PDFs need OpenRouter's parser.
+  const isKimi = modelId !== undefined && isKimiModel(modelId);
   // Agent DeepSeek routes default to high; paid Auto opts into max below.
   const isAgentDeepSeekV4 = mode === "agent" && isDeepSeekV4;
   const usesMaxDeepSeekReasoning =
@@ -1228,6 +1245,7 @@ export function buildProviderOptions(
     isGrok46 ||
     reasoningFallbackSlugs.includes(GROK_4_5_SLUG) ||
     reasoningFallbackSlugs.includes(GROK_4_6_SLUG) ||
+    reasoningFallbackSlugs.includes(GROK_4_7_SLUG) ||
     reasoningFallbackSlugs.includes(GLM_5_3_SLUG);
   // Only explicit tier requests on the snapshot use this policy. The legacy
   // vision aliases also serve allowance rescue and retain their own defaults.
@@ -1251,6 +1269,10 @@ export function buildProviderOptions(
   // continuation steps whose caller still carries an older reasoning override.
   const usesFixedMaxGrokReasoning =
     isGrok46 && options.selectedModelOverride === "hackerai-max";
+  // Max on Kimi keeps a high floor so a stale lower override cannot weaken it,
+  // while the paid Agent max-reasoning override can still raise it.
+  const usesMaxKimiReasoningFloor =
+    isKimi && options.selectedModelOverride === "hackerai-max";
   // GLM titles need mandatory reasoning, kept low for the small output budget.
   const reasoning = isExplicitPaidFlashTier
     ? {
@@ -1286,18 +1308,22 @@ export function buildProviderOptions(
                     enabled: true,
                     effort: "high",
                   }
-              : (options.reasoningOverride ??
-                (isHighReasoningModel(modelName) || isAgentDeepSeekV4
-                  ? {
-                      enabled: true,
-                      effort: "high",
-                    }
-                  : isReasoningModel
+              : usesMaxKimiReasoningFloor
+                ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
+                  ? options.reasoningOverride
+                  : { enabled: true, effort: "high" }
+                : (options.reasoningOverride ??
+                  (isHighReasoningModel(modelName) || isAgentDeepSeekV4
                     ? {
                         enabled: true,
-                        ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                        effort: "high",
                       }
-                    : { enabled: false }));
+                    : isReasoningModel
+                      ? {
+                          enabled: true,
+                          ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                        }
+                      : { enabled: false }));
 
   return {
     openrouter: {
@@ -1308,7 +1334,7 @@ export function buildProviderOptions(
             ? { enabled: true, effort: "max" }
             : reasoning,
       }),
-      ...(options.hasPdfAttachments && isDeepSeekV4
+      ...(options.hasPdfAttachments && (isDeepSeekV4 || isKimi)
         ? {
             plugins: [
               {

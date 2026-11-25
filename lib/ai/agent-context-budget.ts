@@ -56,7 +56,8 @@ export const MAX_AGENT_CONTEXT_TOKENS = Math.floor(
 // deliberately does not use the half-window heuristic above.
 export const PAID_AGENT_CONTEXT_MAX_TOKENS = 500_000;
 
-// Verified against https://openrouter.ai/api/v1/models on 2026-10-18.
+// Verified against https://openrouter.ai/api/v1/models on 2026-10-18
+// (Kimi K3.1 Pro and Grok 4.7 on 2026-11-24).
 // Use the smaller advertised top_provider.context_length where it differs.
 // Exact IDs deliberately fail closed for new models and custom endpoints.
 const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
@@ -69,8 +70,10 @@ const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "z-ai/glm-5.3": 1_048_576,
   "z-ai/glm-5.3-flash": 1_048_576,
   "moonshotai/kimi-k3": 1_048_576,
+  "moonshotai/kimi-k3.1-pro": 1_048_576,
   "x-ai/grok-4.5": 500_000,
   "x-ai/grok-4.6": 500_000,
+  "x-ai/grok-4.7": 500_000,
 };
 
 /** Smallest verified capacity across a route, or undefined if any is unknown. */
