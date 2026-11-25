@@ -17,6 +17,8 @@ services:
       - HACKERAI_LOCAL_TOKEN=${HACKERAI_LOCAL_TOKEN}
       - HACKERAI_CONVEX_URL=https://hackerai-convex.bolaxax.cloud
       - HACKERAI_RUNNER_NAME=${HACKERAI_RUNNER_NAME:-Servidor Kali}
+    # Fixed hostname so the selector shows the same computer after redeploys.
+    hostname: servidor-kali
     restart: unless-stopped
     # Docker's default capabilities (no SYS_ADMIN) plus NET_ADMIN for
     # masscan/nmap options; NET_RAW is already in the default set.
